@@ -23,6 +23,8 @@
 
 #include "modeling/models/qwen3_tts/qwen3_tts_pipeline.hpp"
 
+#include <openvino/runtime/properties.hpp>
+
 using namespace ov::genai::modeling::models;
 
 namespace {

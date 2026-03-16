@@ -58,6 +58,14 @@ public:
                             const Tensor& rope_sin,
                             const Tensor& causal_mask) const;
 
+    // Forward with KV cache (for decode)
+    AttentionKVOutput forward_with_cache(const Tensor& hidden_states,
+                                         const Tensor& rope_cos,
+                                         const Tensor& rope_sin,
+                                         const Tensor& attention_mask,
+                                         const std::optional<Tensor>& past_key,
+                                         const std::optional<Tensor>& past_value) const;
+
 private:
     const Tensor& q_proj_weight() const;
     const Tensor& k_proj_weight() const;
@@ -117,6 +125,15 @@ public:
                                                const Tensor& causal_mask,
                                                const std::optional<Tensor>& residual) const;
 
+    // Forward with KV cache (for decode)
+    DecoderLayerKVOutput forward_with_cache(const Tensor& hidden_states,
+                                            const Tensor& rope_cos,
+                                            const Tensor& rope_sin,
+                                            const Tensor& attention_mask,
+                                            const std::optional<Tensor>& residual,
+                                            const std::optional<Tensor>& past_key,
+                                            const std::optional<Tensor>& past_value) const;
+
 private:
     Qwen3TTSCodePredictorAttention self_attn_;
     Qwen3TTSCodePredictorMLP mlp_;
@@ -139,6 +156,16 @@ public:
     // Output: hidden_states [B, T, hidden_size=1024]
     Tensor forward_no_cache(const Tensor& inputs_embeds,
                             const Tensor& position_ids) const;
+
+    // Forward with KV cache
+    // Input: inputs_embeds [B, T, hidden_size=1024], position_ids [B, T],
+    //        attention_mask [B, 1, T, kv_len], past KV caches
+    // Output: hidden_states, key/value caches for all layers
+    TalkerModelKVOutput forward_with_cache(const Tensor& inputs_embeds,
+                                           const Tensor& position_ids,
+                                           const Tensor& attention_mask,
+                                           const std::vector<Tensor>& past_keys,
+                                           const std::vector<Tensor>& past_values) const;
 
     // Get codec embedding for a specific layer (0..14 -> layers 1..15)
     Tensor get_codec_embed(const Tensor& codec_ids, int layer_idx) const;
@@ -180,6 +207,27 @@ public:
                             const Tensor& position_ids,
                             int step) const;
 
+    // Forward with KV cache — outputs logits for ALL 15 steps plus updated KV caches
+    // At runtime, caller picks logits for the relevant step
+    struct CPForwardKVOutput {
+        std::vector<Tensor> all_logits;  // 15 logits tensors
+        std::vector<Tensor> key_caches;
+        std::vector<Tensor> value_caches;
+    };
+    CPForwardKVOutput forward_with_cache(const Tensor& inputs_embeds,
+                                         const Tensor& position_ids,
+                                         const Tensor& attention_mask,
+                                         const std::vector<Tensor>& past_keys,
+                                         const std::vector<Tensor>& past_values) const;
+
+    // Forward with KV cache returning only hidden state (no lm_heads)
+    // Used by the hidden model to reduce GPU kernel count
+    TalkerModelKVOutput forward_hidden_with_cache(const Tensor& inputs_embeds,
+                                                   const Tensor& position_ids,
+                                                   const Tensor& attention_mask,
+                                                   const std::vector<Tensor>& past_keys,
+                                                   const std::vector<Tensor>& past_values) const;
+
     // Get codec embedding for a specific layer (0..14 -> layers 1..15)
     Tensor get_codec_embed(const Tensor& codec_ids, int layer_idx) const;
 
@@ -190,6 +238,23 @@ public:
     Qwen3TTSCodePredictorModel& model();
     VocabEmbedding& codec_embedding(int layer_idx);
     LMHead& lm_head(int step);
+
+    // Apply input projection: talker_hidden_size -> hidden_size
+    Tensor apply_input_projection(const Tensor& inputs_embeds) const;
+
+    // Forward with KV cache for a single step (applies only the specified lm_head)
+    struct SingleStepKVOutput {
+        Tensor logits;
+        std::vector<Tensor> key_caches;
+        std::vector<Tensor> value_caches;
+    };
+    SingleStepKVOutput forward_step_with_cache(
+        const Tensor& inputs_embeds,
+        const Tensor& position_ids,
+        const Tensor& attention_mask,
+        const std::vector<Tensor>& past_keys,
+        const std::vector<Tensor>& past_values,
+        int32_t step) const;
 
 private:
     Qwen3TTSCodePredictorConfig cfg_;
@@ -261,10 +326,44 @@ std::shared_ptr<ov::Model> create_qwen3_tts_code_predictor_unified_ar_model(
     ov::genai::modeling::weights::WeightSource& source,
     ov::genai::modeling::weights::WeightFinalizer& finalizer);
 
+// Create Code Predictor AR decode model with KV cache and all 15 lm_heads
+// Supports both prefill (T>1) and decode (T=1) via KV cache
+// Input:
+//   - inputs_embeds: [batch, T, talker_hidden_size]
+//   - position_ids: [batch, T]
+//   - attention_mask: [batch, 1, T, kv_len]
+//   - past_key_i / past_value_i: [batch, kv_heads, past_len, head_dim] for each layer
+// Output:
+//   - logits_0 through logits_14: [batch, 1, vocab_size]
+//   - present_key_i / present_value_i: [batch, kv_heads, total_len, head_dim]
+std::shared_ptr<ov::Model> create_qwen3_tts_code_predictor_ar_decode_model(
+    const Qwen3TTSCodePredictorConfig& cfg,
+    ov::genai::modeling::weights::WeightSource& source,
+    ov::genai::modeling::weights::WeightFinalizer& finalizer);
+
 // Create unified codec embedding model for all 15 layers
 // Input: codec_input [batch, 1] token, layer_index [1] int32
 // Output: codec_embed [batch, 1, talker_hidden_size]
 std::shared_ptr<ov::Model> create_qwen3_tts_code_predictor_unified_embed_model(
+    const Qwen3TTSCodePredictorConfig& cfg,
+    ov::genai::modeling::weights::WeightSource& source,
+    ov::genai::modeling::weights::WeightFinalizer& finalizer);
+
+// Create CP AR decode model that outputs hidden_state (no lm_heads on GPU)
+// lm_head matmuls are done on CPU to reduce GPU kernel count by ~30
+// Input: inputs_embeds, position_ids, attention_mask, past_key/value per layer
+// Output: hidden_state [B, 1, hidden_size], present_key/value per layer
+std::shared_ptr<ov::Model> create_qwen3_tts_code_predictor_ar_hidden_model(
+    const Qwen3TTSCodePredictorConfig& cfg,
+    ov::genai::modeling::weights::WeightSource& source,
+    ov::genai::modeling::weights::WeightFinalizer& finalizer);
+
+// Create unrolled CP model — all 15 AR steps in a single OV model.
+// Uses re-prefill approach (no KV cache): each step processes the full growing sequence.
+// ArgMax and embedding lookups happen ON GPU, eliminating 14 CPU-GPU sync points.
+// Input: past_hidden [1, 1, talker_hidden], layer0_embed [1, 1, talker_hidden]
+// Output: codec_sum [1, 1, talker_hidden], token_0..token_14 [1, 1] each
+std::shared_ptr<ov::Model> create_qwen3_tts_code_predictor_unrolled_model(
     const Qwen3TTSCodePredictorConfig& cfg,
     ov::genai::modeling::weights::WeightSource& source,
     ov::genai::modeling::weights::WeightFinalizer& finalizer);

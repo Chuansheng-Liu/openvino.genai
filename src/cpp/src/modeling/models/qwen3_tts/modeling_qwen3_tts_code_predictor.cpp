@@ -10,6 +10,7 @@
 #include <vector>
 
 #include <openvino/openvino.hpp>
+#include <openvino/op/topk.hpp>
 
 #include "modeling/builder_context.hpp"
 #include "modeling/layers/lm_head.hpp"
@@ -117,8 +118,60 @@ Tensor Qwen3TTSCodePredictorAttention::forward_no_cache(const Tensor& hidden_sta
     return out;
 }
 
-//===----------------------------------------------------------------------===//
-// Code Predictor MLP Implementation
+AttentionKVOutput Qwen3TTSCodePredictorAttention::forward_with_cache(
+    const Tensor& hidden_states,
+    const Tensor& rope_cos,
+    const Tensor& rope_sin,
+    const Tensor& attention_mask,
+    const std::optional<Tensor>& past_key,
+    const std::optional<Tensor>& past_value) const {
+    // Q/K/V projections
+    auto q = ops::linear(hidden_states, q_proj_weight());
+    auto k = ops::linear(hidden_states, k_proj_weight());
+    auto v = ops::linear(hidden_states, v_proj_weight());
+
+    // Reshape to heads: [B, T, H*D] -> [B, H, T, D]
+    auto q_heads = q.reshape({0, 0, num_heads_, head_dim_}).permute({0, 2, 1, 3});
+    auto k_heads = k.reshape({0, 0, num_kv_heads_, head_dim_}).permute({0, 2, 1, 3});
+    auto v_heads = v.reshape({0, 0, num_kv_heads_, head_dim_}).permute({0, 2, 1, 3});
+
+    // Q/K normalization
+    if (q_norm_.weight_param().is_bound()) {
+        q_heads = q_norm_.forward(q_heads);
+    }
+    if (k_norm_.weight_param().is_bound()) {
+        k_heads = k_norm_.forward(k_heads);
+    }
+
+    // Apply standard RoPE
+    auto* policy = &ctx().op_policy();
+    auto q_rot = ops::llm::apply_rope(q_heads, rope_cos, rope_sin, head_dim_, policy);
+    auto k_rot = ops::llm::apply_rope(k_heads, rope_cos, rope_sin, head_dim_, policy);
+
+    // Concatenate with past KV cache
+    Tensor k_combined = k_rot;
+    Tensor v_combined = v_heads;
+    if (past_key.has_value() && past_value.has_value()) {
+        k_combined = ops::concat({*past_key, k_rot}, 2);
+        v_combined = ops::concat({*past_value, v_heads}, 2);
+    }
+
+    // Expand KV for GQA
+    auto k_expanded = ops::llm::repeat_kv(k_combined, num_heads_, num_kv_heads_, head_dim_);
+    auto v_expanded = ops::llm::repeat_kv(v_combined, num_heads_, num_kv_heads_, head_dim_);
+
+    // SDPA with attention mask
+    auto context = ops::llm::sdpa(q_rot, k_expanded, v_expanded, scaling_, 3, &attention_mask, false, policy);
+
+    // Merge heads
+    const int64_t attn_out_dim = static_cast<int64_t>(num_heads_) * head_dim_;
+    auto merged = context.permute({0, 2, 1, 3}).reshape({0, 0, attn_out_dim});
+
+    // Output projection
+    auto out = ops::linear(merged, o_proj_weight());
+    return AttentionKVOutput{out, k_combined, v_combined};
+}
+
 //===----------------------------------------------------------------------===//
 
 Qwen3TTSCodePredictorMLP::Qwen3TTSCodePredictorMLP(BuilderContext& ctx,
@@ -192,8 +245,37 @@ std::pair<Tensor, Tensor> Qwen3TTSCodePredictorDecoderLayer::forward_no_cache(
     return {mlp_out, post_norm.second};
 }
 
-//===----------------------------------------------------------------------===//
-// Code Predictor Model Implementation
+DecoderLayerKVOutput Qwen3TTSCodePredictorDecoderLayer::forward_with_cache(
+    const Tensor& hidden_states,
+    const Tensor& rope_cos,
+    const Tensor& rope_sin,
+    const Tensor& attention_mask,
+    const std::optional<Tensor>& residual,
+    const std::optional<Tensor>& past_key,
+    const std::optional<Tensor>& past_value) const {
+    // Pre-norm
+    Tensor normed;
+    Tensor next_residual;
+    if (residual) {
+        auto norm_out = input_layernorm_.forward(hidden_states, *residual);
+        normed = norm_out.first;
+        next_residual = norm_out.second;
+    } else {
+        normed = input_layernorm_.forward(hidden_states);
+        next_residual = hidden_states;
+    }
+
+    // Attention with KV cache
+    auto attn_result = self_attn_.forward_with_cache(
+        normed, rope_cos, rope_sin, attention_mask, past_key, past_value);
+
+    // Post-attention norm + MLP
+    auto post_norm = post_attention_layernorm_.forward(attn_result.hidden_states, next_residual);
+    auto mlp_out = mlp_.forward(post_norm.first);
+
+    return DecoderLayerKVOutput{mlp_out, post_norm.second, attn_result.key_cache, attn_result.value_cache};
+}
+
 //===----------------------------------------------------------------------===//
 
 Qwen3TTSCodePredictorModel::Qwen3TTSCodePredictorModel(BuilderContext& ctx,
@@ -245,6 +327,51 @@ Tensor Qwen3TTSCodePredictorModel::forward_no_cache(const Tensor& inputs_embeds,
         return norm_.forward(hidden_states, *residual).first;
     }
     return norm_.forward(hidden_states);
+}
+
+TalkerModelKVOutput Qwen3TTSCodePredictorModel::forward_with_cache(
+    const Tensor& inputs_embeds,
+    const Tensor& position_ids,
+    const Tensor& attention_mask,
+    const std::vector<Tensor>& past_keys,
+    const std::vector<Tensor>& past_values) const {
+    auto hidden_states = inputs_embeds;
+
+    // Build RoPE cos/sin
+    auto* policy = &ctx().op_policy();
+    auto cos_sin = ops::llm::rope_cos_sin(position_ids, head_dim_, rope_theta_, policy);
+
+    // Forward through layers, collecting KV caches
+    std::vector<Tensor> key_caches;
+    std::vector<Tensor> value_caches;
+    key_caches.reserve(layers_.size());
+    value_caches.reserve(layers_.size());
+
+    std::optional<Tensor> residual;
+    for (size_t i = 0; i < layers_.size(); ++i) {
+        std::optional<Tensor> past_key =
+            (i < past_keys.size()) ? std::optional<Tensor>(past_keys[i]) : std::nullopt;
+        std::optional<Tensor> past_value =
+            (i < past_values.size()) ? std::optional<Tensor>(past_values[i]) : std::nullopt;
+
+        auto layer_out = layers_[i].forward_with_cache(
+            hidden_states, cos_sin.first, cos_sin.second, attention_mask, residual, past_key, past_value);
+
+        hidden_states = layer_out.hidden_states;
+        residual = layer_out.residual;
+        key_caches.push_back(layer_out.key_cache);
+        value_caches.push_back(layer_out.value_cache);
+    }
+
+    // Final norm
+    Tensor pre_norm_hidden;
+    if (residual) {
+        pre_norm_hidden = norm_.forward(hidden_states, *residual).first;
+    } else {
+        pre_norm_hidden = norm_.forward(hidden_states);
+    }
+
+    return TalkerModelKVOutput{hidden_states, pre_norm_hidden, std::move(key_caches), std::move(value_caches)};
 }
 
 Tensor Qwen3TTSCodePredictorModel::get_codec_embed(const Tensor& codec_ids, int layer_idx) const {
@@ -309,6 +436,61 @@ Tensor Qwen3TTSCodePredictorForConditionalGeneration::forward_no_cache(const Ten
     return lm_heads_[step].forward(last_hidden);
 }
 
+Qwen3TTSCodePredictorForConditionalGeneration::CPForwardKVOutput
+Qwen3TTSCodePredictorForConditionalGeneration::forward_with_cache(
+    const Tensor& inputs_embeds,
+    const Tensor& position_ids,
+    const Tensor& attention_mask,
+    const std::vector<Tensor>& past_keys,
+    const std::vector<Tensor>& past_values) const {
+    // Apply projection if needed (talker_hidden_size -> hidden_size)
+    Tensor projected_embeds = inputs_embeds;
+    if (needs_projection_ && projection_weight_ && projection_weight_->is_bound()) {
+        projected_embeds = ops::linear(inputs_embeds, projection_weight_->value());
+        if (projection_bias_ && projection_bias_->is_bound()) {
+            projected_embeds = projected_embeds + projection_bias_->value();
+        }
+    }
+
+    // Forward through transformer with KV cache
+    auto model_out = model_.forward_with_cache(projected_embeds, position_ids, attention_mask,
+                                               past_keys, past_values);
+
+    // Get hidden_states at last position for lm_head application
+    auto last_hidden = ops::slice(model_out.pre_norm_hidden, -1, std::numeric_limits<int64_t>::max(), 1, 1);
+
+    // Apply all 15 lm_heads
+    std::vector<Tensor> all_logits;
+    all_logits.reserve(15);
+    for (int step = 0; step < 15; ++step) {
+        all_logits.push_back(lm_heads_[step].forward(last_hidden));
+    }
+
+    return CPForwardKVOutput{std::move(all_logits), std::move(model_out.key_caches), std::move(model_out.value_caches)};
+}
+
+TalkerModelKVOutput
+Qwen3TTSCodePredictorForConditionalGeneration::forward_hidden_with_cache(
+    const Tensor& inputs_embeds,
+    const Tensor& position_ids,
+    const Tensor& attention_mask,
+    const std::vector<Tensor>& past_keys,
+    const std::vector<Tensor>& past_values) const {
+    // Apply projection if needed (talker_hidden_size -> hidden_size)
+    Tensor projected_embeds = inputs_embeds;
+    if (needs_projection_ && projection_weight_ && projection_weight_->is_bound()) {
+        projected_embeds = ops::linear(inputs_embeds, projection_weight_->value());
+        if (projection_bias_ && projection_bias_->is_bound()) {
+            projected_embeds = projected_embeds + projection_bias_->value();
+        }
+    }
+
+    // Forward through transformer with KV cache — returns hidden state + KV caches
+    // No lm_heads applied, reducing GPU kernel count by ~30
+    return model_.forward_with_cache(projected_embeds, position_ids, attention_mask,
+                                     past_keys, past_values);
+}
+
 Tensor Qwen3TTSCodePredictorForConditionalGeneration::get_codec_embed(const Tensor& codec_ids,
                                                                       int layer_idx) const {
     return model_.get_codec_embed(codec_ids, layer_idx);
@@ -334,6 +516,42 @@ VocabEmbedding& Qwen3TTSCodePredictorForConditionalGeneration::codec_embedding(i
 
 LMHead& Qwen3TTSCodePredictorForConditionalGeneration::lm_head(int step) {
     return lm_heads_[step];
+}
+
+Tensor Qwen3TTSCodePredictorForConditionalGeneration::apply_input_projection(
+    const Tensor& inputs_embeds) const {
+    if (!needs_projection_ || !projection_weight_ || !projection_weight_->is_bound()) {
+        return inputs_embeds;
+    }
+    Tensor projected = ops::linear(inputs_embeds, projection_weight_->value());
+    if (projection_bias_ && projection_bias_->is_bound()) {
+        projected = projected + projection_bias_->value();
+    }
+    return projected;
+}
+
+Qwen3TTSCodePredictorForConditionalGeneration::SingleStepKVOutput
+Qwen3TTSCodePredictorForConditionalGeneration::forward_step_with_cache(
+    const Tensor& inputs_embeds,
+    const Tensor& position_ids,
+    const Tensor& attention_mask,
+    const std::vector<Tensor>& past_keys,
+    const std::vector<Tensor>& past_values,
+    int32_t step) const {
+    // Apply input projection (talker_hidden -> cp_hidden)
+    Tensor projected = apply_input_projection(inputs_embeds);
+
+    // Forward through transformer with KV cache
+    auto model_out = model_.forward_with_cache(projected, position_ids, attention_mask,
+                                                past_keys, past_values);
+
+    // Apply ONLY the specified lm_head (at last position)
+    auto last_hidden = ops::slice(model_out.pre_norm_hidden, -1,
+        std::numeric_limits<int64_t>::max(), 1, 1);
+    auto logits = lm_heads_[step].forward(last_hidden);
+
+    return SingleStepKVOutput{logits, std::move(model_out.key_caches),
+                              std::move(model_out.value_caches)};
 }
 
 //===----------------------------------------------------------------------===//
@@ -465,6 +683,61 @@ std::shared_ptr<ov::Model> create_qwen3_tts_code_predictor_unified_ar_model(
     return ctx.build_model(outputs);
 }
 
+std::shared_ptr<ov::Model> create_qwen3_tts_code_predictor_ar_decode_model(
+    const Qwen3TTSCodePredictorConfig& cfg,
+    ov::genai::modeling::weights::WeightSource& source,
+    ov::genai::modeling::weights::WeightFinalizer& finalizer) {
+    BuilderContext ctx;
+    Qwen3TTSCodePredictorForConditionalGeneration model(ctx, cfg);
+    ov::genai::modeling::weights::load_model(model, source, finalizer,
+        ov::genai::modeling::weights::LoadOptions::lenient());
+
+    // Inputs: embeds, position_ids, attention_mask, past KV caches
+    auto inputs_embeds =
+        ctx.parameter("inputs_embeds", ov::element::f32, ov::PartialShape{-1, -1, cfg.talker_hidden_size});
+    auto position_ids = ctx.parameter("position_ids", ov::element::i64, ov::PartialShape{-1, -1});
+    auto attention_mask = ctx.parameter("attention_mask", ov::element::f32, ov::PartialShape{-1, 1, -1, -1});
+
+    // Past KV cache inputs for each layer
+    std::vector<Tensor> past_keys;
+    std::vector<Tensor> past_values;
+    past_keys.reserve(cfg.num_hidden_layers);
+    past_values.reserve(cfg.num_hidden_layers);
+    for (int32_t i = 0; i < cfg.num_hidden_layers; ++i) {
+        auto past_key = ctx.parameter("past_key_" + std::to_string(i), ov::element::f32,
+            ov::PartialShape{-1, cfg.num_key_value_heads, -1, cfg.head_dim});
+        auto past_value = ctx.parameter("past_value_" + std::to_string(i), ov::element::f32,
+            ov::PartialShape{-1, cfg.num_key_value_heads, -1, cfg.head_dim});
+        past_keys.push_back(past_key);
+        past_values.push_back(past_value);
+    }
+
+    // Forward with KV cache — returns all 15 logits + updated KV caches
+    auto result = model.forward_with_cache(inputs_embeds, position_ids, attention_mask,
+                                           past_keys, past_values);
+
+    // Build outputs: logits_0..14, present_key_0..N, present_value_0..N
+    std::vector<ov::Output<ov::Node>> outputs;
+
+    for (int step = 0; step < 15; ++step) {
+        auto logits_result = std::make_shared<ov::op::v0::Result>(result.all_logits[step].output());
+        set_name(logits_result, "logits_" + std::to_string(step));
+        outputs.push_back(logits_result->output(0));
+    }
+
+    for (size_t i = 0; i < result.key_caches.size(); ++i) {
+        auto key_result = std::make_shared<ov::op::v0::Result>(result.key_caches[i].output());
+        set_name(key_result, "present_key_" + std::to_string(i));
+        outputs.push_back(key_result->output(0));
+
+        auto value_result = std::make_shared<ov::op::v0::Result>(result.value_caches[i].output());
+        set_name(value_result, "present_value_" + std::to_string(i));
+        outputs.push_back(value_result->output(0));
+    }
+
+    return ctx.build_model(outputs);
+}
+
 std::shared_ptr<ov::Model> create_qwen3_tts_code_predictor_unified_embed_model(
     const Qwen3TTSCodePredictorConfig& cfg,
     ov::genai::modeling::weights::WeightSource& source,
@@ -488,6 +761,174 @@ std::shared_ptr<ov::Model> create_qwen3_tts_code_predictor_unified_embed_model(
 
     return ctx.build_model(outputs);
 }
+
+std::shared_ptr<ov::Model> create_qwen3_tts_code_predictor_ar_hidden_model(
+    const Qwen3TTSCodePredictorConfig& cfg,
+    ov::genai::modeling::weights::WeightSource& source,
+    ov::genai::modeling::weights::WeightFinalizer& finalizer) {
+    BuilderContext ctx;
+    Qwen3TTSCodePredictorForConditionalGeneration model(ctx, cfg);
+    ov::genai::modeling::weights::load_model(model, source, finalizer,
+        ov::genai::modeling::weights::LoadOptions::lenient());
+
+    // Inputs: embeds, position_ids, attention_mask, past KV caches
+    auto inputs_embeds =
+        ctx.parameter("inputs_embeds", ov::element::f32, ov::PartialShape{-1, -1, cfg.talker_hidden_size});
+    auto position_ids = ctx.parameter("position_ids", ov::element::i64, ov::PartialShape{-1, -1});
+    auto attention_mask = ctx.parameter("attention_mask", ov::element::f32, ov::PartialShape{-1, 1, -1, -1});
+
+    // Past KV cache inputs for each layer
+    std::vector<Tensor> past_keys;
+    std::vector<Tensor> past_values;
+    past_keys.reserve(cfg.num_hidden_layers);
+    past_values.reserve(cfg.num_hidden_layers);
+    for (int32_t i = 0; i < cfg.num_hidden_layers; ++i) {
+        auto past_key = ctx.parameter("past_key_" + std::to_string(i), ov::element::f32,
+            ov::PartialShape{-1, cfg.num_key_value_heads, -1, cfg.head_dim});
+        auto past_value = ctx.parameter("past_value_" + std::to_string(i), ov::element::f32,
+            ov::PartialShape{-1, cfg.num_key_value_heads, -1, cfg.head_dim});
+        past_keys.push_back(past_key);
+        past_values.push_back(past_value);
+    }
+
+    // Forward with KV cache — returns hidden state + KV caches (no lm_heads)
+    auto model_out = model.forward_hidden_with_cache(inputs_embeds, position_ids, attention_mask,
+                                                     past_keys, past_values);
+
+    // Output: last-position hidden state + present KV caches
+    auto last_hidden = ops::slice(model_out.pre_norm_hidden, -1, std::numeric_limits<int64_t>::max(), 1, 1);
+
+    std::vector<ov::Output<ov::Node>> outputs;
+
+    auto hidden_result = std::make_shared<ov::op::v0::Result>(last_hidden.output());
+    set_name(hidden_result, "hidden_state");
+    outputs.push_back(hidden_result->output(0));
+
+    for (size_t i = 0; i < model_out.key_caches.size(); ++i) {
+        auto key_result = std::make_shared<ov::op::v0::Result>(model_out.key_caches[i].output());
+        set_name(key_result, "present_key_" + std::to_string(i));
+        outputs.push_back(key_result->output(0));
+
+        auto value_result = std::make_shared<ov::op::v0::Result>(model_out.value_caches[i].output());
+        set_name(value_result, "present_value_" + std::to_string(i));
+        outputs.push_back(value_result->output(0));
+    }
+
+    return ctx.build_model(outputs);
+}
+
+std::shared_ptr<ov::Model> create_qwen3_tts_code_predictor_unrolled_model(
+    const Qwen3TTSCodePredictorConfig& cfg,
+    ov::genai::modeling::weights::WeightSource& source,
+    ov::genai::modeling::weights::WeightFinalizer& finalizer) {
+    BuilderContext ctx;
+    Qwen3TTSCodePredictorForConditionalGeneration model(ctx, cfg);
+    ov::genai::modeling::weights::load_model(model, source, finalizer,
+        ov::genai::modeling::weights::LoadOptions::lenient());
+
+    // Inputs in talker hidden space
+    auto past_hidden = ctx.parameter("past_hidden", ov::element::f32,
+                                      ov::PartialShape{1, 1, cfg.talker_hidden_size});
+    auto layer0_embed = ctx.parameter("layer0_embed", ov::element::f32,
+                                       ov::PartialShape{1, 1, cfg.talker_hidden_size});
+
+    // K=1 constant for TopK (argmax)
+    auto k_const = std::make_shared<ov::op::v0::Constant>(
+        ov::element::i64, ov::Shape{}, std::vector<int64_t>{1});
+
+    Tensor codec_sum;
+    std::vector<ov::Output<ov::Node>> token_outputs;
+    std::vector<Tensor> key_caches, value_caches;
+
+    for (int step = 0; step < 15; ++step) {
+        Tensor logits;
+
+        if (step == 0) {
+            // Step 0: Prefill with [past_hidden, layer0_embed] (2 tokens)
+            Tensor sequence = ops::concat({past_hidden, layer0_embed}, 1);
+
+            // Position IDs: [0, 1]
+            std::vector<int64_t> pos_data = {0, 1};
+            ov::Tensor pos_ov(ov::element::i64, {1, 2}, pos_data.data());
+            auto pos_ids = ops::constant(pos_ov, &ctx.op_context());
+
+            // Causal mask for 2 tokens: [1, 1, 2, 2]
+            std::vector<float> mask_data = {0.0f, -std::numeric_limits<float>::infinity(),
+                                            0.0f, 0.0f};
+            ov::Tensor mask_ov(ov::element::f32, {1, 1, 2, 2}, mask_data.data());
+            auto mask = ops::constant(mask_ov, &ctx.op_context());
+
+            // Forward with cache: applies ONLY step 0's lm_head
+            auto result = model.forward_step_with_cache(sequence, pos_ids, mask, {}, {}, 0);
+            logits = result.logits;
+            key_caches = std::move(result.key_caches);
+            value_caches = std::move(result.value_caches);
+        } else {
+            // Steps 1-14: Decode with 1 token using KV cache from previous step
+            auto codec_embed = model.get_codec_embed(
+                ov::genai::modeling::Tensor(token_outputs.back()), step - 1);
+
+            // Accumulate codec sum
+            if (step == 1) {
+                codec_sum = codec_embed;
+            } else {
+                codec_sum = codec_sum + codec_embed;
+            }
+
+            // Position ID for this decode step
+            std::vector<int64_t> pos_data = {static_cast<int64_t>(step + 1)};
+            ov::Tensor pos_ov(ov::element::i64, {1, 1}, pos_data.data());
+            auto pos_ids = ops::constant(pos_ov, &ctx.op_context());
+
+            // Decode mask: [1, 1, 1, kv_len+1] all zeros (attend to all)
+            size_t total_kv = static_cast<size_t>(step + 2);
+            std::vector<float> mask_data(total_kv, 0.0f);
+            ov::Tensor mask_ov(ov::element::f32, {1, 1, 1, total_kv}, mask_data.data());
+            auto mask = ops::constant(mask_ov, &ctx.op_context());
+
+            // Forward with KV cache: applies ONLY this step's lm_head
+            auto result = model.forward_step_with_cache(codec_embed, pos_ids, mask,
+                                                         key_caches, value_caches, step);
+            logits = result.logits;
+            key_caches = std::move(result.key_caches);
+            value_caches = std::move(result.value_caches);
+        }
+
+        // Squeeze: [1, 1, vocab] -> [1, vocab]
+        auto logits_2d = logits.squeeze(1);
+
+        // ArgMax via TopK(k=1, axis=1, mode=max)
+        auto topk = std::make_shared<ov::op::v11::TopK>(
+            logits_2d.output(), k_const->output(0), 1, "max", "none", ov::element::i32);
+
+        token_outputs.push_back(topk->output(1));
+    }
+
+    // Handle the last step's codec embed for codec_sum
+    {
+        auto last_codec_embed = model.get_codec_embed(
+            ov::genai::modeling::Tensor(token_outputs.back()), 14);
+        codec_sum = codec_sum + last_codec_embed;
+    }
+
+    // Build outputs
+    ov::OutputVector outputs;
+
+    // Output 0: codec_sum [1, 1, talker_hidden_size]
+    auto codec_sum_result = std::make_shared<ov::op::v0::Result>(codec_sum.output());
+    set_name(codec_sum_result, "codec_sum");
+    outputs.push_back(codec_sum_result->output(0));
+
+    // Outputs 1..15: token IDs (each [1, 1] i32)
+    for (int step = 0; step < 15; ++step) {
+        auto result = std::make_shared<ov::op::v0::Result>(token_outputs[step]);
+        set_name(result, "token_" + std::to_string(step));
+        outputs.push_back(result->output(0));
+    }
+
+    return ctx.build_model(outputs);
+}
+
 
 }  // namespace models
 }  // namespace modeling
