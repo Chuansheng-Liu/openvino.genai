@@ -439,6 +439,56 @@ std::shared_ptr<ov::Model> create_qwen3_tts_code_predictor_single_codec_embed_mo
     return ctx.build_model({result->output(0)});
 }
 
+std::shared_ptr<ov::Model> create_qwen3_tts_code_predictor_unified_ar_model(
+    const Qwen3TTSCodePredictorConfig& cfg,
+    ov::genai::modeling::weights::WeightSource& source,
+    ov::genai::modeling::weights::WeightFinalizer& finalizer) {
+    BuilderContext ctx;
+    Qwen3TTSCodePredictorForConditionalGeneration model(ctx, cfg);
+    ov::genai::modeling::weights::load_model(model, source, finalizer, ov::genai::modeling::weights::LoadOptions::lenient());
+
+    auto inputs_embeds =
+        ctx.parameter("inputs_embeds", ov::element::f32, ov::PartialShape{-1, -1, cfg.talker_hidden_size});
+    auto position_ids = ctx.parameter("position_ids", ov::element::i64, ov::PartialShape{-1, -1});
+
+    // Call forward_no_cache for each step. The OpenVINO graph builder uses the same
+    // weight nodes for shared layers (projection + transformer), so the graph optimizer
+    // will deduplicate the shared computation paths automatically.
+    std::vector<ov::Output<ov::Node>> outputs;
+    for (int step = 0; step < 15; ++step) {
+        auto logits = model.forward_no_cache(inputs_embeds, position_ids, step);
+        auto result_node = std::make_shared<ov::op::v0::Result>(logits.output());
+        set_name(result_node, "logits_" + std::to_string(step));
+        outputs.push_back(result_node->output(0));
+    }
+
+    return ctx.build_model(outputs);
+}
+
+std::shared_ptr<ov::Model> create_qwen3_tts_code_predictor_unified_embed_model(
+    const Qwen3TTSCodePredictorConfig& cfg,
+    ov::genai::modeling::weights::WeightSource& source,
+    ov::genai::modeling::weights::WeightFinalizer& finalizer) {
+    BuilderContext ctx;
+    Qwen3TTSCodePredictorForConditionalGeneration model(ctx, cfg);
+    ov::genai::modeling::weights::load_model(model, source, finalizer, ov::genai::modeling::weights::LoadOptions::lenient());
+
+    // Create input for token
+    auto codec_input =
+        ctx.parameter("codec_input", ov::element::i64, ov::PartialShape{-1, -1});
+
+    // Output embeddings for all 15 layers
+    std::vector<ov::Output<ov::Node>> outputs;
+    for (int i = 0; i < 15; ++i) {
+        auto embed = model.get_codec_embed(codec_input, i);
+        auto result_node = std::make_shared<ov::op::v0::Result>(embed.output());
+        set_name(result_node, "codec_embed_" + std::to_string(i));
+        outputs.push_back(result_node->output(0));
+    }
+
+    return ctx.build_model(outputs);
+}
+
 }  // namespace models
 }  // namespace modeling
 }  // namespace genai

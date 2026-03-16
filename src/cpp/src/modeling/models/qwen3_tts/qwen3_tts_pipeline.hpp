@@ -154,9 +154,9 @@ private:
     ov::InferRequest m_talker_prefill_infer;
     ov::InferRequest m_talker_decode_infer;
     ov::InferRequest m_talker_codec_infer;
-    std::vector<ov::InferRequest> m_cp_ar_infer;      // 15 AR models
-    std::vector<ov::InferRequest> m_cp_embed_infer;   // 15 single codec embedding models
-    ov::InferRequest m_cp_codec_infer;                // Combined codec embedding
+    ov::InferRequest m_cp_ar_unified_infer;            // Unified AR model (all 15 lm_heads)
+    ov::InferRequest m_cp_embed_unified_infer;         // Unified codec embedding (all 15 layers)
+    ov::InferRequest m_cp_codec_infer;                 // Combined codec embedding sum
     ov::InferRequest m_decoder_infer;
     
     // Cached embeddings

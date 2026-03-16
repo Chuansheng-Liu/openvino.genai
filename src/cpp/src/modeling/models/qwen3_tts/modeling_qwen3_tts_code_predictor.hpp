@@ -249,6 +249,26 @@ std::shared_ptr<ov::Model> create_qwen3_tts_code_predictor_single_codec_embed_mo
     ov::genai::modeling::weights::WeightSource& source,
     ov::genai::modeling::weights::WeightFinalizer& finalizer);
 
+// Create unified Code Predictor AR model with all 15 lm_heads
+// Single transformer forward, outputs logits for all 15 generation steps
+// Input:
+//   - inputs_embeds: [batch, seq_len, talker_hidden_size]
+//   - position_ids: [batch, seq_len]
+// Output:
+//   - logits_0 through logits_14: [batch, 1, vocab_size] for each step
+std::shared_ptr<ov::Model> create_qwen3_tts_code_predictor_unified_ar_model(
+    const Qwen3TTSCodePredictorConfig& cfg,
+    ov::genai::modeling::weights::WeightSource& source,
+    ov::genai::modeling::weights::WeightFinalizer& finalizer);
+
+// Create unified codec embedding model for all 15 layers
+// Input: codec_input [batch, 1] token, layer_index [1] int32
+// Output: codec_embed [batch, 1, talker_hidden_size]
+std::shared_ptr<ov::Model> create_qwen3_tts_code_predictor_unified_embed_model(
+    const Qwen3TTSCodePredictorConfig& cfg,
+    ov::genai::modeling::weights::WeightSource& source,
+    ov::genai::modeling::weights::WeightFinalizer& finalizer);
+
 }  // namespace models
 }  // namespace modeling
 }  // namespace genai

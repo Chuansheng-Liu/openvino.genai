@@ -9,6 +9,7 @@
 #include <cstring>
 #include <fstream>
 #include <numeric>
+#include <iomanip>
 
 #include "nlohmann/json.hpp"
 
@@ -361,23 +362,17 @@ void Qwen3TTSPipeline::load_models(const std::filesystem::path& models_path,
     auto talker_codec_compiled = core.compile_model(talker_codec_model, device, properties);
     m_talker_codec_infer = talker_codec_compiled.create_infer_request();
     
-    // Create 15 AR Code Predictor models
-    m_cp_ar_infer.reserve(15);
-    for (int step = 0; step < 15; ++step) {
-        auto ar_model = create_qwen3_tts_code_predictor_ar_model(cp_cfg, step, weight_source, finalizer);
-        auto ar_compiled = core.compile_model(ar_model, device, properties);
-        m_cp_ar_infer.push_back(ar_compiled.create_infer_request());
-    }
+    // Create unified AR Code Predictor model (single model with all 15 lm_heads)
+    auto unified_ar_model = create_qwen3_tts_code_predictor_unified_ar_model(cp_cfg, weight_source, finalizer);
+    auto unified_ar_compiled = core.compile_model(unified_ar_model, device, properties);
+    m_cp_ar_unified_infer = unified_ar_compiled.create_infer_request();
     
-    // Create 15 single codec embedding models
-    m_cp_embed_infer.reserve(15);
-    for (int layer = 0; layer < 15; ++layer) {
-        auto embed_model = create_qwen3_tts_code_predictor_single_codec_embed_model(cp_cfg, layer, weight_source, finalizer);
-        auto embed_compiled = core.compile_model(embed_model, device, properties);
-        m_cp_embed_infer.push_back(embed_compiled.create_infer_request());
-    }
+    // Create unified codec embedding model (single model with all 15 embeddings)
+    auto unified_embed_model = create_qwen3_tts_code_predictor_unified_embed_model(cp_cfg, weight_source, finalizer);
+    auto unified_embed_compiled = core.compile_model(unified_embed_model, device, properties);
+    m_cp_embed_unified_infer = unified_embed_compiled.create_infer_request();
     
-    // Create Code Predictor codec embedding model
+    // Create Code Predictor codec embedding model (sum of all 15)
     auto cp_codec_model = create_qwen3_tts_code_predictor_codec_embed_model(cp_cfg, weight_source, finalizer);
     auto cp_codec_compiled = core.compile_model(cp_codec_model, device, properties);
     m_cp_codec_infer = cp_codec_compiled.create_infer_request();
@@ -457,6 +452,15 @@ std::vector<std::vector<int64_t>> Qwen3TTSPipeline::generate_codec_tokens(
     const size_t head_dim = static_cast<size_t>(m_head_dim);
     const size_t vocab_size = static_cast<size_t>(m_vocab_size);
     const size_t cp_vocab_size = static_cast<size_t>(m_cp_vocab_size);
+
+    // Timing accumulators (microseconds)
+    using hrc = std::chrono::high_resolution_clock;
+    double t_prefill_us = 0, t_talker_embed_us = 0, t_cp_ar_us = 0;
+    double t_cp_embed_us = 0, t_codec_sum_us = 0, t_talker_decode_us = 0;
+    double t_sampling_us = 0;
+    auto timer = [](hrc::time_point s) {
+        return std::chrono::duration<double, std::micro>(hrc::now() - s).count();
+    };
     
     std::vector<std::vector<int64_t>> all_layer_tokens(16);
     
@@ -533,7 +537,9 @@ std::vector<std::vector<int64_t>> Qwen3TTSPipeline::generate_codec_tokens(
         m_talker_prefill_infer.set_tensor("past_key_" + std::to_string(i), past_keys[i]);
         m_talker_prefill_infer.set_tensor("past_value_" + std::to_string(i), past_values[i]);
     }
+    auto t0_prefill = hrc::now();
     m_talker_prefill_infer.infer();
+    t_prefill_us += timer(t0_prefill);
     
     auto logits_tensor = m_talker_prefill_infer.get_tensor("logits");
     auto hidden_tensor = m_talker_prefill_infer.get_tensor("hidden_states");
@@ -582,43 +588,53 @@ std::vector<std::vector<int64_t>> Qwen3TTSPipeline::generate_codec_tokens(
     all_layer_tokens[0].push_back(layer0_token);
     
     // AR Code Predictor for Frame 0
+    // Pre-allocate buffers for AR sequence (max 17 embeddings: hidden + layer0 + 15 layers)
+    const size_t max_ar_len = 17;
     std::vector<float> ar_sequence;
+    ar_sequence.reserve(max_ar_len * hidden_size);
     ar_sequence.insert(ar_sequence.end(), past_hidden.begin(), past_hidden.end());
     ar_sequence.insert(ar_sequence.end(), layer0_embed.begin(), layer0_embed.end());
     
+
+    // Pre-allocate position IDs buffer (reused across frames)
+    std::vector<int64_t> pos_ids_buf(max_ar_len);
+    for (size_t i = 0; i < max_ar_len; ++i) pos_ids_buf[i] = static_cast<int64_t>(i);
+
+    // Pre-allocate token buffer for embedding lookup
+    std::vector<int64_t> token_vec_buf(1);
+
     std::vector<int64_t> current_layer_tokens(15);
     
     // Generate layers 1-15 for Frame 0
     for (int step = 0; step < 15; ++step) {
         size_t cur_len = ar_sequence.size() / hidden_size;
-        
-        std::vector<int64_t> pos_ids(cur_len);
-        for (size_t i = 0; i < cur_len; ++i) {
-            pos_ids[i] = static_cast<int64_t>(i);
-        }
-        
+
         ov::Tensor ar_input(ov::element::f32, {batch_size, cur_len, hidden_size}, ar_sequence.data());
-        ov::Tensor ar_pos(ov::element::i64, {batch_size, cur_len}, pos_ids.data());
-        
-        m_cp_ar_infer[step].set_tensor("inputs_embeds", ar_input);
-        m_cp_ar_infer[step].set_tensor("position_ids", ar_pos);
-        m_cp_ar_infer[step].infer();
-        
-        auto step_logits = m_cp_ar_infer[step].get_tensor("logits");
-        
+        ov::Tensor ar_pos(ov::element::i64, {batch_size, cur_len}, pos_ids_buf.data());
+
+        auto t0_ar = hrc::now();
+        m_cp_ar_unified_infer.set_tensor("inputs_embeds", ar_input);
+        m_cp_ar_unified_infer.set_tensor("position_ids", ar_pos);
+        m_cp_ar_unified_infer.infer();
+        t_cp_ar_us += timer(t0_ar);
+
+        auto step_logits = m_cp_ar_unified_infer.get_tensor("logits_" + std::to_string(step));
+
         int64_t layer_token = sample_token(step_logits.data<float>(), cp_vocab_size,
                                            config.temperature, config.top_k, config.top_p, 1.0f,
                                            nullptr, nullptr);
         all_layer_tokens[step + 1].push_back(layer_token);
         current_layer_tokens[step] = layer_token;
-        
-        // Get embedding for this token
-        std::vector<int64_t> token_vec = {layer_token};
-        ov::Tensor token_tensor(ov::element::i64, {batch_size, 1}, token_vec.data());
-        m_cp_embed_infer[step].set_tensor("codec_input", token_tensor);
-        m_cp_embed_infer[step].infer();
-        auto layer_embed_out = m_cp_embed_infer[step].get_tensor("codec_embed");
-        
+
+        // Get embedding for this token (reuse pre-allocated buffer)
+        auto t0_emb = hrc::now();
+        token_vec_buf[0] = layer_token;
+        ov::Tensor token_tensor(ov::element::i64, {batch_size, 1}, token_vec_buf.data());
+        m_cp_embed_unified_infer.set_tensor("codec_input", token_tensor);
+        m_cp_embed_unified_infer.infer();
+        t_cp_embed_us += timer(t0_emb);
+        auto layer_embed_out = m_cp_embed_unified_infer.get_tensor("codec_embed_" + std::to_string(step));
+
         const float* embed_ptr = layer_embed_out.data<float>();
         ar_sequence.insert(ar_sequence.end(), embed_ptr, embed_ptr + hidden_size);
     }
@@ -637,7 +653,9 @@ std::vector<std::vector<int64_t>> Qwen3TTSPipeline::generate_codec_tokens(
             layer_tensors[layer] = ov::Tensor(ov::element::i64, {batch_size, 1}, layer_tokens[layer].data());
             m_cp_codec_infer.set_tensor("codec_input_" + std::to_string(layer), layer_tensors[layer]);
         }
+        auto t0_cs = hrc::now();
         m_cp_codec_infer.infer();
+        t_codec_sum_us += timer(t0_cs);
         
         // The model outputs the sum of all 15 codec embeddings
         auto codec_embeds_sum = m_cp_codec_infer.get_tensor("codec_embeds_sum");
@@ -668,7 +686,9 @@ std::vector<std::vector<int64_t>> Qwen3TTSPipeline::generate_codec_tokens(
             m_talker_decode_infer.set_tensor("past_value_" + std::to_string(i), present_values[i]);
         }
         
+        auto t0_td = hrc::now();
         m_talker_decode_infer.infer();
+        t_talker_decode_us += timer(t0_td);
         
         logits_tensor = m_talker_decode_infer.get_tensor("logits");
         hidden_tensor = m_talker_decode_infer.get_tensor("hidden_states");
@@ -710,7 +730,9 @@ std::vector<std::vector<int64_t>> Qwen3TTSPipeline::generate_codec_tokens(
         layer0_vec[0] = layer0_token;
         ov::Tensor layer0_tensor_dec(ov::element::i64, {batch_size, 1}, layer0_vec.data());
         m_talker_codec_infer.set_tensor("codec_input_ids", layer0_tensor_dec);
+        auto t0_te = hrc::now();
         m_talker_codec_infer.infer();
+        t_talker_embed_us += timer(t0_te);
         auto layer0_embed_out_dec = m_talker_codec_infer.get_tensor("codec_embeds");
         std::copy(layer0_embed_out_dec.data<float>(),
                   layer0_embed_out_dec.data<float>() + hidden_size,
@@ -724,32 +746,31 @@ std::vector<std::vector<int64_t>> Qwen3TTSPipeline::generate_codec_tokens(
         // Generate layers 1-15
         for (int step = 0; step < 15; ++step) {
             size_t cur_len = ar_sequence.size() / hidden_size;
-            
-            std::vector<int64_t> pos_ids(cur_len);
-            for (size_t i = 0; i < cur_len; ++i) {
-                pos_ids[i] = static_cast<int64_t>(i);
-            }
-            
+
             ov::Tensor ar_input(ov::element::f32, {batch_size, cur_len, hidden_size}, ar_sequence.data());
-            ov::Tensor ar_pos(ov::element::i64, {batch_size, cur_len}, pos_ids.data());
-            
-            m_cp_ar_infer[step].set_tensor("inputs_embeds", ar_input);
-            m_cp_ar_infer[step].set_tensor("position_ids", ar_pos);
-            m_cp_ar_infer[step].infer();
-            
-            auto step_logits = m_cp_ar_infer[step].get_tensor("logits");
+            ov::Tensor ar_pos(ov::element::i64, {batch_size, cur_len}, pos_ids_buf.data());
+
+            auto t0_ar = hrc::now();
+            m_cp_ar_unified_infer.set_tensor("inputs_embeds", ar_input);
+            m_cp_ar_unified_infer.set_tensor("position_ids", ar_pos);
+            m_cp_ar_unified_infer.infer();
+            t_cp_ar_us += timer(t0_ar);
+
+            auto step_logits = m_cp_ar_unified_infer.get_tensor("logits_" + std::to_string(step));
             int64_t layer_token = sample_token(step_logits.data<float>(), cp_vocab_size,
-                                               config.temperature, config.top_k, config.top_p, 1.0f,
-                                               nullptr, nullptr);
+                                                config.temperature, config.top_k, config.top_p, 1.0f,
+                                                nullptr, nullptr);
             all_layer_tokens[step + 1].push_back(layer_token);
             current_layer_tokens[step] = layer_token;
-            
-            std::vector<int64_t> token_vec = {layer_token};
-            ov::Tensor token_tensor(ov::element::i64, {batch_size, 1}, token_vec.data());
-            m_cp_embed_infer[step].set_tensor("codec_input", token_tensor);
-            m_cp_embed_infer[step].infer();
-            auto layer_embed_out = m_cp_embed_infer[step].get_tensor("codec_embed");
-            
+
+            auto t0_emb = hrc::now();
+            token_vec_buf[0] = layer_token;
+            ov::Tensor token_tensor(ov::element::i64, {batch_size, 1}, token_vec_buf.data());
+            m_cp_embed_unified_infer.set_tensor("codec_input", token_tensor);
+            m_cp_embed_unified_infer.infer();
+            t_cp_embed_us += timer(t0_emb);
+            auto layer_embed_out = m_cp_embed_unified_infer.get_tensor("codec_embed_" + std::to_string(step));
+
             const float* embed_ptr = layer_embed_out.data<float>();
             ar_sequence.insert(ar_sequence.end(), embed_ptr, embed_ptr + hidden_size);
         }
@@ -767,7 +788,9 @@ std::vector<std::vector<int64_t>> Qwen3TTSPipeline::generate_codec_tokens(
             layer_tensors[layer] = ov::Tensor(ov::element::i64, {batch_size, 1}, layer_tokens[layer].data());
             m_cp_codec_infer.set_tensor("codec_input_" + std::to_string(layer), layer_tensors[layer]);
         }
+        auto t0_cs = hrc::now();
         m_cp_codec_infer.infer();
+        t_codec_sum_us += timer(t0_cs);
         
         // The model outputs the sum of all 15 codec embeddings
         auto codec_embeds_sum = m_cp_codec_infer.get_tensor("codec_embeds_sum");
@@ -797,7 +820,9 @@ std::vector<std::vector<int64_t>> Qwen3TTSPipeline::generate_codec_tokens(
             m_talker_decode_infer.set_tensor("past_value_" + std::to_string(i), present_values[i]);
         }
         
+        auto t0_td = hrc::now();
         m_talker_decode_infer.infer();
+        t_talker_decode_us += timer(t0_td);
         
         logits_tensor = m_talker_decode_infer.get_tensor("logits");
         hidden_tensor = m_talker_decode_infer.get_tensor("hidden_states");
@@ -828,6 +853,30 @@ std::vector<std::vector<int64_t>> Qwen3TTSPipeline::generate_codec_tokens(
     
     std::cout << "Generation finished. Total frames: " << all_layer_tokens[0].size() << std::endl;
     
+
+    // Print timing breakdown
+    size_t total_frames = all_layer_tokens[0].size();
+    double total_us = t_prefill_us + t_talker_embed_us + t_cp_ar_us + t_cp_embed_us
+                     + t_codec_sum_us + t_talker_decode_us + t_sampling_us;
+    std::cout << "\n============================================================" << std::endl;
+    std::cout << "Codec Generation Timing Breakdown (" << total_frames << " frames)" << std::endl;
+    std::cout << "============================================================" << std::endl;
+    std::cout << std::fixed << std::setprecision(1);
+    std::cout << "  Talker prefill:      " << t_prefill_us / 1000.0 << " ms" << std::endl;
+    std::cout << "  Talker embed:        " << t_talker_embed_us / 1000.0 << " ms" << std::endl;
+    std::cout << "  CP AR infer (15x):   " << t_cp_ar_us / 1000.0 << " ms" << std::endl;
+    std::cout << "  CP embed lookup:     " << t_cp_embed_us / 1000.0 << " ms" << std::endl;
+    std::cout << "  Codec sum:           " << t_codec_sum_us / 1000.0 << " ms" << std::endl;
+    std::cout << "  Talker decode (28L): " << t_talker_decode_us / 1000.0 << " ms" << std::endl;
+    std::cout << "  Sampling:            " << t_sampling_us / 1000.0 << " ms" << std::endl;
+    std::cout << "  ---" << std::endl;
+    std::cout << "  Accounted total:     " << total_us / 1000.0 << " ms" << std::endl;
+    if (total_frames > 0) {
+        std::cout << "  Per-frame avg:       " << total_us / 1000.0 / total_frames << " ms" << std::endl;
+        std::cout << "    CP AR per-frame:   " << t_cp_ar_us / 1000.0 / total_frames << " ms" << std::endl;
+        std::cout << "    Talker dec/frame:  " << t_talker_decode_us / 1000.0 / total_frames << " ms" << std::endl;
+    }
+    std::cout << "============================================================\n" << std::endl;
     return all_layer_tokens;
 }
 
