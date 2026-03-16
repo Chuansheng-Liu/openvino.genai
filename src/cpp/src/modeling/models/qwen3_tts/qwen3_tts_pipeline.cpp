@@ -392,6 +392,15 @@ void Qwen3TTSPipeline::load_models(const std::filesystem::path& models_path,
     auto decoder_compiled = core.compile_model(decoder_model, device, properties);
     m_decoder_infer = decoder_compiled.create_infer_request();
     
+    // Warm up speech decoder with a small dummy inference to trigger GPU kernel JIT compilation
+    {
+        const int warmup_seq = 2;
+        std::vector<int64_t> warmup_codes(16 * warmup_seq, 0);
+        ov::Tensor warmup_tensor(ov::element::i64, {1, 16, static_cast<size_t>(warmup_seq)}, warmup_codes.data());
+        m_decoder_infer.set_tensor("codes", warmup_tensor);
+        m_decoder_infer.infer();
+    }
+    
     // Pre-compute tts_pad embedding for decode phase
     size_t hidden_size = static_cast<size_t>(m_hidden_size);
     std::vector<int64_t> tts_pad_vec = {m_tts_pad_token_id};
