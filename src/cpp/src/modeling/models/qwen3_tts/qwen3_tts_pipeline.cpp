@@ -845,6 +845,29 @@ std::vector<std::vector<int64_t>> Qwen3TTSPipeline::generate_codec_tokens(
             present_values[i] = m_talker_decode_infer.get_tensor("present_value_" + std::to_string(i));
         }
         
+        // Sliding window KV cache: truncate periodically to bound attention cost
+        // Only truncate when cache exceeds window + buffer to amortize copy overhead
+        constexpr size_t kv_window_size = 512;
+        constexpr size_t kv_truncate_buffer = 128;
+        constexpr size_t kv_truncate_at = kv_window_size + kv_truncate_buffer;
+        if (present_keys[0].get_shape()[2] > kv_truncate_at) {
+            size_t kv_len = present_keys[0].get_shape()[2];
+            size_t drop = kv_len - kv_window_size;
+            for (size_t i = 0; i < num_layers; ++i) {
+                auto k_shape = present_keys[i].get_shape();
+                auto v_shape = present_values[i].get_shape();
+                ov::Tensor k_new(present_keys[i].get_element_type(), {k_shape[0], k_shape[1], kv_window_size, k_shape[3]});
+                ov::Tensor v_new(present_values[i].get_element_type(), {v_shape[0], v_shape[1], kv_window_size, v_shape[3]});
+                size_t copy_size = num_kv_heads * kv_window_size * head_dim;
+                size_t offset = num_kv_heads * drop * head_dim;
+                std::memcpy(k_new.data<float>(), present_keys[i].data<float>() + offset, copy_size * sizeof(float));
+                std::memcpy(v_new.data<float>(), present_values[i].data<float>() + offset, copy_size * sizeof(float));
+                present_keys[i] = k_new;
+                present_values[i] = v_new;
+            }
+            current_seq_len = kv_window_size;
+        }
+        
         logits_data = logits_tensor.data<float>();
         
         const std::vector<int64_t>* suppress = (frame < config.min_new_tokens) ? &suppress_tokens_with_eos : &suppress_tokens;
