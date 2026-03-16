@@ -20,6 +20,7 @@
 #include "safetensors_utils/safetensors_loader.hpp"
 #include "safetensors_utils/safetensors_weight_source.hpp"
 #include "safetensors_utils/safetensors_weight_finalizer.hpp"
+#include "modeling/weights/quantization_config.hpp"
 
 using json = nlohmann::json;
 using namespace ov::genai::safetensors;
@@ -337,10 +338,11 @@ void Qwen3TTSPipeline::load_models(const std::filesystem::path& models_path,
     auto cp_cfg = parse_code_predictor_config(config);
     SpeechDecoderConfig decoder_cfg;  // Use defaults
     
-    // Load main model weights
+    // Load main model weights with quantization support
     auto st_data = ::ov::genai::safetensors::load_safetensors(models_path);
     ::ov::genai::safetensors::SafetensorsWeightSource weight_source(std::move(st_data));
-    ::ov::genai::safetensors::SafetensorsWeightFinalizer finalizer;
+    const auto quant_config = ov::genai::modeling::weights::parse_quantization_config_from_env();
+    ::ov::genai::safetensors::SafetensorsWeightFinalizer finalizer(quant_config);
     
     // Create and compile Embedding model
     auto embed_model = create_qwen3_tts_embedding_model(talker_cfg, weight_source, finalizer);
@@ -363,17 +365,19 @@ void Qwen3TTSPipeline::load_models(const std::filesystem::path& models_path,
     m_talker_codec_infer = talker_codec_compiled.create_infer_request();
     
     // Create unified AR Code Predictor model (single model with all 15 lm_heads)
-    auto unified_ar_model = create_qwen3_tts_code_predictor_unified_ar_model(cp_cfg, weight_source, finalizer);
+    // No quantization for CP (5-layer model too small to benefit from INT4/INT8)
+    ::ov::genai::safetensors::SafetensorsWeightFinalizer cp_finalizer;
+    auto unified_ar_model = create_qwen3_tts_code_predictor_unified_ar_model(cp_cfg, weight_source, cp_finalizer);
     auto unified_ar_compiled = core.compile_model(unified_ar_model, device, properties);
     m_cp_ar_unified_infer = unified_ar_compiled.create_infer_request();
     
     // Create unified codec embedding model (single model with all 15 embeddings)
-    auto unified_embed_model = create_qwen3_tts_code_predictor_unified_embed_model(cp_cfg, weight_source, finalizer);
+    auto unified_embed_model = create_qwen3_tts_code_predictor_unified_embed_model(cp_cfg, weight_source, cp_finalizer);
     auto unified_embed_compiled = core.compile_model(unified_embed_model, device, properties);
     m_cp_embed_unified_infer = unified_embed_compiled.create_infer_request();
     
     // Create Code Predictor codec embedding model (sum of all 15)
-    auto cp_codec_model = create_qwen3_tts_code_predictor_codec_embed_model(cp_cfg, weight_source, finalizer);
+    auto cp_codec_model = create_qwen3_tts_code_predictor_codec_embed_model(cp_cfg, weight_source, cp_finalizer);
     auto cp_codec_compiled = core.compile_model(cp_codec_model, device, properties);
     m_cp_codec_infer = cp_codec_compiled.create_infer_request();
     
