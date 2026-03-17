@@ -858,10 +858,11 @@ std::vector<std::vector<int64_t>> Qwen3TTSPipeline::generate_codec_tokens(
                 auto v_shape = present_values[i].get_shape();
                 ov::Tensor k_new(present_keys[i].get_element_type(), {k_shape[0], k_shape[1], kv_window_size, k_shape[3]});
                 ov::Tensor v_new(present_values[i].get_element_type(), {v_shape[0], v_shape[1], kv_window_size, v_shape[3]});
-                size_t copy_size = num_kv_heads * kv_window_size * head_dim;
-                size_t offset = num_kv_heads * drop * head_dim;
-                std::memcpy(k_new.data<float>(), present_keys[i].data<float>() + offset, copy_size * sizeof(float));
-                std::memcpy(v_new.data<float>(), present_values[i].data<float>() + offset, copy_size * sizeof(float));
+                size_t elem_size = present_keys[i].get_element_type().size();
+                size_t copy_elems = num_kv_heads * kv_window_size * head_dim;
+                size_t offset_elems = num_kv_heads * drop * head_dim;
+                std::memcpy(k_new.data(), reinterpret_cast<const uint8_t*>(present_keys[i].data()) + offset_elems * elem_size, copy_elems * elem_size);
+                std::memcpy(v_new.data(), reinterpret_cast<const uint8_t*>(present_values[i].data()) + offset_elems * elem_size, copy_elems * elem_size);
                 present_keys[i] = k_new;
                 present_values[i] = v_new;
             }
