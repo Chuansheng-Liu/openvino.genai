@@ -142,9 +142,6 @@ private:
     // Code Predictor configuration
     int32_t m_cp_hidden_size = 1024;
     int32_t m_cp_vocab_size = 2048;
-    int32_t m_cp_num_layers = 5;
-    int32_t m_cp_num_kv_heads = 8;
-    int32_t m_cp_head_dim = 128;
     
     // Speech Decoder configuration
     int32_t m_sample_rate = 24000;
@@ -157,17 +154,10 @@ private:
     ov::InferRequest m_talker_prefill_infer;
     ov::InferRequest m_talker_decode_infer;
     ov::InferRequest m_talker_codec_infer;
-    ov::InferRequest m_cp_unrolled_infer;                  // Unrolled CP: all 15 steps in 1 GPU call
+    ov::InferRequest m_cp_ar_unified_infer;            // Unified AR model (all 15 lm_heads)
     ov::InferRequest m_cp_embed_unified_infer;         // Unified codec embedding (all 15 layers)
     ov::InferRequest m_cp_codec_infer;                 // Combined codec embedding sum
     ov::InferRequest m_decoder_infer;
-    
-    // CPU-side codec embedding tables for fast lookup (15 tables)
-    std::vector<std::vector<float>> m_cpu_codec_weights;  // [15][vocab_size * embed_dim]
-    size_t m_codec_embed_dim = 0;  // Embedding dimension (talker_hidden_size)
-    
-    // CPU-side lm_head weights (15 heads, stored as FP16 for bandwidth reduction)
-    std::vector<std::vector<uint16_t>> m_cpu_lm_head_weights;  // [15][vocab_size * hidden_size] in f16
     
     // Cached embeddings
     std::vector<float> m_tts_pad_embed;  // Pre-computed tts_pad embedding for decode phase
