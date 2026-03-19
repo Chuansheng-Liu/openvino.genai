@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <limits>
+#include <unordered_set>
 
 #include <openvino/core/except.hpp>
 #include <openvino/openvino.hpp>
@@ -14,6 +15,7 @@
 #include <openvino/op/util/variable.hpp>
 #include <openvino/opsets/opset13.hpp>
 #include <ov_ops/rms.hpp>
+#include "transformations/rt_info/disable_fp16_compression.hpp"
 
 #include "modeling/ops/kv_cache.hpp"
 #include "modeling/ops/llm.hpp"
@@ -29,6 +31,31 @@ auto set_name = [](auto node, const std::string& name) {
     node->output(0).set_names({name});
     node->set_friendly_name(name);
 };
+
+// Walk backward from `from` outputs to `stop_at` nodes and mark every visited
+// node with disable_fp16_compression so ConvertPrecision keeps them in f32.
+// This prevents position-ID overflow when IDs exceed f16 max (~65504).
+void mark_fp32_subgraph(const std::vector<ov::Output<ov::Node>>& from,
+                        const std::vector<ov::Output<ov::Node>>& stop_at) {
+    std::unordered_set<ov::Node*> stop;
+    for (const auto& o : stop_at) stop.insert(o.get_node());
+    std::vector<ov::Node*> stack;
+    std::unordered_set<ov::Node*> visited;
+    for (const auto& o : from) {
+        if (visited.insert(o.get_node()).second)
+            stack.push_back(o.get_node());
+    }
+    while (!stack.empty()) {
+        auto* n = stack.back(); stack.pop_back();
+        ov::disable_fp16_compression(n->shared_from_this());
+        if (stop.count(n)) continue;
+        for (size_t i = 0; i < n->get_input_size(); ++i) {
+            auto* p = n->input_value(i).get_node();
+            if (visited.insert(p).second)
+                stack.push_back(p);
+        }
+    }
+}
 
 std::vector<std::string> build_default_layer_types(int32_t num_layers, int32_t interval) {
     const int32_t safe_interval = interval > 0 ? interval : 4;
@@ -725,7 +752,11 @@ std::pair<Tensor, Tensor> Qwen3_5Model::build_mrope_cos_sin(const Tensor& positi
     if (pos_rank.is_static() && pos_rank.get_length() == 2) {
         auto pos_f = position_ids.to(ov::element::f32);
         auto freqs = pos_f.unsqueeze(2) * inv_freq_reshaped;
-        return {freqs.cos(), freqs.sin()};
+        auto cos_result = freqs.cos();
+        auto sin_result = freqs.sin();
+        mark_fp32_subgraph({cos_result.output(), sin_result.output()},
+                           {pos_f.output()});
+        return {cos_result, sin_result};
     }
 
     auto pos_t = ops::slice(position_ids, 0, 1, 1, 0).squeeze(0).to(ov::element::f32);
@@ -734,14 +765,22 @@ std::pair<Tensor, Tensor> Qwen3_5Model::build_mrope_cos_sin(const Tensor& positi
 
     auto freqs_t = pos_t.unsqueeze(2) * inv_freq_reshaped;
     if (!cfg_.mrope_interleaved) {
-        return {freqs_t.cos(), freqs_t.sin()};
+        auto cos_result = freqs_t.cos();
+        auto sin_result = freqs_t.sin();
+        mark_fp32_subgraph({cos_result.output(), sin_result.output()},
+                           {pos_t.output()});
+        return {cos_result, sin_result};
     }
 
     auto freqs_h = pos_h.unsqueeze(2) * inv_freq_reshaped;
     auto freqs_w = pos_w.unsqueeze(2) * inv_freq_reshaped;
     auto freqs_all = ops::tensor::stack({freqs_t, freqs_h, freqs_w}, 0);
     auto freqs = ops::rope::mrope_interleaved(freqs_all, cfg_.mrope_section);
-    return {freqs.cos(), freqs.sin()};
+    auto cos_result = freqs.cos();
+    auto sin_result = freqs.sin();
+    mark_fp32_subgraph({cos_result.output(), sin_result.output()},
+                       {pos_t.output(), pos_h.output(), pos_w.output()});
+    return {cos_result, sin_result};
 }
 
 Tensor Qwen3_5Model::forward_impl(const Tensor* input_ids,
