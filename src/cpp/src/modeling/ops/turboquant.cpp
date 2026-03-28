@@ -176,6 +176,49 @@ std::pair<Tensor, Tensor> turboquant_encode(const Tensor& x,
 }
 
 // ---------------------------------------------------------------------------
+// turboquant_encode_norot
+// ---------------------------------------------------------------------------
+//
+// Identical to turboquant_encode() but omits the SRHT matmul step.
+// Use for V when storing it in the original (unrotated) space.
+
+std::pair<Tensor, Tensor> turboquant_encode_norot(const Tensor& x,
+                                                   int bits,
+                                                   float clip_val) {
+    // 1. Cast to FP32 and L2-normalise.
+    auto x_f32 = x.to(ov::element::f32);
+    auto sum_sq    = ops::reduce_sum(x_f32 * x_f32, -1L, /*keepdim=*/true);
+    auto rsqrt_n   = (sum_sq + 1e-8f).rsqrt();
+    auto x_norm    = x_f32 * rsqrt_n;
+    auto norms     = 1.0f / rsqrt_n;  // [B,H,S,1] actual L2 norms
+
+    // 2. Infer head_dim from x shape (used to apply sqrt_d scaling).
+    const auto& ps = x.output().get_partial_shape();
+    const int32_t head_dim = (ps.rank().is_static() && ps[3].is_static())
+                             ? static_cast<int32_t>(ps[3].get_length())
+                             : -1;
+    const float sqrt_d = (head_dim > 0) ? std::sqrt(static_cast<float>(head_dim)) : 1.0f;
+
+    // 3. Scale to approximate N(0,1) and quantise — same as turboquant_encode()
+    //    but without the rotation matmul.  Unit-sphere coordinates satisfy
+    //    E[x_i^2] = 1/D, so multiplying by sqrt(D) normalises the variance.
+    const float half       = static_cast<float>((1 << (bits - 1)) - 1);
+    const float scale_to_int = half / clip_val;
+
+    auto x_scaled  = x_norm * sqrt_d;
+    auto x_clamp   = tq_clamp(x_scaled, -static_cast<double>(clip_val),
+                                          static_cast<double>(clip_val));
+    auto x_q       = tq_round(x_clamp * scale_to_int);
+    auto codes     = tq_clamp(x_q,
+                              -static_cast<double>(half),
+                               static_cast<double>(half))
+                         .to(ov::element::i8);   // [B,H,S,D] i8
+    auto scales    = norms.to(ov::element::f16); // [B,H,S,1]
+
+    return {codes, scales};
+}
+
+// ---------------------------------------------------------------------------
 // turboquant_decode
 // ---------------------------------------------------------------------------
 //

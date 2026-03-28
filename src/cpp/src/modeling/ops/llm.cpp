@@ -419,10 +419,16 @@ Tensor sdpa(const Tensor& q,
 
     auto* ctx = q.context();
     
-    // Create scale constant - this is critical for NPU compatibility
-    // The scale is typically 1/sqrt(head_dim)
-    auto scale_const = std::make_shared<ov::op::v0::Constant>(
-        ov::element::f32, ov::Shape{}, std::vector<float>{scale});
+    // Create scale constant matching Q's element type for SDPA type consistency
+    auto q_et = q.output().get_element_type();
+    std::shared_ptr<ov::Node> scale_const;
+    if (q_et == ov::element::f16) {
+        scale_const = std::make_shared<ov::op::v0::Constant>(
+            ov::element::f16, ov::Shape{}, std::vector<ov::float16>{ov::float16(scale)});
+    } else {
+        scale_const = std::make_shared<ov::op::v0::Constant>(
+            ov::element::f32, ov::Shape{}, std::vector<float>{scale});
+    }
 
     // Use native ScaledDotProductAttention for optimal GPU performance
     if (mask) {

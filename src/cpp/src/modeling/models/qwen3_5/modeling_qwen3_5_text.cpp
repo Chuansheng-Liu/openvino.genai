@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <limits>
+#include <regex>
 
 #include <openvino/core/except.hpp>
 #include <openvino/openvino.hpp>
@@ -228,26 +229,121 @@ Tensor Qwen3_5Attention::forward(const Tensor& hidden_states,
 
     const std::string cache_prefix = full_path().empty() ? name() : full_path();
     const auto& tq_cfg = turboquant_kv_config();
-    auto [q_rot, k_cached, v_cached, R_const] = ops::append_kv_cache_turboquant(
-        q_heads, k_heads, v_heads, beam_idx, num_kv_heads_, head_dim_, cache_prefix, ctx(),
-        tq_cfg);
-    auto k_expanded = ops::llm::repeat_kv(k_cached, num_heads_, num_kv_heads_, head_dim_);
-    auto v_expanded = ops::llm::repeat_kv(v_cached, num_heads_, num_kv_heads_, head_dim_);
 
-    auto attn_raw = ops::llm::sdpa(q_rot, k_expanded, v_expanded, scaling_, 3, nullptr, true, policy);
+    // GPU-native KV compression: use standard f16 KV cache and let the GPU plugin
+    // auto-compress to i8 via KVCacheCompressionMatcher + fused SDPA dequant.
+    // This avoids all explicit dequant overhead while keeping TQ rotation for quality.
+    static const bool gpu_native = []() {
+        const char* env = std::getenv("OV_GENAI_TQ_GPU_NATIVE");
+        return env && std::string(env) == "1";
+    }();
 
-    // Unrotate output only when TurboQuant is active. When disabled the path
-    // goes through standard FP16 cache and no correction is needed.
     Tensor attn;
-    if (tq_cfg.enabled) {
-        // attn_raw @ R recovers the original (unrotated) space.
-        // SDPA(Q@R^T, K@R^T, V@R^T) @ R = softmax(Q K^T/√D) @ V  (R orthogonal).
-        attn = ops::matmul(attn_raw.to(ov::element::f32),
-                           R_const.to(ov::element::f32),
-                           /*ta=*/false, /*tb=*/false)
-                   .to(attn_raw.dtype());
+    if (tq_cfg.enabled && gpu_native) {
+        // --- GPU-native path: TQ rotation + standard f16 KV + GPU auto-compression ---
+        // Apply SRHT rotation to Q and K for better quantization uniformity,
+        // but store f16 in standard KV cache (GPU plugin handles i8 compression).
+        // Extract layer index from cache_prefix for per-layer rotation seed.
+        int layer_idx = -1;
+        {
+            static const std::regex lp(R"(layers[\[\.](\d+)[\]\.]?)");
+            std::smatch m;
+            if (std::regex_search(cache_prefix, m, lp)) layer_idx = std::stoi(m[1].str());
+        }
+        const uint64_t layer_seed =
+            tq_cfg.rotation_seed ^
+            (layer_idx >= 0
+                 ? (static_cast<uint64_t>(layer_idx) * UINT64_C(0x9E3779B97F4A7C15))
+                 : UINT64_C(0));
+        ov::Tensor rotation_host =
+            turboquant::make_rotation_matrix(head_dim_, layer_seed, ov::element::f32);
+        auto rotation = ops::constant(rotation_host, op_ctx);
+
+        auto q_rot = turboquant::turboquant_rotate_query(q_heads, rotation);
+        auto k_rot = ops::matmul(k_heads, rotation, false, true);  // K @ R^T
+
+        auto [k_cached, v_cached] = ops::append_kv_cache(
+            k_rot, v_heads, beam_idx, num_kv_heads_, head_dim_, cache_prefix, ctx());
+
+        // Standard SDPA: GPU plugin fuses KVCache + SDPA with inline i8 dequant
+        auto k_expanded = ops::llm::repeat_kv(k_cached, num_heads_, num_kv_heads_, head_dim_);
+        auto v_expanded = ops::llm::repeat_kv(v_cached, num_heads_, num_kv_heads_, head_dim_);
+        attn = ops::llm::sdpa(q_rot, k_expanded, v_expanded, scaling_, 3, nullptr, true, policy);
+    } else if (tq_cfg.enabled && !gpu_native) {
+        // --- TQ explicit quantization paths ---
+        auto [q_rot, k_data, k_scales, v_data, v_scales] = ops::append_kv_cache_turboquant(
+            q_heads, k_heads, v_heads, beam_idx, num_kv_heads_, head_dim_, cache_prefix, ctx(),
+            tq_cfg);
+
+        if (k_scales.output().get_node()) {
+        // ----- TurboQuant decomposed attention -----
+        // Algebraic trick: multiply per-row scales in score space [B,H,Sq,S]
+        // instead of broadcasting to [B,H,S,D] (eliminates broadcast_gpu_ref).
+        //
+        // K_original ≈ K_codes * k_fused_scale  (per row)
+        // scores = Q @ K_codes^T * k_scale^T
+        // output = softmax(scores) * v_scale^T  @  V_codes
+
+        // Convert i8 codes to f16 for MatMul
+        auto k_f16 = k_data.to(ov::element::f16);   // [B, Hkv, S, D]
+        auto v_f16 = v_data.to(ov::element::f16);   // [B, Hkv, S, D]
+        auto q_f16 = q_rot.to(ov::element::f16);    // [B, Hq, Sq, D]
+
+        // GQA: reshape Q from [B, Hq, Sq, D] to [B, Hkv, Hq/Hkv * Sq, D]
+        auto q_grouped = q_f16.reshape({0, static_cast<int64_t>(num_kv_heads_), -1, static_cast<int64_t>(head_dim_)});
+
+        // Scores: [B, Hkv, Hq/Hkv*Sq, D] @ [B, Hkv, D, S] → [B, Hkv, Hq/Hkv*Sq, S]
+        auto raw_scores = ops::matmul(q_grouped, k_f16, /*ta=*/false, /*tb=*/true);
+
+        // Apply K scale in score space: [B,Hkv,S,1] → permute → [B,Hkv,1,S]
+        // k_scales already absorbs 1/sqrt(D), so no separate scaling_ needed.
+        auto k_scales_T = k_scales.permute({0, 1, 3, 2});
+        auto scaled_scores = raw_scores * k_scales_T;
+
+        // Causal mask + softmax.
+        // SDPA with causal=true handles the mask internally. For decomposed
+        // attention we must build it explicitly, but it's cheap (no data copy).
+        auto causal_mask = ops::llm::build_kv_causal_mask(q_grouped, k_f16);
+        auto masked_scores = scaled_scores + causal_mask.to(ov::element::f16);
+        auto attn_weights = masked_scores.softmax(3);
+
+        // Apply V scale in score space, then output matmul
+        auto v_scales_T = v_scales.permute({0, 1, 3, 2});
+        auto weighted = attn_weights * v_scales_T;
+        auto output_grouped = ops::matmul(weighted, v_f16);
+
+        // Reshape back to [B, Hq, Sq, D] and match upstream dtype
+        attn = output_grouped.reshape({0, static_cast<int64_t>(num_heads_), -1, static_cast<int64_t>(head_dim_)})
+                             .to(hidden_states.dtype());
     } else {
-        attn = attn_raw;
+        // ----- Standard attention (SDPA) -----
+        if (tq_cfg.enabled) {
+            // TQ f16 dequant path: GQA reshape Q + Tile mask (avoids repeat_kv broadcast)
+            auto q_f16 = q_rot.to(ov::element::f16);
+            auto q_grouped = q_f16.reshape({0, static_cast<int64_t>(num_kv_heads_), -1, static_cast<int64_t>(head_dim_)});
+            const int64_t gqa_ratio = static_cast<int64_t>(num_heads_) / static_cast<int64_t>(num_kv_heads_);
+            auto causal_mask = ops::llm::build_kv_causal_mask(q_f16, k_data);
+            auto tile_repeats = ops::const_vec(op_ctx, std::vector<int64_t>{1, 1, gqa_ratio, 1});
+            auto gqa_mask = Tensor(
+                std::make_shared<ov::op::v0::Tile>(causal_mask.output(), tile_repeats),
+                op_ctx).to(ov::element::f16);
+            attn = ops::llm::sdpa(q_grouped, k_data, v_data, scaling_, 3, &gqa_mask, false, policy);
+            attn = attn.reshape({0, static_cast<int64_t>(num_heads_), -1, static_cast<int64_t>(head_dim_)})
+                       .to(hidden_states.dtype());
+        } else {
+            // Non-TQ: expand KV heads explicitly + fused SDPA with causal
+            auto k_expanded = ops::llm::repeat_kv(k_data, num_heads_, num_kv_heads_, head_dim_);
+            auto v_expanded = ops::llm::repeat_kv(v_data, num_heads_, num_kv_heads_, head_dim_);
+            attn = ops::llm::sdpa(q_rot, k_expanded, v_expanded, scaling_, 3, nullptr, true, policy);
+        }
+        }  // closes inner if(k_scales)/else
+    } else {
+        // --- Non-TQ baseline: standard f16 KV cache + SDPA ---
+        auto [k_cached, v_cached] = ops::append_kv_cache(
+            k_heads, v_heads, beam_idx, num_kv_heads_, head_dim_, cache_prefix, ctx());
+        auto k_expanded = ops::llm::repeat_kv(k_cached, num_heads_, num_kv_heads_, head_dim_);
+        auto v_expanded = ops::llm::repeat_kv(v_cached, num_heads_, num_kv_heads_, head_dim_);
+        attn = ops::llm::sdpa(q_heads, k_expanded, v_expanded, scaling_, 3, nullptr, true, policy);
     }
 
     const int64_t attn_hidden = static_cast<int64_t>(num_heads_) * static_cast<int64_t>(head_dim_);

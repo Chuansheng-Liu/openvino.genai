@@ -113,6 +113,25 @@ ov::Tensor make_rotation_matrix(int32_t head_dim,
 // Graph-level encode / decode  (insert into the OV computation graph)
 // ---------------------------------------------------------------------------
 
+/// @brief Quantise a float KV tensor to INT8 codes + FP16 per-vector scales,
+///        WITHOUT applying the SRHT rotation.
+///
+/// Use for value vectors when the attention output unrotation is to be skipped:
+///   softmax(Q_rot @ K_rot^T) @ V_orig = softmax(Q @ K^T) @ V
+/// so no rotation or inverse-rotation is needed on V.
+///
+/// The encode pipeline is identical to turboquant_encode() but omits the
+/// matmul with the rotation matrix; the decode formula (turboquant_decode_norot)
+/// is unchanged.
+///
+/// @param x         Input [B, H, S, D] in any float dtype.
+/// @param bits      Bit-width matching TurboQuantKVConfig::bits.
+/// @param clip_val  Clipping range matching TurboQuantKVConfig::clip_val.
+/// @return Pair (codes [B,H,S,D] i8,  scales [B,H,S,1] f16).
+std::pair<Tensor, Tensor> turboquant_encode_norot(const Tensor& x,
+                                                   int bits,
+                                                   float clip_val);
+
 /// @brief Quantise a float KV tensor to INT8 codes + FP16 per-vector scales.
 ///
 /// @param x         Input [B, H, S, D] in any float dtype.

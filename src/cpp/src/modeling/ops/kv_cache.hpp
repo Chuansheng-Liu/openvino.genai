@@ -57,10 +57,18 @@ std::pair<Tensor, Tensor> append_kv_cache(const Tensor& keys,
 //   Correctness (R orthogonal, R^T R = I):
 //     SDPA(Q@R^T, K@R^T, V@R^T) @ R = softmax(Q K^T/√D) @ V  ✓
 //
-// Returns (q_rotated, k_norot, v_norot, R) for ops::llm::sdpa.
-// Caller must apply: attn = matmul(sdpa(q_rot,k,v), R, false, false)
-// When TurboQuant is disabled, R is identity and the matmul is a no-op.
-std::tuple<Tensor, Tensor, Tensor, Tensor> append_kv_cache_turboquant(
+// Returns (q_rotated, k_data, k_scales, v_data, v_scales):
+//   Non-TQ:  {query, k_f16, Tensor{}, v_f16, Tensor{}}
+//   TQ:      {q_rot, k_codes_i8, k_fused_scales_f16, v_codes_i8, v_fused_scales_f16}
+//
+// When k_scales is non-empty (TQ active), the caller should use the
+// decomposed attention path: scores in the low-dimensional [B,H,Sq,S]
+// space rather than broadcasting scales to [B,H,S,D].
+//
+// k_fused_scales incorporate the dequant constant:
+//   fused_scale = raw_scale * (clip_val / half) / sqrt(D)
+// so that: K_original ≈ K_codes * k_fused_scale  (per row)
+std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor> append_kv_cache_turboquant(
     const Tensor& query,
     const Tensor& keys,
     const Tensor& values,

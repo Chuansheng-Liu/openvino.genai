@@ -3,6 +3,7 @@
 
 #include "modeling/ops/kv_cache.hpp"
 
+#include <cmath>
 #include <iostream>
 #include <regex>
 #include <openvino/op/util/variable.hpp>
@@ -120,7 +121,7 @@ std::pair<Tensor, Tensor> append_kv_cache(const Tensor& keys,
 // append_kv_cache_turboquant
 // ---------------------------------------------------------------------------
 
-std::tuple<Tensor, Tensor, Tensor, Tensor> append_kv_cache_turboquant(
+std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor> append_kv_cache_turboquant(
     const Tensor& query,
     const Tensor& keys,
     const Tensor& values,
@@ -134,12 +135,10 @@ std::tuple<Tensor, Tensor, Tensor, Tensor> append_kv_cache_turboquant(
     auto* op_ctx = keys.context();
 
     // Fall back to standard FP16 cache when TurboQuant is disabled.
-    // Return an invalid (default-constructed) rotation tensor as sentinel —
-    // the caller checks tq_config.enabled before using it.
     if (!tq_config.enabled) {
         auto [k, v] = append_kv_cache(keys, values, beam_idx, num_kv_heads, head_dim,
                                       cache_prefix, ctx);
-        return {query, k, v, Tensor{}};
+        return {query, k, Tensor{}, v, Tensor{}};
     }
     const int layer_idx = extract_layer_index(cache_prefix);
 
@@ -161,19 +160,20 @@ std::tuple<Tensor, Tensor, Tensor, Tensor> append_kv_cache_turboquant(
 
     // ------------------------------------------------------------------
     // Encode incoming keys and values.
+    // K is encoded WITH rotation (preserves attention score correctness).
+    // V is encoded WITHOUT rotation so that no output unrotation is needed:
+    //   softmax(Q_rot @ K_rot^T) @ V_orig = softmax(Q @ K^T) @ V  (desired)
+    // This saves 1 MatMul per layer per decode step (28 per full model pass).
     // ------------------------------------------------------------------
     auto [k_codes, k_scales] = turboquant::turboquant_encode(
         keys, rotation, tq_config.bits, tq_config.clip_val);
-    auto [v_codes, v_scales] = turboquant::turboquant_encode(
-        values, rotation, tq_config.bits, tq_config.clip_val);
+    auto [v_codes, v_scales] = turboquant::turboquant_encode_norot(
+        values, tq_config.bits, tq_config.clip_val);
 
     // ------------------------------------------------------------------
     // Variable shapes.
     // codes : [batch, num_kv_heads, seq_len, head_dim]  i8
     // scales: [batch, num_kv_heads, seq_len,          1] f16
-    // GPU plugin only supports i8/f16 for dynamic Variable tensors.
-    // For 4-bit, codes use range [-7, 7] stored in i8 (quantisation noise
-    // benefit of 4-bit, without packing — packing requires custom ops).
     // ------------------------------------------------------------------
     auto batch        = shape::dim(keys, 0);
     auto kv_heads_vec = ops::const_vec(op_ctx,
@@ -186,7 +186,6 @@ std::tuple<Tensor, Tensor, Tensor, Tensor> append_kv_cache_turboquant(
     auto codes_shape  = shape::make({batch, kv_heads_vec, zero_len, head_dim_vec});
     auto scales_shape = shape::make({batch, kv_heads_vec, zero_len, one_vec});
 
-    // Zero-initialised empty tensors for ReadValue.
     auto zero_i8  = Tensor(ops::const_scalar(op_ctx, 0.0f), op_ctx).to(ov::element::i8);
     auto zero_f16 = Tensor(ops::const_scalar(op_ctx, 0.0f), op_ctx).to(ov::element::f16);
     auto k_codes_init  = shape::broadcast_to(zero_i8,  codes_shape);
@@ -196,9 +195,6 @@ std::tuple<Tensor, Tensor, Tensor, Tensor> append_kv_cache_turboquant(
 
     // ------------------------------------------------------------------
     // Variable names.
-    // We extend the NPUW "past_key_values.N.key" convention with _quant
-    // and _scale suffixes so the StatefulToStateless pass ignores them
-    // (it only patterns-matches the un-suffixed names).
     // ------------------------------------------------------------------
     auto make_tq_name = [&](bool is_key, const std::string& suffix) -> std::string {
         if (layer_idx >= 0) {
@@ -269,17 +265,94 @@ std::tuple<Tensor, Tensor, Tensor, Tensor> append_kv_cache_turboquant(
     // Rotate Q into the SRHT-rotated space (O(S_q × D²), cheap for S_q=1).
     auto q_rot = turboquant::turboquant_rotate_query(query, rotation);
 
-    // K and V: dequantise + rescale only (no inverse-rotation matmul).
-    // Results ≈ K @ R^T and V @ R^T with original magnitudes.
-    auto k_out = turboquant::turboquant_decode_norot(
-        kc_combined, ks_combined, tq_config.bits, tq_config.clip_val)
-        .to(keys.dtype());
-    auto v_out = turboquant::turboquant_decode_norot(
-        vc_combined, vs_combined, tq_config.bits, tq_config.clip_val)
-        .to(values.dtype());
+    // Path selection via environment variables:
+    // OV_GENAI_TQ_DECOMPOSED=1  → decomposed attention (score-space scales)
+    // OV_GENAI_TQ_F16_CACHE=1   → dequant at encode, store f16 in separate cache
+    // default                    → dequant full cache each step + GQA SDPA
+    static const bool use_decomposed = []() {
+        const char* env = std::getenv("OV_GENAI_TQ_DECOMPOSED");
+        return env && std::string(env) == "1";
+    }();
+    static const bool use_f16_cache = []() {
+        const char* env = std::getenv("OV_GENAI_TQ_F16_CACHE");
+        return env && std::string(env) == "1";
+    }();
 
-    // Return rotation so caller can unrotate SDPA output: attn @ R.
-    return {q_rot, k_out, v_out, rotation};
+    if (use_f16_cache) {
+        // F16-cache path: dequant new tokens NOW, store f16 in a secondary cache.
+        // This eliminates per-decode-step dequant (codes*scales broadcast over D=128).
+        // Trade-off: 2× cache memory (f16 vs i8), but decode is as fast as baseline.
+        const int half_val = (1 << (tq_config.bits - 1)) - 1;
+        const float dq = tq_config.clip_val / static_cast<float>(half_val)
+                       / std::sqrt(static_cast<float>(head_dim));
+
+        // Dequant the NEW k/v tokens (small: just Sq tokens, not full cache)
+        auto k_new_dq = k_codes.to(ov::element::f16) *
+                        (k_scales.to(ov::element::f32) * dq).to(ov::element::f16);
+        auto v_new_dq = v_codes.to(ov::element::f16) *
+                        (v_scales.to(ov::element::f32) * dq).to(ov::element::f16);
+
+        // Secondary f16 cache variables
+        auto make_f16_name = [&](bool is_key) -> std::string {
+            if (layer_idx >= 0) {
+                const std::string t = is_key ? "key" : "value";
+                return "past_key_values." + std::to_string(layer_idx) + "." + t + "_f16" +
+                       "present." + std::to_string(layer_idx) + "." + t + "_f16";
+            }
+            const std::string base = cache_prefix + (is_key ? ".key_cache" : ".value_cache");
+            return base + "_f16";
+        };
+
+        const ov::PartialShape f16_var_shape{-1, num_kv_heads, -1, head_dim};
+        auto zero_f16_val = Tensor(ops::const_scalar(op_ctx, 0.0f), op_ctx).to(ov::element::f16);
+        auto f16_shape = shape::make({batch, kv_heads_vec, zero_len, head_dim_vec});
+        auto f16_init = shape::broadcast_to(zero_f16_val, f16_shape);
+
+        ov::op::util::VariableInfo kf16_info{f16_var_shape, ov::element::f16, make_f16_name(true)};
+        auto kf16_var = std::make_shared<ov::op::util::Variable>(kf16_info);
+        auto kf16_read = std::make_shared<ov::op::v6::ReadValue>(f16_init.output(), kf16_var);
+
+        ov::op::util::VariableInfo vf16_info{f16_var_shape, ov::element::f16, make_f16_name(false)};
+        auto vf16_var = std::make_shared<ov::op::util::Variable>(vf16_info);
+        auto vf16_read = std::make_shared<ov::op::v6::ReadValue>(f16_init.output(), vf16_var);
+
+        auto kf16_cached = ops::gather(Tensor(kf16_read->output(0), op_ctx), beam_idx, 0);
+        auto vf16_cached = ops::gather(Tensor(vf16_read->output(0), op_ctx), beam_idx, 0);
+
+        auto k_f16_combined = ops::concat({kf16_cached, k_new_dq}, 2);
+        auto v_f16_combined = ops::concat({vf16_cached, v_new_dq}, 2);
+
+        auto kf16_assign = std::make_shared<ov::opset13::Assign>(k_f16_combined.output(), kf16_var);
+        auto vf16_assign = std::make_shared<ov::opset13::Assign>(v_f16_combined.output(), vf16_var);
+        ctx.register_sink(kf16_assign);
+        ctx.register_sink(vf16_assign);
+
+        return {q_rot, k_f16_combined, Tensor{}, v_f16_combined, Tensor{}};
+    }
+
+    if (use_decomposed) {
+        // Decomposed path: return raw i8 codes + fused scales.
+        // The caller multiplies scales in the score space [B,H,Sq,S] instead of
+        // broadcasting to [B,H,S,D], eliminating the expensive broadcast kernel.
+        const int half = (1 << (tq_config.bits - 1)) - 1;
+        const float k_fused_factor = tq_config.clip_val / static_cast<float>(half)
+                                   / static_cast<float>(head_dim);
+        const float v_fused_factor = tq_config.clip_val / static_cast<float>(half)
+                                   / std::sqrt(static_cast<float>(head_dim));
+        auto k_fused_scales = (ks_combined.to(ov::element::f32) * k_fused_factor).to(ov::element::f16);
+        auto v_fused_scales = (vs_combined.to(ov::element::f32) * v_fused_factor).to(ov::element::f16);
+        return {q_rot, kc_combined, k_fused_scales, vc_combined, v_fused_scales};
+    }
+
+    // Default path: full dequant + SDPA.
+    const int half = (1 << (tq_config.bits - 1)) - 1;
+    const float dequant_factor = tq_config.clip_val / static_cast<float>(half)
+                               / std::sqrt(static_cast<float>(head_dim));
+    auto k_dq_scale = (ks_combined.to(ov::element::f32) * dequant_factor).to(ov::element::f16);
+    auto v_dq_scale = (vs_combined.to(ov::element::f32) * dequant_factor).to(ov::element::f16);
+    auto k_dequant = kc_combined.to(ov::element::f16) * k_dq_scale;
+    auto v_dequant = vc_combined.to(ov::element::f16) * v_dq_scale;
+    return {q_rot, k_dequant, Tensor{}, v_dequant, Tensor{}};
 }
 
 }  // namespace ops

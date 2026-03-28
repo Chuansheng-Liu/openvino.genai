@@ -223,13 +223,22 @@ std::string turboquant_cache_suffix(const ov::genai::modeling::turboquant::Turbo
     if (!tq.enabled) {
         return "";
     }
-    // e.g. "_tqkv8" or "_tqkv4c2.5"
+    // e.g. "_tqkv8" or "_tqkv4c2.5" or "_tqkv8gn" (GPU-native)
     std::string s = "_tqkv" + std::to_string(tq.bits);
     if (tq.clip_val != 4.0f) {
         // Include clip value only when non-default to keep filenames short.
         std::ostringstream oss;
         oss << std::fixed << std::setprecision(1) << tq.clip_val;
         s += "c" + oss.str();
+    }
+    // GPU-native path uses a completely different graph topology (rotation + f16 KV
+    // instead of explicit i8 codes + scales), so it needs a distinct cached IR.
+    static const bool gpu_native = []() {
+        const char* env = std::getenv("OV_GENAI_TQ_GPU_NATIVE");
+        return env && std::string(env) == "1";
+    }();
+    if (gpu_native) {
+        s += "gn";
     }
     return s;
 }
@@ -1003,7 +1012,26 @@ int main(int argc, char* argv[]) try {
         std::cout << "[vision] Compiling vision model on device: " << vision_device << std::endl;
         compiled_vision = core.compile_model(vision_model, vision_device);
     }
-    auto compiled_text = core.compile_model(text_model, opts.device);
+    // Configure GPU compile properties.
+    ov::AnyMap gpu_properties;
+
+    // Enable GPU-native INT8 KV cache compression.
+    // The GPU plugin's KVCacheCompressionMatcher will fuse DynamicQuantize + SDPA,
+    // performing inline i8 dequant inside the optimized SDPA kernel — zero overhead.
+    // Controlled by OV_GENAI_GPU_KV_COMPRESS=1 or OV_GENAI_TQ_GPU_NATIVE=1.
+    static const bool gpu_kv_compress = []() {
+        auto check = [](const char* name) {
+            const char* env = std::getenv(name);
+            return env && std::string(env) == "1";
+        };
+        return check("OV_GENAI_GPU_KV_COMPRESS") || check("OV_GENAI_TQ_GPU_NATIVE");
+    }();
+    if (gpu_kv_compress) {
+        gpu_properties[ov::hint::kv_cache_precision.name()] = ov::element::i8;
+        std::cout << "[GPU] KV cache compression: i8 (fused SDPA dequant)" << std::endl;
+    }
+
+    auto compiled_text = core.compile_model(text_model, opts.device, gpu_properties);
 
     ov::Tensor visual_embeds;
     ov::Tensor grid_thw;
