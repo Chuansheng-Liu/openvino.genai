@@ -186,6 +186,17 @@ Tensor turboquant_decode_norot(const Tensor& codes,
 /// @return         Rotated query in the same dtype as input.
 Tensor turboquant_rotate_query(const Tensor& query, const Tensor& rotation);
 
+/// @brief Pack signed 4-bit codes [B,H,S,D] i8 → [B,H,S,D/2] i8.
+///
+/// Two codes per byte: byte = ((code_even + 8) & 0xF) | ((code_odd + 8) << 4).
+/// D must be even. Use tq_unpack_i4 to reverse.
+Tensor tq_pack_i4(const Tensor& codes, int32_t head_dim);
+
+/// @brief Unpack packed codes [B,H,S,D/2] i8 → [B,H,S,D] f32 signed codes.
+///
+/// Reverses tq_pack_i4: extracts two signed 4-bit values per byte.
+Tensor tq_unpack_i4(const Tensor& packed, int32_t head_dim);
+
 }  // namespace turboquant
 }  // namespace modeling
 }  // namespace genai

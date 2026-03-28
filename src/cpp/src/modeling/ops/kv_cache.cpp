@@ -165,25 +165,33 @@ std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor> append_kv_cache_turboquant(
     //   softmax(Q_rot @ K_rot^T) @ V_orig = softmax(Q @ K^T) @ V  (desired)
     // This saves 1 MatMul per layer per decode step (28 per full model pass).
     // ------------------------------------------------------------------
-    auto [k_codes, k_scales] = turboquant::turboquant_encode(
+    auto [k_codes_raw, k_scales] = turboquant::turboquant_encode(
         keys, rotation, tq_config.bits, tq_config.clip_val);
-    auto [v_codes, v_scales] = turboquant::turboquant_encode_norot(
+    auto [v_codes_raw, v_scales] = turboquant::turboquant_encode_norot(
         values, tq_config.bits, tq_config.clip_val);
+
+    // For INT4 (bits <= 4): pack two codes per byte → [B,H,S,D/2] i8
+    // This halves KV cache memory vs i8 storage.
+    const bool use_i4_pack = (tq_config.bits <= 4);
+    auto k_codes = use_i4_pack ? turboquant::tq_pack_i4(k_codes_raw, head_dim) : k_codes_raw;
+    auto v_codes = use_i4_pack ? turboquant::tq_pack_i4(v_codes_raw, head_dim) : v_codes_raw;
+    const int32_t codes_last_dim = use_i4_pack ? (head_dim / 2) : head_dim;
 
     // ------------------------------------------------------------------
     // Variable shapes.
-    // codes : [batch, num_kv_heads, seq_len, head_dim]  i8
-    // scales: [batch, num_kv_heads, seq_len,          1] f16
+    // codes : [batch, num_kv_heads, seq_len, codes_last_dim]  i8
+    //         codes_last_dim = head_dim (8-bit) or head_dim/2 (4-bit packed)
+    // scales: [batch, num_kv_heads, seq_len,                1] f16
     // ------------------------------------------------------------------
     auto batch        = shape::dim(keys, 0);
     auto kv_heads_vec = ops::const_vec(op_ctx,
                             std::vector<int64_t>{static_cast<int64_t>(num_kv_heads)});
     auto zero_len     = ops::const_vec(op_ctx, std::vector<int64_t>{0});
-    auto head_dim_vec = ops::const_vec(op_ctx,
-                            std::vector<int64_t>{static_cast<int64_t>(head_dim)});
+    auto codes_dim_vec = ops::const_vec(op_ctx,
+                            std::vector<int64_t>{static_cast<int64_t>(codes_last_dim)});
     auto one_vec      = ops::const_vec(op_ctx, std::vector<int64_t>{1});
 
-    auto codes_shape  = shape::make({batch, kv_heads_vec, zero_len, head_dim_vec});
+    auto codes_shape  = shape::make({batch, kv_heads_vec, zero_len, codes_dim_vec});
     auto scales_shape = shape::make({batch, kv_heads_vec, zero_len, one_vec});
 
     auto zero_i8  = Tensor(ops::const_scalar(op_ctx, 0.0f), op_ctx).to(ov::element::i8);
@@ -211,7 +219,7 @@ std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor> append_kv_cache_turboquant(
     const std::string vc_name = make_tq_name(false, "_quant");
     const std::string vs_name = make_tq_name(false, "_scale");
 
-    const ov::PartialShape codes_var_shape {-1, num_kv_heads, -1, head_dim};
+    const ov::PartialShape codes_var_shape {-1, num_kv_heads, -1, codes_last_dim};
     const ov::PartialShape scales_var_shape{-1, num_kv_heads, -1, 1};
 
     // Keys — codes
@@ -287,10 +295,17 @@ std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor> append_kv_cache_turboquant(
                        / std::sqrt(static_cast<float>(head_dim));
 
         // Dequant the NEW k/v tokens (small: just Sq tokens, not full cache)
-        auto k_new_dq = k_codes.to(ov::element::f16) *
-                        (k_scales.to(ov::element::f32) * dq).to(ov::element::f16);
-        auto v_new_dq = v_codes.to(ov::element::f16) *
-                        (v_scales.to(ov::element::f32) * dq).to(ov::element::f16);
+        // For INT4 packed: unpack first to get [B,H,S,D] codes, then dequant
+        Tensor k_codes_dq, v_codes_dq;
+        if (use_i4_pack) {
+            k_codes_dq = (turboquant::tq_unpack_i4(k_codes, head_dim) * dq).to(ov::element::f16);
+            v_codes_dq = (turboquant::tq_unpack_i4(v_codes, head_dim) * dq).to(ov::element::f16);
+        } else {
+            k_codes_dq = k_codes.to(ov::element::f16);
+            v_codes_dq = v_codes.to(ov::element::f16);
+        }
+        auto k_new_dq = k_codes_dq * (k_scales.to(ov::element::f32) * (use_i4_pack ? 1.0f : dq)).to(ov::element::f16);
+        auto v_new_dq = v_codes_dq * (v_scales.to(ov::element::f32) * (use_i4_pack ? 1.0f : dq)).to(ov::element::f16);
 
         // Secondary f16 cache variables
         auto make_f16_name = [&](bool is_key) -> std::string {
@@ -303,6 +318,8 @@ std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor> append_kv_cache_turboquant(
             return base + "_f16";
         };
 
+        auto head_dim_vec = ops::const_vec(op_ctx,
+                                std::vector<int64_t>{static_cast<int64_t>(head_dim)});
         const ov::PartialShape f16_var_shape{-1, num_kv_heads, -1, head_dim};
         auto zero_f16_val = Tensor(ops::const_scalar(op_ctx, 0.0f), op_ctx).to(ov::element::f16);
         auto f16_shape = shape::make({batch, kv_heads_vec, zero_len, head_dim_vec});
@@ -331,9 +348,8 @@ std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor> append_kv_cache_turboquant(
     }
 
     if (use_decomposed) {
-        // Decomposed path: return raw i8 codes + fused scales.
-        // The caller multiplies scales in the score space [B,H,Sq,S] instead of
-        // broadcasting to [B,H,S,D], eliminating the expensive broadcast kernel.
+        // Decomposed path: return codes + fused scales for score-space multiplication.
+        // For INT4 packed: unpack to [B,H,S,D] f16 codes before returning.
         const int half = (1 << (tq_config.bits - 1)) - 1;
         const float k_fused_factor = tq_config.clip_val / static_cast<float>(half)
                                    / static_cast<float>(head_dim);
@@ -341,17 +357,32 @@ std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor> append_kv_cache_turboquant(
                                    / std::sqrt(static_cast<float>(head_dim));
         auto k_fused_scales = (ks_combined.to(ov::element::f32) * k_fused_factor).to(ov::element::f16);
         auto v_fused_scales = (vs_combined.to(ov::element::f32) * v_fused_factor).to(ov::element::f16);
+        if (use_i4_pack) {
+            auto k_unpacked = turboquant::tq_unpack_i4(kc_combined, head_dim).to(ov::element::i8);
+            auto v_unpacked = turboquant::tq_unpack_i4(vc_combined, head_dim).to(ov::element::i8);
+            return {q_rot, k_unpacked, k_fused_scales, v_unpacked, v_fused_scales};
+        }
         return {q_rot, kc_combined, k_fused_scales, vc_combined, v_fused_scales};
     }
 
     // Default path: full dequant + SDPA.
+    // For INT4 packed: unpack to f32 codes, then dequant to f16.
     const int half = (1 << (tq_config.bits - 1)) - 1;
     const float dequant_factor = tq_config.clip_val / static_cast<float>(half)
                                / std::sqrt(static_cast<float>(head_dim));
     auto k_dq_scale = (ks_combined.to(ov::element::f32) * dequant_factor).to(ov::element::f16);
     auto v_dq_scale = (vs_combined.to(ov::element::f32) * dequant_factor).to(ov::element::f16);
-    auto k_dequant = kc_combined.to(ov::element::f16) * k_dq_scale;
-    auto v_dequant = vc_combined.to(ov::element::f16) * v_dq_scale;
+    Tensor k_dequant, v_dequant;
+    if (use_i4_pack) {
+        // Unpack → f32 codes → f16 → multiply scale
+        auto k_codes_f32 = turboquant::tq_unpack_i4(kc_combined, head_dim);
+        auto v_codes_f32 = turboquant::tq_unpack_i4(vc_combined, head_dim);
+        k_dequant = (k_codes_f32.to(ov::element::f16) * k_dq_scale);
+        v_dequant = (v_codes_f32.to(ov::element::f16) * v_dq_scale);
+    } else {
+        k_dequant = kc_combined.to(ov::element::f16) * k_dq_scale;
+        v_dequant = vc_combined.to(ov::element::f16) * v_dq_scale;
+    }
     return {q_rot, k_dequant, Tensor{}, v_dequant, Tensor{}};
 }
 

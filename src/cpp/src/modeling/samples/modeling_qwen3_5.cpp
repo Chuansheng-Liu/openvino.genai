@@ -240,6 +240,13 @@ std::string turboquant_cache_suffix(const ov::genai::modeling::turboquant::Turbo
     if (gpu_native) {
         s += "gn";
     }
+    static const bool f16_cache = []() {
+        const char* env = std::getenv("OV_GENAI_TQ_F16_CACHE");
+        return env && std::string(env) == "1";
+    }();
+    if (f16_cache) {
+        s += "f16c";
+    }
     return s;
 }
 

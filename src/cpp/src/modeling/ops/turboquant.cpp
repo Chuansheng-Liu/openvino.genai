@@ -13,6 +13,11 @@
 
 #include <openvino/opsets/opset13.hpp>
 
+#include <openvino/op/bitwise_and.hpp>
+#include <openvino/op/bitwise_or.hpp>
+#include <openvino/op/bitwise_left_shift.hpp>
+#include <openvino/op/bitwise_right_shift.hpp>
+
 #include "modeling/ops/ops.hpp"
 
 namespace ov {
@@ -69,7 +74,54 @@ static int32_t infer_head_dim(const Tensor& rotation) {
     return -1;
 }
 
-}  // namespace
+}  // namespace (anonymous)
+
+// ---------------------------------------------------------------------------
+// INT4 bitpacking helpers
+// ---------------------------------------------------------------------------
+// Pack two signed 4-bit values (∈ [-7, 7]) into one i8 byte:
+//   1. Bias to unsigned: u = val + 8  → [1, 15] (0 reserved for zero)
+//   2. Pack: byte = u_even | (u_odd << 4)
+//
+// The GPU Concat op doesn't support i4, so we store packed i8 with D/2 dims.
+// This achieves the same 4× memory reduction vs f16 as native i4.
+
+/// Pack [B,H,S,D] i8 codes (range [-7,7]) → [B,H,S,D/2] i8 (2 codes/byte).
+/// Low nibble stores first half of head_dim, high nibble stores second half.
+Tensor tq_pack_i4(const Tensor& codes, int32_t head_dim) {
+    auto* ctx = codes.context();
+    const int64_t half = static_cast<int64_t>(head_dim / 2);
+    // Split head_dim in half: [B,H,S,D/2] each
+    auto first  = ops::slice(codes, 0, half, 1, 3);   // codes[..., :D/2]
+    auto second = ops::slice(codes, half, head_dim, 1, 3);  // codes[..., D/2:]
+    // Bias to unsigned [1,15]: u = code + 8  (i32 arithmetic)
+    auto c_8  = Tensor(ops::const_scalar(ctx, static_cast<int32_t>(8)), ctx);
+    auto c_0f = Tensor(ops::const_scalar(ctx, static_cast<int32_t>(0xF)), ctx);
+    auto c_4  = Tensor(ops::const_scalar(ctx, static_cast<int32_t>(4)), ctx);
+    auto f_u = first.to(ov::element::i32)  + c_8;
+    auto s_u = second.to(ov::element::i32) + c_8;
+    // Pack: byte = (first & 0xF) | (second << 4)
+    auto lo = Tensor(std::make_shared<ov::op::v13::BitwiseAnd>(f_u.output(), c_0f.output()), ctx);
+    auto hi = Tensor(std::make_shared<ov::op::v15::BitwiseLeftShift>(s_u.output(), c_4.output()), ctx);
+    auto packed = Tensor(std::make_shared<ov::op::v13::BitwiseOr>(lo.output(), hi.output()), ctx);
+    return packed.to(ov::element::i8);  // [B,H,S,D/2] i8
+}
+
+/// Unpack [B,H,S,D/2] i8 → [B,H,S,D] f32 signed codes in [-7, 7].
+Tensor tq_unpack_i4(const Tensor& packed, int32_t head_dim) {
+    auto* ctx = packed.context();
+    auto p_i32 = packed.to(ov::element::i32);
+    auto c_0f = Tensor(ops::const_scalar(ctx, static_cast<int32_t>(0xF)), ctx);
+    auto c_4  = Tensor(ops::const_scalar(ctx, static_cast<int32_t>(4)), ctx);
+    auto c_8  = Tensor(ops::const_scalar(ctx, static_cast<int32_t>(8)), ctx);
+    // Low nibble → first half: (packed & 0xF) - 8
+    auto first = Tensor(std::make_shared<ov::op::v13::BitwiseAnd>(p_i32.output(), c_0f.output()), ctx) - c_8;
+    // High nibble → second half: ((packed >> 4) & 0xF) - 8
+    auto shifted = Tensor(std::make_shared<ov::op::v15::BitwiseRightShift>(p_i32.output(), c_4.output()), ctx);
+    auto second = Tensor(std::make_shared<ov::op::v13::BitwiseAnd>(shifted.output(), c_0f.output()), ctx) - c_8;
+    // Concat halves → [B,H,S,D] f32
+    return ops::concat({first, second}, 3).to(ov::element::f32);
+}
 
 // ---------------------------------------------------------------------------
 // make_rotation_matrix
