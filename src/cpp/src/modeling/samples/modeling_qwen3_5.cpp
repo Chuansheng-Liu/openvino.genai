@@ -1022,9 +1022,9 @@ int main(int argc, char* argv[]) try {
     // Configure GPU compile properties.
     ov::AnyMap gpu_properties;
 
-    // Enable GPU-native INT8 KV cache compression.
+    // Enable GPU-native KV cache compression.
     // The GPU plugin's KVCacheCompressionMatcher will fuse DynamicQuantize + SDPA,
-    // performing inline i8 dequant inside the optimized SDPA kernel — zero overhead.
+    // performing inline dequant inside the optimized SDPA kernel — zero overhead.
     // Controlled by OV_GENAI_GPU_KV_COMPRESS=1 or OV_GENAI_TQ_GPU_NATIVE=1.
     static const bool gpu_kv_compress = []() {
         auto check = [](const char* name) {
@@ -1034,8 +1034,14 @@ int main(int argc, char* argv[]) try {
         return check("OV_GENAI_GPU_KV_COMPRESS") || check("OV_GENAI_TQ_GPU_NATIVE");
     }();
     if (gpu_kv_compress) {
-        gpu_properties[ov::hint::kv_cache_precision.name()] = ov::element::i8;
-        std::cout << "[GPU] KV cache compression: i8 (fused SDPA dequant)" << std::endl;
+        // Use i4 compression when TQ bits=4 for ~75% KV memory savings; i8 otherwise (~50%).
+        if (tq_kv_cfg.enabled && tq_kv_cfg.bits == 4) {
+            gpu_properties[ov::hint::kv_cache_precision.name()] = ov::element::i4;
+            std::cout << "[GPU] KV cache compression: i4 (fused SDPA dequant, TQ 4-bit)" << std::endl;
+        } else {
+            gpu_properties[ov::hint::kv_cache_precision.name()] = ov::element::i8;
+            std::cout << "[GPU] KV cache compression: i8 (fused SDPA dequant)" << std::endl;
+        }
     }
 
     auto compiled_text = core.compile_model(text_model, opts.device, gpu_properties);
