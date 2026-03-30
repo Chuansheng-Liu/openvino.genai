@@ -265,7 +265,7 @@ Tensor Qwen3_5Attention::forward(const Tensor& hidden_states,
         auto [k_cached, v_cached] = ops::append_kv_cache(
             k_rot, v_heads, beam_idx, num_kv_heads_, head_dim_, cache_prefix, ctx());
 
-        // Standard SDPA: GPU plugin fuses KVCache + SDPA with inline i8 dequant
+        // Standard SDPA: GPU plugin fuses KVCache + SDPA with inline i4/i8 dequant
         auto k_expanded = ops::llm::repeat_kv(k_cached, num_heads_, num_kv_heads_, head_dim_);
         auto v_expanded = ops::llm::repeat_kv(v_cached, num_heads_, num_kv_heads_, head_dim_);
         attn = ops::llm::sdpa(q_rot, k_expanded, v_expanded, scaling_, 3, nullptr, true, policy);
