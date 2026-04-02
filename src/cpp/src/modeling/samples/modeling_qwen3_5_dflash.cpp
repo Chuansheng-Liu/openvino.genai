@@ -508,11 +508,28 @@ int main(int argc, char* argv[]) try {
         }
     } // Weight sources (target_source, draft_source) and their safetensors data freed here.
 
+    // Apply f16 preprocessing for draft model's context_hidden input.
+    // context_hidden will be stored as f16 USM → GPU reads f16 directly, fewer reorder_data.
+    bool use_f16_ctx = false;
+    if (combined_draft_model) {
+        try {
+            ov::preprocess::PrePostProcessor ppp(combined_draft_model);
+            ppp.input("context_hidden").tensor().set_element_type(ov::element::f16);
+            ppp.input("context_hidden").preprocess().convert_element_type(ov::element::f32);
+            combined_draft_model = ppp.build();
+            use_f16_ctx = true;
+            std::cout << "[Draft model: context_hidden input set to f16 via preprocessing]" << std::endl;
+        } catch (const std::exception& e) {
+            std::cerr << "[Warning] Failed to apply f16 preprocessing: " << e.what() << std::endl;
+        }
+    }
+
     // Compile models
     ov::Core core;
     ov::AnyMap compile_cfg = {
         {ov::hint::inference_precision.name(), ov::element::f16},
         {ov::hint::kv_cache_precision.name(), ov::element::f16},
+        {ov::hint::performance_mode.name(), ov::hint::PerformanceMode::LATENCY},
     };
     // activations_scale_factor: env var override (0 = disable, default 8.0)
     float act_scale = 8.0f;
@@ -530,6 +547,10 @@ int main(int argc, char* argv[]) try {
             std::cout << kv.second.as<ov::element::Type>().get_type_name();
         } else if (kv.second.is<float>()) {
             std::cout << kv.second.as<float>();
+        } else if (kv.second.is<ov::hint::PerformanceMode>()) {
+            auto mode = kv.second.as<ov::hint::PerformanceMode>();
+            std::cout << (mode == ov::hint::PerformanceMode::LATENCY ? "LATENCY" :
+                         mode == ov::hint::PerformanceMode::THROUGHPUT ? "THROUGHPUT" : "other");
         } else {
             std::cout << "(unknown)";
         }
@@ -891,21 +912,36 @@ int main(int argc, char* argv[]) try {
     // Each draft step reuses the cache instead of recomputing fc on the full context.
     const size_t ctx_hidden_dim = static_cast<size_t>(dflash_cfg.hidden_size);
     const size_t max_ctx_len = max_length + static_cast<size_t>(dflash_cfg.block_size);
+    const ov::element::Type ctx_elem = use_f16_ctx ? ov::element::f16 : ov::element::f32;
+    const size_t ctx_elem_size = use_f16_ctx ? sizeof(ov::float16) : sizeof(float);
     // Allocate cache as USM host tensor (zero-copy read by GPU draft model)
     ov::Tensor ctx_hidden_storage;
     bool using_usm_ctx = false;
     if (has_gpu_context) {
         try {
             ctx_hidden_storage = remote_context.create_host_tensor(
-                ov::element::f32, {1, max_ctx_len, ctx_hidden_dim});
+                ctx_elem, {1, max_ctx_len, ctx_hidden_dim});
             using_usm_ctx = true;
         } catch (const std::exception&) {
             using_usm_ctx = false;
         }
     }
     if (!using_usm_ctx) {
-        ctx_hidden_storage = ov::Tensor(ov::element::f32, {1, max_ctx_len, ctx_hidden_dim});
+        ctx_hidden_storage = ov::Tensor(ctx_elem, {1, max_ctx_len, ctx_hidden_dim});
     }
+
+    // Helper: copy f32 context_fc output to cache (f32 or f16 depending on use_f16_ctx)
+    auto copy_ctx_to_cache = [&](const ov::Tensor& src, ov::Tensor& dst) {
+        if (use_f16_ctx) {
+            const float* s = src.data<float>();
+            ov::float16* d = dst.data<ov::float16>();
+            const size_t n = src.get_size();
+            for (size_t i = 0; i < n; ++i)
+                d[i] = ov::float16(s[i]);
+        } else {
+            src.copy_to(dst);
+        }
+    };
 
     // Compute initial context_hidden from prefill target_hidden
     {
@@ -914,12 +950,13 @@ int main(int argc, char* argv[]) try {
         context_fc_request.infer();
         auto init_ctx = context_fc_request.get_tensor("context_hidden");
         ov::Tensor dst_init(ctx_hidden_storage, {0, 0, 0}, {1, prompt_len, ctx_hidden_dim});
-        init_ctx.copy_to(dst_init);
+        copy_ctx_to_cache(init_ctx, dst_init);
     }
     size_t context_hidden_len = prompt_len;
     std::cerr << "[DFlash] context_hidden cache: [1," << max_ctx_len
               << "," << ctx_hidden_dim << "] = "
-              << (max_ctx_len * ctx_hidden_dim * sizeof(float) / 1024 / 1024) << " MB (f32"
+              << (max_ctx_len * ctx_hidden_dim * ctx_elem_size / 1024 / 1024) << " MB ("
+              << ctx_elem.get_type_name()
               << (using_usm_ctx ? " USM host" : " CPU") << ")" << std::endl;
     std::cerr << "[DFlash] initial context_hidden computed for " << prompt_len << " tokens" << std::endl;
 
@@ -1304,7 +1341,7 @@ int main(int argc, char* argv[]) try {
             ov::Tensor ctx_dst(ctx_hidden_storage,
                                {0, context_hidden_len, 0},
                                {1, context_hidden_len + num_accepted, ctx_hidden_dim});
-            new_ctx.copy_to(ctx_dst);
+            copy_ctx_to_cache(new_ctx, ctx_dst);
             context_hidden_len += num_accepted;
         }
 
