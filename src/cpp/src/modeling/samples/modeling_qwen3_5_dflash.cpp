@@ -445,8 +445,17 @@ int main(int argc, char* argv[]) try {
     std::shared_ptr<ov::Model> target_model;
     std::shared_ptr<ov::Model> context_fc_model;
     std::shared_ptr<ov::Model> combined_draft_model;
+    std::shared_ptr<ov::Model> context_kv_model;   // V3: KV projector
+    std::shared_ptr<ov::Model> step_draft_model;    // V3: lightweight draft step
     std::shared_ptr<ov::Model> vision_model;
     ov::Tensor vl_pos_embed_weight;  // Extracted in scope for VL preprocessing later
+
+    // V3 draft path: use cached context KV projections (env var to enable)
+    bool use_kv_cache_draft = false;  // default: use V2 path (V3 KV caching is slower due to data transfer)
+    if (const char* env = std::getenv("OV_GENAI_DFLASH_USE_V3")) {
+        use_kv_cache_draft = (std::string(env) == "1");
+    }
+
     {
         auto target_data = ov::genai::safetensors::load_safetensors(target_dir);
         ov::genai::safetensors::SafetensorsWeightSource target_source(std::move(target_data));
@@ -480,11 +489,23 @@ int main(int argc, char* argv[]) try {
         context_fc_model = ov::genai::modeling::models::create_qwen3_5_dflash_context_fc_model(
             dflash_cfg, draft_source, draft_finalizer);
 
-        // Build combined draft model V2 (takes pre-computed context_hidden, skips fc+hidden_norm)
-        std::cout << "[Building combined draft model V2 (embed+draft+lm_head, cached context)...]" << std::endl;
-        combined_draft_model = ov::genai::modeling::models::create_qwen3_5_dflash_combined_draft_model_v2(
-            target_qwen35_cfg, dflash_cfg, target_source, target_finalizer,
-            draft_source, draft_finalizer);
+        if (use_kv_cache_draft) {
+            // V3 path: context_kv projector + lightweight step model
+            std::cout << "[Building context_kv model (KV projector)...]" << std::endl;
+            context_kv_model = ov::genai::modeling::models::create_qwen3_5_dflash_context_kv_model(
+                dflash_cfg, draft_source, draft_finalizer);
+
+            std::cout << "[Building step draft model V3 (embed+draft+lm_head, cached KV)...]" << std::endl;
+            step_draft_model = ov::genai::modeling::models::create_qwen3_5_dflash_step_model(
+                target_qwen35_cfg, dflash_cfg, target_source, target_finalizer,
+                draft_source, draft_finalizer);
+        } else {
+            // V2 path: combined draft model with context_hidden
+            std::cout << "[Building combined draft model V2 (embed+draft+lm_head, cached context)...]" << std::endl;
+            combined_draft_model = ov::genai::modeling::models::create_qwen3_5_dflash_combined_draft_model_v2(
+                target_qwen35_cfg, dflash_cfg, target_source, target_finalizer,
+                draft_source, draft_finalizer);
+        }
     } // Weight sources (target_source, draft_source) and their safetensors data freed here.
 
     // Compile models
@@ -631,13 +652,33 @@ int main(int argc, char* argv[]) try {
     auto compiled_target = core.compile_model(target_model, device, compile_cfg);
     std::cout << "[Compiling context_fc model (fc+hidden_norm) on CPU...]" << std::endl;
     auto compiled_context_fc = core.compile_model(context_fc_model, "CPU", {});
-    std::cout << "[Compiling combined draft model V2 (cached context)...]" << std::endl;
-    auto compiled_draft = core.compile_model(combined_draft_model, device, compile_cfg);
-    std::cout << "[All 3 models compiled.]" << std::endl;
+
+    // Compile draft models (V3 or V2 path)
+    ov::CompiledModel compiled_draft;
+    ov::CompiledModel compiled_context_kv;
+    ov::CompiledModel compiled_step_draft;
+    if (use_kv_cache_draft) {
+        std::cout << "[Compiling context_kv projector on " << device << "...]" << std::endl;
+        compiled_context_kv = core.compile_model(context_kv_model, device, compile_cfg);
+        std::cout << "[Compiling step draft model V3 (cached KV) on " << device << "...]" << std::endl;
+        compiled_step_draft = core.compile_model(step_draft_model, device, compile_cfg);
+    } else {
+        std::cout << "[Compiling combined draft model V2 (cached context)...]" << std::endl;
+        compiled_draft = core.compile_model(combined_draft_model, device, compile_cfg);
+    }
+    std::cout << "[All models compiled.]" << std::endl;
 
     auto target_request = compiled_target.create_infer_request();
     auto context_fc_request = compiled_context_fc.create_infer_request();
-    auto draft_request = compiled_draft.create_infer_request();
+    ov::InferRequest draft_request;
+    ov::InferRequest context_kv_request;
+    ov::InferRequest step_draft_request;
+    if (use_kv_cache_draft) {
+        context_kv_request = compiled_context_kv.create_infer_request();
+        step_draft_request = compiled_step_draft.create_infer_request();
+    } else {
+        draft_request = compiled_draft.create_infer_request();
+    }
 
     // Release model graphs and weight data — no longer needed after compilation.
     // On iGPU (shared CPU/GPU memory), this recovers ~10+ GB that would otherwise
@@ -645,6 +686,8 @@ int main(int argc, char* argv[]) try {
     target_model.reset();
     context_fc_model.reset();
     combined_draft_model.reset();
+    context_kv_model.reset();
+    step_draft_model.reset();
     if (vision_model) vision_model.reset();
 
     target_request.reset_state();
@@ -880,6 +923,80 @@ int main(int argc, char* argv[]) try {
               << (using_usm_ctx ? " USM host" : " CPU") << ")" << std::endl;
     std::cerr << "[DFlash] initial context_hidden computed for " << prompt_len << " tokens" << std::endl;
 
+    // ── V3: Context KV cache for draft model ──
+    // Pre-compute K,V projections for all context tokens and cache them.
+    // Each draft step reuses cached KV and only projects draft tokens (16 vs 1000+).
+    const int32_t num_draft_layers = dflash_cfg.num_hidden_layers;
+    const int32_t kv_heads = dflash_cfg.num_key_value_heads > 0
+                                 ? dflash_cfg.num_key_value_heads
+                                 : dflash_cfg.num_attention_heads;
+    const int32_t head_dim_draft = dflash_cfg.head_dim > 0
+                                       ? dflash_cfg.head_dim
+                                       : (dflash_cfg.hidden_size / dflash_cfg.num_attention_heads);
+
+    // KV cache storage: one K,V pair per draft layer, shape [1, kv_heads, max_ctx_len, head_dim]
+    std::vector<ov::Tensor> kv_cache_k;  // per-layer K cache
+    std::vector<ov::Tensor> kv_cache_v;  // per-layer V cache
+    size_t kv_cache_len = 0;
+
+    if (use_kv_cache_draft) {
+        for (int32_t i = 0; i < num_draft_layers; ++i) {
+            ov::Tensor k_store, v_store;
+            if (has_gpu_context) {
+                try {
+                    k_store = remote_context.create_host_tensor(
+                        ov::element::f32, {1, static_cast<size_t>(kv_heads), max_ctx_len, static_cast<size_t>(head_dim_draft)});
+                    v_store = remote_context.create_host_tensor(
+                        ov::element::f32, {1, static_cast<size_t>(kv_heads), max_ctx_len, static_cast<size_t>(head_dim_draft)});
+                } catch (const std::exception&) {
+                    k_store = ov::Tensor(ov::element::f32, {1, static_cast<size_t>(kv_heads), max_ctx_len, static_cast<size_t>(head_dim_draft)});
+                    v_store = ov::Tensor(ov::element::f32, {1, static_cast<size_t>(kv_heads), max_ctx_len, static_cast<size_t>(head_dim_draft)});
+                }
+            } else {
+                k_store = ov::Tensor(ov::element::f32, {1, static_cast<size_t>(kv_heads), max_ctx_len, static_cast<size_t>(head_dim_draft)});
+                v_store = ov::Tensor(ov::element::f32, {1, static_cast<size_t>(kv_heads), max_ctx_len, static_cast<size_t>(head_dim_draft)});
+            }
+            kv_cache_k.push_back(k_store);
+            kv_cache_v.push_back(v_store);
+        }
+
+        // Compute initial KV projections for prefill target_hidden
+        {
+            ov::Tensor initial_th(target_hidden_storage, {0, 0, 0}, {1, prompt_len, hidden_dim});
+            context_kv_request.set_tensor("target_hidden", initial_th);
+            context_kv_request.set_tensor("position_ids", make_mrope_position_ids(0, prompt_len));
+            // Note: context_kv model expects 2D position_ids [1, N], not 3D mRoPE.
+            // Use simple 1D position_ids for draft model RoPE.
+            ov::Tensor kv_pos_ids(ov::element::i64, {1, prompt_len});
+            {
+                auto* pd = kv_pos_ids.data<int64_t>();
+                for (size_t i = 0; i < prompt_len; ++i) pd[i] = static_cast<int64_t>(i);
+            }
+            context_kv_request.set_tensor("position_ids", kv_pos_ids);
+            context_kv_request.infer();
+
+            // Copy per-layer K,V to cache storage
+            for (int32_t i = 0; i < num_draft_layers; ++i) {
+                auto k_out = context_kv_request.get_tensor("context_k_" + std::to_string(i));
+                auto v_out = context_kv_request.get_tensor("context_v_" + std::to_string(i));
+                ov::Tensor k_dst(kv_cache_k[i], {0, 0, 0, 0},
+                    {1, static_cast<size_t>(kv_heads), prompt_len, static_cast<size_t>(head_dim_draft)});
+                ov::Tensor v_dst(kv_cache_v[i], {0, 0, 0, 0},
+                    {1, static_cast<size_t>(kv_heads), prompt_len, static_cast<size_t>(head_dim_draft)});
+                k_out.copy_to(k_dst);
+                v_out.copy_to(v_dst);
+            }
+            kv_cache_len = prompt_len;
+        }
+
+        const size_t kv_cache_bytes = static_cast<size_t>(num_draft_layers) * 2 *
+            kv_heads * max_ctx_len * head_dim_draft * sizeof(float);
+        std::cerr << "[DFlash] V3 KV cache: " << num_draft_layers << " layers × 2(K,V) × ["
+                  << kv_heads << "," << max_ctx_len << "," << head_dim_draft << "] = "
+                  << (kv_cache_bytes / 1024 / 1024) << " MB" << std::endl;
+        std::cerr << "[DFlash] initial KV cache computed for " << prompt_len << " tokens" << std::endl;
+    }
+
     // ── Sliding window for draft model context_hidden ──
     // Limits how many context_hidden tokens the draft model sees each step.
     // Reduces draft compute from O(full_context) to O(window) while target model
@@ -896,6 +1013,16 @@ int main(int argc, char* argv[]) try {
 
     const size_t block_size = static_cast<size_t>(dflash_cfg.block_size);
 
+    // Per-step verbose output (default off to avoid console I/O overhead)
+    bool verbose_steps = false;
+    if (const char* env = std::getenv("OV_GENAI_DFLASH_VERBOSE")) {
+        verbose_steps = (std::string(env) == "1");
+    }
+
+    // Pre-allocate reusable tensors for draft step
+    ov::Tensor draft_block_ids_tensor(ov::element::i64, {1, static_cast<size_t>(block_size)});
+    ov::Tensor draft_pos_tensor;  // re-allocated only when size changes (V2 path: ctx_len varies)
+
     const auto generation_start = Clock::now();
 
     bool stopped_by_eos = false;
@@ -909,41 +1036,82 @@ int main(int argc, char* argv[]) try {
         double step_tracked_ms = 0.0;
 
         // Build draft block inputs: [last_token, MASK, MASK, ...]
-        std::vector<int64_t> block_ids(block_size, mask_token_id);
-        block_ids[0] = output_ids.back();
+        {
+            auto* ids = draft_block_ids_tensor.data<int64_t>();
+            ids[0] = output_ids.back();
+            for (size_t i = 1; i < block_size; ++i)
+                ids[i] = mask_token_id;
+        }
 
         auto draft_start = Clock::now();
 
-        // Apply sliding window: limit context_hidden to last ctx_window tokens
-        const size_t effective_ctx_len = (ctx_window > 0 && context_hidden_len > ctx_window)
-                                         ? ctx_window : context_hidden_len;
-        const size_t ctx_offset = context_hidden_len - effective_ctx_len;
+        ov::Tensor draft_logits;
+        if (use_kv_cache_draft) {
+            // ── V3 path: use cached context KV projections ──
+            // Draft position_ids: [T-1, T, T+1, ..., T+B-2] where T = kv_cache_len
+            ov::Tensor draft_pos(ov::element::i64, {1, block_size});
+            {
+                auto* pd = draft_pos.data<int64_t>();
+                for (size_t i = 0; i < block_size; ++i)
+                    pd[i] = static_cast<int64_t>(kv_cache_len - 1 + i);
+            }
 
-        // Draft position_ids (2D): [ctx_offset..ctx_end-1, ctx_end-1..ctx_end+B-2]
-        // Uses absolute positions so RoPE embeddings remain correct
-        const size_t total_pos = effective_ctx_len + block_size;
-        ov::Tensor draft_pos(ov::element::i64, {1, total_pos});
-        {
-            auto* pd = draft_pos.data<int64_t>();
-            for (size_t i = 0; i < effective_ctx_len; ++i)
-                pd[i] = static_cast<int64_t>(ctx_offset + i);
-            for (size_t i = effective_ctx_len; i < total_pos; ++i)
-                pd[i] = static_cast<int64_t>(context_hidden_len - 1 + (i - effective_ctx_len));
+            // Set per-layer context K,V — copy to contiguous tensors
+            // (sub-tensor views on dim 2 of 4D [1,heads,seq,dim] are non-contiguous
+            //  and GPU plugin may misinterpret the strided data)
+            for (int32_t i = 0; i < num_draft_layers; ++i) {
+                ov::Tensor k_dense(ov::element::f32,
+                    {1, static_cast<size_t>(kv_heads), kv_cache_len, static_cast<size_t>(head_dim_draft)});
+                ov::Tensor v_dense(ov::element::f32,
+                    {1, static_cast<size_t>(kv_heads), kv_cache_len, static_cast<size_t>(head_dim_draft)});
+                // Copy per-head slices from strided cache to dense tensor
+                const size_t head_src_stride = max_ctx_len * static_cast<size_t>(head_dim_draft);
+                const size_t head_dst_stride = kv_cache_len * static_cast<size_t>(head_dim_draft);
+                const size_t copy_bytes = kv_cache_len * static_cast<size_t>(head_dim_draft) * sizeof(float);
+                for (int32_t h = 0; h < kv_heads; ++h) {
+                    std::memcpy(k_dense.data<float>() + h * head_dst_stride,
+                                kv_cache_k[i].data<float>() + h * head_src_stride,
+                                copy_bytes);
+                    std::memcpy(v_dense.data<float>() + h * head_dst_stride,
+                                kv_cache_v[i].data<float>() + h * head_src_stride,
+                                copy_bytes);
+                }
+                step_draft_request.set_tensor("context_k_" + std::to_string(i), k_dense);
+                step_draft_request.set_tensor("context_v_" + std::to_string(i), v_dense);
+            }
+
+            step_draft_request.set_tensor("input_ids", draft_block_ids_tensor);
+            step_draft_request.set_tensor("position_ids", draft_pos);
+            step_draft_request.infer();
+            draft_logits = step_draft_request.get_tensor("logits");
+        } else {
+            // ── V2 path: full context_hidden recomputation ──
+            const size_t effective_ctx_len = (ctx_window > 0 && context_hidden_len > ctx_window)
+                                             ? ctx_window : context_hidden_len;
+            const size_t ctx_offset = context_hidden_len - effective_ctx_len;
+
+            const size_t total_pos = effective_ctx_len + block_size;
+            ov::Tensor draft_pos(ov::element::i64, {1, total_pos});
+            {
+                auto* pd = draft_pos.data<int64_t>();
+                for (size_t i = 0; i < effective_ctx_len; ++i)
+                    pd[i] = static_cast<int64_t>(ctx_offset + i);
+                for (size_t i = effective_ctx_len; i < total_pos; ++i)
+                    pd[i] = static_cast<int64_t>(context_hidden_len - 1 + (i - effective_ctx_len));
+            }
+
+            ov::Tensor ctx_hidden_view(ctx_hidden_storage,
+                                       {0, ctx_offset, 0},
+                                       {1, ctx_offset + effective_ctx_len, ctx_hidden_dim});
+            draft_request.set_tensor("context_hidden", ctx_hidden_view);
+            draft_request.set_tensor("input_ids", draft_block_ids_tensor);
+            draft_request.set_tensor("position_ids", draft_pos);
+            draft_request.infer();
+            draft_logits = draft_request.get_tensor("logits");
         }
 
-        // Run combined draft model V2 with (windowed) cached context_hidden
-        ov::Tensor ctx_hidden_view(ctx_hidden_storage,
-                                   {0, ctx_offset, 0},
-                                   {1, ctx_offset + effective_ctx_len, ctx_hidden_dim});
-        draft_request.set_tensor("context_hidden", ctx_hidden_view);
-        draft_request.set_tensor("input_ids", make_ids_tensor(block_ids));
-        draft_request.set_tensor("position_ids", draft_pos);
-        draft_request.infer();
-
-        auto draft_logits = draft_request.get_tensor("logits");
-
         // Argmax draft tokens (skip position 0 which is the last accepted token)
-        const size_t draft_len = block_ids.size() - 1;
+        const size_t draft_len = block_size - 1;
         auto draft_tokens = argmax_logits_slice(draft_logits, 1, draft_len);
 
         auto draft_end = Clock::now();
@@ -953,7 +1121,7 @@ int main(int argc, char* argv[]) try {
 
         // Batch verification: construct block_output_ids
         std::vector<int64_t> block_output_ids;
-        block_output_ids.reserve(block_ids.size());
+        block_output_ids.reserve(block_size);
         block_output_ids.push_back(output_ids.back());  // Last accepted token
         block_output_ids.insert(block_output_ids.end(), draft_tokens.begin(), draft_tokens.end());
 
@@ -1072,6 +1240,33 @@ int main(int argc, char* argv[]) try {
             context_fc_request.set_tensor("target_hidden", new_th);
             context_fc_request.start_async();
 
+            // V3: update KV cache with projections for newly accepted tokens
+            if (use_kv_cache_draft) {
+                context_kv_request.set_tensor("target_hidden", new_th);
+                // Position IDs for the new tokens: [target_hidden_len, ..., target_hidden_len + num_accepted - 1]
+                ov::Tensor new_kv_pos(ov::element::i64, {1, num_accepted});
+                {
+                    auto* pd = new_kv_pos.data<int64_t>();
+                    for (size_t i = 0; i < num_accepted; ++i)
+                        pd[i] = static_cast<int64_t>(target_hidden_len + i);
+                }
+                context_kv_request.set_tensor("position_ids", new_kv_pos);
+                context_kv_request.infer();
+
+                // Append new K,V to cache storage
+                for (int32_t i = 0; i < num_draft_layers; ++i) {
+                    auto k_out = context_kv_request.get_tensor("context_k_" + std::to_string(i));
+                    auto v_out = context_kv_request.get_tensor("context_v_" + std::to_string(i));
+                    ov::Tensor k_dst(kv_cache_k[i], {0, 0, kv_cache_len, 0},
+                        {1, static_cast<size_t>(kv_heads), kv_cache_len + num_accepted, static_cast<size_t>(head_dim_draft)});
+                    ov::Tensor v_dst(kv_cache_v[i], {0, 0, kv_cache_len, 0},
+                        {1, static_cast<size_t>(kv_heads), kv_cache_len + num_accepted, static_cast<size_t>(head_dim_draft)});
+                    k_out.copy_to(k_dst);
+                    v_out.copy_to(v_dst);
+                }
+                kv_cache_len += num_accepted;
+            }
+
             target_hidden_len += num_accepted;
         }
 
@@ -1085,19 +1280,21 @@ int main(int argc, char* argv[]) try {
         ++perf.draft_steps;
         perf.accepted_tokens += accepted;  // raw acceptance (before max_length clipping, matches pipeline)
         perf.accepted_per_step.push_back(accepted);
-        // Collect tokens for batch decode at end (avoid per-step tokenizer overhead)
+    // Collect tokens for batch decode at end (avoid per-step tokenizer overhead)
         {
             std::vector<int64_t> step_toks;
             for (size_t i = 0; i < accepted; ++i)
                 step_toks.push_back(draft_tokens[i]);
             step_toks.push_back(posterior_next);
-            std::cout << "[Step " << perf.draft_steps << "] accepted=" << accepted
-                      << " ids=[";
-            for (size_t i = 0; i < step_toks.size(); ++i) {
-                if (i) std::cout << ",";
-                std::cout << step_toks[i];
+            if (verbose_steps) {
+                std::cout << "[Step " << perf.draft_steps << "] accepted=" << accepted
+                          << " ids=[";
+                for (size_t i = 0; i < step_toks.size(); ++i) {
+                    if (i) std::cout << ",";
+                    std::cout << step_toks[i];
+                }
+                std::cout << "]\n";
             }
-            std::cout << "]" << std::endl;
         }
 
         // Wait for context_fc to finish (should have completed during postprocessing above)
