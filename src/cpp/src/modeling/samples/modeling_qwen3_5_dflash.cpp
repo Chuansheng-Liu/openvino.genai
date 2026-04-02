@@ -790,6 +790,30 @@ int main(int argc, char* argv[]) try {
     target_hidden_block.copy_to(target_hidden_init);
     size_t target_hidden_len = prompt_len;
 
+    // Pre-allocate USM tensor for target_hidden output to avoid GPU→CPU copy each decode step.
+    // After set_tensor, the GPU writes directly to USM (CPU-readable on iGPU).
+    bool using_usm_output = false;
+    if (using_usm_storage) {
+        try {
+            const size_t max_verify_tokens = std::max(prompt_len,
+                static_cast<size_t>(dflash_cfg.block_size) + 1);
+            auto target_hidden_output_usm = remote_context.create_host_tensor(
+                hidden_elem_type, {1, max_verify_tokens, hidden_dim});
+            target_request.set_tensor("target_hidden", target_hidden_output_usm);
+            using_usm_output = true;
+            std::cerr << "[DFlash] target_hidden output bound to USM host tensor" << std::endl;
+        } catch (const std::exception& e) {
+            std::cerr << "[DFlash] USM output binding failed: " << e.what() << std::endl;
+        }
+    }
+
+    // Helper: get target_hidden as CPU-readable tensor (zero-copy if USM, else GPU→CPU copy)
+    auto get_target_hidden = [&]() -> ov::Tensor {
+        auto t = target_request.get_tensor("target_hidden");
+        if (using_usm_output) return t;
+        return copy_to_host(t);
+    };
+
     int64_t next_token = argmax_last_token(logits);
     auto prefill_end = Clock::now();
     perf.ttft_ms = duration_ms(prefill_start, prefill_end);
@@ -924,15 +948,15 @@ int main(int argc, char* argv[]) try {
             ov::genai::utils::trim_kv_cache(target_request, target_kv_state, std::nullopt);
             target_kv_state.num_tokens_to_trim = 0;
 
-            target_hidden_block = copy_to_host(target_request.get_tensor("target_hidden"));
+            target_hidden_block = get_target_hidden();
         } else if (all_accepted) {
-            target_hidden_block = copy_to_host(target_request.get_tensor("target_hidden"));
+            target_hidden_block = get_target_hidden();
         } else if (!has_linear_states) {
             const size_t tokens_to_trim = verify_len - num_accepted;
             target_kv_state.num_tokens_to_trim = tokens_to_trim;
             ov::genai::utils::trim_kv_cache(target_request, target_kv_state, std::nullopt);
             target_kv_state.num_tokens_to_trim = 0;
-            target_hidden_block = copy_to_host(target_request.get_tensor("target_hidden"));
+            target_hidden_block = get_target_hidden();
         } else {
             restore_linear_states(target_request, saved_linear);
 
@@ -955,7 +979,7 @@ int main(int argc, char* argv[]) try {
                 target_request.infer();
             }
 
-            target_hidden_block = copy_to_host(target_request.get_tensor("target_hidden"));
+            target_hidden_block = get_target_hidden();
         }
 
         if (num_accepted > 0 && target_hidden_len + num_accepted <= max_length + static_cast<size_t>(dflash_cfg.block_size)) {
