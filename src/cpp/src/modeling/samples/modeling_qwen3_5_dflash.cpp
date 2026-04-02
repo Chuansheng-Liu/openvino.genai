@@ -443,6 +443,7 @@ int main(int argc, char* argv[]) try {
     // Build models inside a scope so that weight sources are freed after model building.
     // On iGPU (shared CPU/GPU memory), this recovers ~10+ GB of safetensors data.
     std::shared_ptr<ov::Model> target_model;
+    std::shared_ptr<ov::Model> context_fc_model;
     std::shared_ptr<ov::Model> combined_draft_model;
     std::shared_ptr<ov::Model> vision_model;
     ov::Tensor vl_pos_embed_weight;  // Extracted in scope for VL preprocessing later
@@ -474,9 +475,14 @@ int main(int argc, char* argv[]) try {
             vl_pos_embed_weight = target_source.get_tensor(pos_embed_name);
         }
 
-        // Build combined draft model (embed + draft layers + lm_head in single graph)
-        std::cout << "[Building combined draft model (embed+draft+lm_head)...]" << std::endl;
-        combined_draft_model = ov::genai::modeling::models::create_qwen3_5_dflash_combined_draft_model(
+        // Build context_fc model (fc + hidden_norm only — for incremental context_hidden caching)
+        std::cout << "[Building context_fc model (fc+hidden_norm)...]" << std::endl;
+        context_fc_model = ov::genai::modeling::models::create_qwen3_5_dflash_context_fc_model(
+            dflash_cfg, draft_source, draft_finalizer);
+
+        // Build combined draft model V2 (takes pre-computed context_hidden, skips fc+hidden_norm)
+        std::cout << "[Building combined draft model V2 (embed+draft+lm_head, cached context)...]" << std::endl;
+        combined_draft_model = ov::genai::modeling::models::create_qwen3_5_dflash_combined_draft_model_v2(
             target_qwen35_cfg, dflash_cfg, target_source, target_finalizer,
             draft_source, draft_finalizer);
     } // Weight sources (target_source, draft_source) and their safetensors data freed here.
@@ -616,17 +622,21 @@ int main(int argc, char* argv[]) try {
     std::cout << "[Compiling models on " << device << "...]" << std::endl;
     std::cout << "[Compiling target model...]" << std::endl;
     auto compiled_target = core.compile_model(target_model, device, compile_cfg);
-    std::cout << "[Compiling combined draft model (embed+draft+lm_head)...]" << std::endl;
+    std::cout << "[Compiling context_fc model (fc+hidden_norm)...]" << std::endl;
+    auto compiled_context_fc = core.compile_model(context_fc_model, device, compile_cfg);
+    std::cout << "[Compiling combined draft model V2 (cached context)...]" << std::endl;
     auto compiled_draft = core.compile_model(combined_draft_model, device, compile_cfg);
-    std::cout << "[All 2 models compiled.]" << std::endl;
+    std::cout << "[All 3 models compiled.]" << std::endl;
 
     auto target_request = compiled_target.create_infer_request();
+    auto context_fc_request = compiled_context_fc.create_infer_request();
     auto draft_request = compiled_draft.create_infer_request();
 
     // Release model graphs and weight data — no longer needed after compilation.
     // On iGPU (shared CPU/GPU memory), this recovers ~10+ GB that would otherwise
     // compete with GPU for memory bandwidth during decode.
     target_model.reset();
+    context_fc_model.reset();
     combined_draft_model.reset();
     if (vision_model) vision_model.reset();
 
@@ -826,7 +836,46 @@ int main(int argc, char* argv[]) try {
     const double prefill_ms = duration_ms(prefill_start, prefill_end);
     perf.prefill_wall.add(prefill_ms);
 
+    // ── Context hidden cache for draft model V2 ──
+    // Pre-compute context_hidden = hidden_norm(fc(target_hidden)) and cache it.
+    // Each draft step reuses the cache instead of recomputing fc on the full context.
+    const size_t ctx_hidden_dim = static_cast<size_t>(dflash_cfg.hidden_size);
+    const size_t max_ctx_len = max_length + static_cast<size_t>(dflash_cfg.block_size);
+    // Allocate cache as USM host tensor (zero-copy read by GPU draft model)
+    ov::Tensor ctx_hidden_storage;
+    bool using_usm_ctx = false;
+    if (has_gpu_context) {
+        try {
+            ctx_hidden_storage = remote_context.create_host_tensor(
+                ov::element::f32, {1, max_ctx_len, ctx_hidden_dim});
+            using_usm_ctx = true;
+        } catch (const std::exception&) {
+            using_usm_ctx = false;
+        }
+    }
+    if (!using_usm_ctx) {
+        ctx_hidden_storage = ov::Tensor(ov::element::f32, {1, max_ctx_len, ctx_hidden_dim});
+    }
+
+    // Compute initial context_hidden from prefill target_hidden
+    {
+        ov::Tensor initial_th(target_hidden_storage, {0, 0, 0}, {1, prompt_len, hidden_dim});
+        context_fc_request.set_tensor("target_hidden", initial_th);
+        context_fc_request.infer();
+        auto init_ctx = context_fc_request.get_tensor("context_hidden");
+        ov::Tensor dst_init(ctx_hidden_storage, {0, 0, 0}, {1, prompt_len, ctx_hidden_dim});
+        init_ctx.copy_to(dst_init);
+    }
+    size_t context_hidden_len = prompt_len;
+    std::cerr << "[DFlash] context_hidden cache: [1," << max_ctx_len
+              << "," << ctx_hidden_dim << "] = "
+              << (max_ctx_len * ctx_hidden_dim * sizeof(float) / 1024 / 1024) << " MB (f32"
+              << (using_usm_ctx ? " USM host" : " CPU") << ")" << std::endl;
+    std::cerr << "[DFlash] initial context_hidden computed for " << prompt_len << " tokens" << std::endl;
+
     std::cout << "\n[Generating...]" << std::flush;
+
+    const size_t block_size = static_cast<size_t>(dflash_cfg.block_size);
 
     const auto generation_start = Clock::now();
 
@@ -841,25 +890,27 @@ int main(int argc, char* argv[]) try {
         double step_tracked_ms = 0.0;
 
         // Build draft block inputs: [last_token, MASK, MASK, ...]
-        std::vector<int64_t> block_ids(static_cast<size_t>(dflash_cfg.block_size), mask_token_id);
+        std::vector<int64_t> block_ids(block_size, mask_token_id);
         block_ids[0] = output_ids.back();
 
         auto draft_start = Clock::now();
 
         // Draft position_ids (2D): [0..T-1, T-1..T+B-2] — context + draft with overlap
-        const size_t total_pos = target_hidden_len + block_ids.size();
+        const size_t total_pos = context_hidden_len + block_size;
         ov::Tensor draft_pos(ov::element::i64, {1, total_pos});
         {
             auto* pd = draft_pos.data<int64_t>();
-            for (size_t i = 0; i < target_hidden_len; ++i)
+            for (size_t i = 0; i < context_hidden_len; ++i)
                 pd[i] = static_cast<int64_t>(i);
-            for (size_t i = target_hidden_len; i < total_pos; ++i)
-                pd[i] = static_cast<int64_t>(target_hidden_len - 1 + (i - target_hidden_len));
+            for (size_t i = context_hidden_len; i < total_pos; ++i)
+                pd[i] = static_cast<int64_t>(context_hidden_len - 1 + (i - context_hidden_len));
         }
 
-        // Run combined draft model (embed + draft + lm_head in one GPU dispatch)
-        ov::Tensor hidden_view(target_hidden_storage, {0, 0, 0}, {1, target_hidden_len, hidden_dim});
-        draft_request.set_tensor("target_hidden", hidden_view);
+        // Run combined draft model V2 with cached context_hidden (no fc recomputation)
+        ov::Tensor ctx_hidden_view(ctx_hidden_storage,
+                                   {0, 0, 0},
+                                   {1, context_hidden_len, ctx_hidden_dim});
+        draft_request.set_tensor("context_hidden", ctx_hidden_view);
         draft_request.set_tensor("input_ids", make_ids_tensor(block_ids));
         draft_request.set_tensor("position_ids", draft_pos);
         draft_request.infer();
@@ -988,6 +1039,14 @@ int main(int argc, char* argv[]) try {
                                  {0, target_hidden_len, 0},
                                  {1, target_hidden_len + num_accepted, hidden_dim});
             src_slice.copy_to(dst_slice);
+
+            // Launch context_fc async — overlaps GPU work with CPU postprocessing below
+            ov::Tensor new_th(target_hidden_storage,
+                              {0, target_hidden_len, 0},
+                              {1, target_hidden_len + num_accepted, hidden_dim});
+            context_fc_request.set_tensor("target_hidden", new_th);
+            context_fc_request.start_async();
+
             target_hidden_len += num_accepted;
         }
 
@@ -1015,6 +1074,18 @@ int main(int argc, char* argv[]) try {
             }
             std::cout << "] [" << text << "]" << std::endl;
         }
+
+        // Wait for context_fc to finish (should have completed during postprocessing above)
+        if (num_accepted > 0) {
+            context_fc_request.wait();
+            auto new_ctx = context_fc_request.get_tensor("context_hidden");
+            ov::Tensor ctx_dst(ctx_hidden_storage,
+                               {0, context_hidden_len, 0},
+                               {1, context_hidden_len + num_accepted, ctx_hidden_dim});
+            new_ctx.copy_to(ctx_dst);
+            context_hidden_len += num_accepted;
+        }
+
         auto postproc_end = Clock::now();
         perf.postproc_wall.add(duration_ms(postproc_start, postproc_end));
 

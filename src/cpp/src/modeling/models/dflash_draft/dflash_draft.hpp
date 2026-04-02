@@ -192,6 +192,16 @@ public:
         const Tensor& position_ids,
         const std::vector<std::pair<Tensor, Tensor>>& context_kv) const;
 
+    /// Compute context_hidden from target_hidden (fc + hidden_norm only).
+    /// Used by context_fc model to cache the result.
+    Tensor compute_context_hidden(const Tensor& target_hidden) const;
+
+    /// Forward with pre-computed context_hidden (skips fc + hidden_norm).
+    /// context_hidden: [1, T, hidden_size] from compute_context_hidden().
+    Tensor forward_with_context(const Tensor& context_hidden,
+                                const Tensor& noise_embedding,
+                                const Tensor& position_ids) const;
+
 private:
     const Tensor& fc_weight() const;
 

@@ -1599,6 +1599,106 @@ std::shared_ptr<ov::Model> create_qwen3_5_dflash_step_model(
     return ctx.build_model({logits_result->output(0)});
 }
 
+// ============================================================================
+// DFlash Context FC Model — computes fc + hidden_norm only
+// ============================================================================
+// Runs on new target_hidden tokens to produce context_hidden for caching.
+// Input:  target_hidden [1, A, ctx_dim]
+// Output: context_hidden [1, A, hidden_size]
+std::shared_ptr<ov::Model> create_qwen3_5_dflash_context_fc_model(
+    const DFlashDraftConfig& draft_cfg,
+    ov::genai::modeling::weights::WeightSource& draft_source,
+    ov::genai::modeling::weights::WeightFinalizer& draft_finalizer) {
+    BuilderContext ctx;
+
+    DFlashDraftModel draft_model(ctx, draft_cfg);
+    ov::genai::modeling::weights::load_model(draft_model, draft_source, draft_finalizer);
+
+    const ov::element::Type dtype = ov::element::f32;
+    const int64_t ctx_dim = static_cast<int64_t>(draft_cfg.hidden_size) *
+                            static_cast<int64_t>(draft_cfg.num_hidden_layers);
+    auto target_hidden = ctx.parameter("target_hidden", dtype, ov::PartialShape{-1, -1, ctx_dim});
+
+    auto context_hidden = draft_model.compute_context_hidden(target_hidden);
+
+    auto result = std::make_shared<ov::op::v0::Result>(context_hidden.output());
+    set_name(result, "context_hidden");
+
+    return ctx.build_model({result->output(0)});
+}
+
+// ============================================================================
+// DFlash Combined Draft Model V2 — takes pre-computed context_hidden
+// ============================================================================
+// Skips fc + hidden_norm (cached externally). Same as combined_draft but with
+// context_hidden [1, T, hidden_size] input instead of target_hidden [1, T, ctx_dim].
+std::shared_ptr<ov::Model> create_qwen3_5_dflash_combined_draft_model_v2(
+    const Qwen3_5Config& qwen_cfg,
+    const DFlashDraftConfig& draft_cfg,
+    ov::genai::modeling::weights::WeightSource& target_source,
+    ov::genai::modeling::weights::WeightFinalizer& target_finalizer,
+    ov::genai::modeling::weights::WeightSource& draft_source,
+    ov::genai::modeling::weights::WeightFinalizer& draft_finalizer) {
+    BuilderContext ctx;
+
+    // ── Embedding path (target weights under "model" prefix) ──
+    Module embed_root("model", ctx);
+    VocabEmbedding embed(ctx, "embed_tokens", &embed_root);
+    embed_root.packed_mapping().rules.push_back({"model.language_model.", "model.", 0});
+    embed_root.packed_mapping().rules.push_back({"language_model.", "model.", 0});
+
+    ov::genai::modeling::weights::LoadOptions options;
+    options.allow_unmatched = true;
+    options.allow_missing = false;
+    options.report_unmatched = false;
+    options.report_missing = true;
+    ov::genai::modeling::weights::load_model(embed_root, target_source, target_finalizer, options);
+
+    // ── Draft layers (draft weights) ──
+    DFlashDraftModel draft_model(ctx, draft_cfg);
+    ov::genai::modeling::weights::load_model(draft_model, draft_source, draft_finalizer);
+
+    // ── LM head (target weights, tied to embed_tokens when configured) ──
+    Module lm_root("", ctx);
+    LMHead head(ctx, "lm_head", &lm_root);
+    if (qwen_cfg.tie_word_embeddings) {
+        head.tie_to(embed.weight_param());
+    } else if (!target_source.has("lm_head.weight")) {
+        const std::vector<std::string> embed_candidates = {
+            "model.embed_tokens.weight",
+            "model.language_model.embed_tokens.weight",
+            "language_model.embed_tokens.weight",
+        };
+        std::string embed_weight;
+        for (const auto& name : embed_candidates) {
+            if (target_source.has(name)) { embed_weight = name; break; }
+        }
+        if (!embed_weight.empty()) {
+            auto tied = target_finalizer.finalize(embed_weight, target_source, ctx.op_context());
+            head.weight_param().bind(tied);
+        }
+    }
+    ov::genai::modeling::weights::load_model(lm_root, target_source, target_finalizer, options);
+
+    // ── Inputs ──
+    const ov::element::Type dtype = ov::element::f32;
+    auto context_hidden = ctx.parameter("context_hidden", dtype,
+                                        ov::PartialShape{-1, -1, draft_cfg.hidden_size});
+    auto input_ids = ctx.parameter("input_ids", ov::element::i64, ov::PartialShape{-1, -1});
+    auto position_ids = ctx.parameter("position_ids", ov::element::i64, ov::PartialShape{-1, -1});
+
+    // ── Forward: embed → draft_with_context → lm_head (single graph, no fc) ──
+    auto noise_embedding = embed.forward(input_ids);
+    auto draft_hidden = draft_model.forward_with_context(context_hidden, noise_embedding, position_ids);
+    auto logits = head.forward(draft_hidden);
+
+    // ── Output ──
+    auto logits_result = std::make_shared<ov::op::v0::Result>(logits.output());
+    set_name(logits_result, "logits");
+
+    return ctx.build_model({logits_result->output(0)});
+}
+
 }  // namespace models
 }  // namespace modeling
 }  // namespace genai

@@ -418,6 +418,23 @@ Tensor DFlashDraftModel::forward_with_cached_kv(
     return norm_.forward(hidden_states);
 }
 
+Tensor DFlashDraftModel::compute_context_hidden(const Tensor& target_hidden) const {
+    auto conditioned = ops::linear(target_hidden, fc_weight());
+    return hidden_norm_.forward(conditioned);
+}
+
+Tensor DFlashDraftModel::forward_with_context(const Tensor& context_hidden,
+                                               const Tensor& noise_embedding,
+                                               const Tensor& position_ids) const {
+    auto hidden_states = noise_embedding;
+    auto* policy = &ctx().op_policy();
+    auto cos_sin = ops::llm::rope_cos_sin(position_ids, head_dim_, rope_theta_, policy);
+    for (const auto& layer : layers_) {
+        hidden_states = layer.forward(context_hidden, hidden_states, cos_sin.first, cos_sin.second);
+    }
+    return norm_.forward(hidden_states);
+}
+
 std::shared_ptr<ov::Model> create_dflash_draft_model(
     const DFlashDraftConfig& cfg,
     ov::genai::modeling::weights::WeightSource& source,
