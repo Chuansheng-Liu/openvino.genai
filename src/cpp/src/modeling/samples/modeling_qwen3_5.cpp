@@ -1372,6 +1372,21 @@ int main(int argc, char* argv[]) try {
         std::cout << "Throughput: N/A" << std::endl;
     }
 
+    // Report KV cache memory usage (non-fatal — explicit TQ path may not support state query)
+    try {
+        size_t total_kv_bytes = 0;
+        auto states = text_request.query_state();
+        for (auto& state : states) {
+            total_kv_bytes += state.get_state().get_byte_size();
+        }
+        if (total_kv_bytes > 0) {
+            std::cout << "KV cache size: " << std::fixed << std::setprecision(2)
+                      << (total_kv_bytes / (1024.0 * 1024.0)) << " MB" << std::endl;
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "[KV cache query skipped: " << e.what() << "]" << std::endl;
+    }
+
     if (tokenizer) {
         std::cout << tokenizer->decode(generated, ov::genai::skip_special_tokens(true)) << std::endl;
     } else {
