@@ -18,6 +18,7 @@
 #include <openvino/openvino.hpp>
 #include <openvino/core/type/bfloat16.hpp>
 #include <openvino/core/type/float16.hpp>
+#include <openvino/runtime/intel_gpu/properties.hpp>
 
 #include "openvino/genai/tokenizer.hpp"
 #include "loaders/model_config.hpp"
@@ -421,6 +422,21 @@ int main(int argc, char* argv[]) try {
     } else if (target_quant_arg.empty()) {
         target_quant_config = ov::genai::modeling::weights::parse_quantization_config_from_env();
     }
+    // Override group_size via env var
+    if (const char* env = std::getenv("OV_GENAI_DFLASH_GROUP_SIZE")) {
+        int gs = std::atoi(env);
+        if (gs > 0 && target_quant_config.enabled()) {
+            target_quant_config.group_size = gs;
+        }
+    }
+    // INT4 lm_head: set backup_mode = primary mode so lm_head also gets INT4
+    bool use_int4_lmhead = false;
+    if (const char* env = std::getenv("OV_GENAI_DFLASH_INT4_LMHEAD")) {
+        use_int4_lmhead = (std::string(env) == "1");
+    }
+    if (use_int4_lmhead && target_quant_config.enabled()) {
+        target_quant_config.backup_mode = target_quant_config.mode;
+    }
     std::cout << "[quant] target: " << (target_quant_config.enabled() ? quant_mode_name(target_quant_config.mode) : "FP16");
     if (target_quant_config.enabled()) std::cout << ", group_size=" << target_quant_config.group_size;
     std::cout << std::endl;
@@ -431,6 +447,16 @@ int main(int argc, char* argv[]) try {
         draft_quant_config.mode = parse_quant_mode(draft_quant_arg);
         draft_quant_config.group_size = 128;
         draft_quant_config.backup_mode = ov::genai::modeling::weights::QuantizationConfig::Mode::INT8_ASYM;
+    }
+    if (use_int4_lmhead && draft_quant_config.enabled()) {
+        draft_quant_config.backup_mode = draft_quant_config.mode;
+    }
+    // Override group_size via env var
+    if (const char* env = std::getenv("OV_GENAI_DFLASH_GROUP_SIZE")) {
+        int gs = std::atoi(env);
+        if (gs > 0 && draft_quant_config.enabled()) {
+            draft_quant_config.group_size = gs;
+        }
     }
     std::cout << "[quant] draft:  " << (draft_quant_config.enabled() ? quant_mode_name(draft_quant_config.mode) : "FP16");
     if (draft_quant_config.enabled()) std::cout << ", group_size=" << draft_quant_config.group_size;
@@ -520,15 +546,22 @@ int main(int argc, char* argv[]) try {
             use_f16_ctx = true;
             std::cout << "[Draft model: context_hidden input set to f16 via preprocessing]" << std::endl;
         } catch (const std::exception& e) {
-            std::cerr << "[Warning] Failed to apply f16 preprocessing: " << e.what() << std::endl;
+            std::cerr << "[Warning] Failed to apply f16 draft preprocessing: " << e.what() << std::endl;
         }
     }
 
     // Compile models
     ov::Core core;
+    // KV cache precision: env var override (default f16, try "u8" for INT8)
+    ov::element::Type kv_precision = ov::element::f16;
+    if (const char* env = std::getenv("OV_GENAI_DFLASH_KV_PREC")) {
+        std::string kv_str(env);
+        if (kv_str == "u8" || kv_str == "int8") kv_precision = ov::element::u8;
+        else if (kv_str == "f32") kv_precision = ov::element::f32;
+    }
     ov::AnyMap compile_cfg = {
         {ov::hint::inference_precision.name(), ov::element::f16},
-        {ov::hint::kv_cache_precision.name(), ov::element::f16},
+        {ov::hint::kv_cache_precision.name(), kv_precision},
         {ov::hint::performance_mode.name(), ov::hint::PerformanceMode::LATENCY},
     };
     // activations_scale_factor: env var override (0 = disable, default 8.0)
@@ -538,6 +571,13 @@ int main(int argc, char* argv[]) try {
     }
     if (act_scale > 0.0f) {
         compile_cfg[ov::hint::activations_scale_factor.name()] = act_scale;
+    }
+    // dynamic_quantization_group_size: env var override (0 = disabled, try 32 or 64)
+    if (const char* env = std::getenv("OV_GENAI_DFLASH_DYN_QUANT")) {
+        uint64_t dyn_quant = static_cast<uint64_t>(std::atoi(env));
+        if (dyn_quant > 0) {
+            compile_cfg[ov::hint::dynamic_quantization_group_size.name()] = dyn_quant;
+        }
     }
 
     std::cout << "[compile_cfg] ";
@@ -679,10 +719,14 @@ int main(int argc, char* argv[]) try {
     ov::CompiledModel compiled_context_kv;
     ov::CompiledModel compiled_step_draft;
     if (use_kv_cache_draft) {
-        std::cout << "[Compiling context_kv projector on " << device << "...]" << std::endl;
-        compiled_context_kv = core.compile_model(context_kv_model, device, compile_cfg);
-        std::cout << "[Compiling step draft model V3 (cached KV) on " << device << "...]" << std::endl;
-        compiled_step_draft = core.compile_model(step_draft_model, device, compile_cfg);
+        ov::AnyMap cpu_draft_cfg = {
+            {ov::hint::performance_mode.name(), ov::hint::PerformanceMode::LATENCY},
+            {ov::hint::num_requests.name(), 1},
+        };
+        std::cout << "[Compiling context_kv projector on CPU...]" << std::endl;
+        compiled_context_kv = core.compile_model(context_kv_model, "CPU", cpu_draft_cfg);
+        std::cout << "[Compiling step draft model V3 (cached KV) on CPU...]" << std::endl;
+        compiled_step_draft = core.compile_model(step_draft_model, "CPU", cpu_draft_cfg);
     } else {
         std::cout << "[Compiling combined draft model V2 (cached context)...]" << std::endl;
         compiled_draft = core.compile_model(combined_draft_model, device, compile_cfg);
@@ -977,22 +1021,10 @@ int main(int argc, char* argv[]) try {
     size_t kv_cache_len = 0;
 
     if (use_kv_cache_draft) {
+        // V3 draft runs on CPU — allocate KV cache as regular CPU tensors
         for (int32_t i = 0; i < num_draft_layers; ++i) {
-            ov::Tensor k_store, v_store;
-            if (has_gpu_context) {
-                try {
-                    k_store = remote_context.create_host_tensor(
-                        ov::element::f32, {1, static_cast<size_t>(kv_heads), max_ctx_len, static_cast<size_t>(head_dim_draft)});
-                    v_store = remote_context.create_host_tensor(
-                        ov::element::f32, {1, static_cast<size_t>(kv_heads), max_ctx_len, static_cast<size_t>(head_dim_draft)});
-                } catch (const std::exception&) {
-                    k_store = ov::Tensor(ov::element::f32, {1, static_cast<size_t>(kv_heads), max_ctx_len, static_cast<size_t>(head_dim_draft)});
-                    v_store = ov::Tensor(ov::element::f32, {1, static_cast<size_t>(kv_heads), max_ctx_len, static_cast<size_t>(head_dim_draft)});
-                }
-            } else {
-                k_store = ov::Tensor(ov::element::f32, {1, static_cast<size_t>(kv_heads), max_ctx_len, static_cast<size_t>(head_dim_draft)});
-                v_store = ov::Tensor(ov::element::f32, {1, static_cast<size_t>(kv_heads), max_ctx_len, static_cast<size_t>(head_dim_draft)});
-            }
+            ov::Tensor k_store(ov::element::f32, {1, static_cast<size_t>(kv_heads), max_ctx_len, static_cast<size_t>(head_dim_draft)});
+            ov::Tensor v_store(ov::element::f32, {1, static_cast<size_t>(kv_heads), max_ctx_len, static_cast<size_t>(head_dim_draft)});
             kv_cache_k.push_back(k_store);
             kv_cache_v.push_back(v_store);
         }
@@ -1001,8 +1033,7 @@ int main(int argc, char* argv[]) try {
         {
             ov::Tensor initial_th(target_hidden_storage, {0, 0, 0}, {1, prompt_len, hidden_dim});
             context_kv_request.set_tensor("target_hidden", initial_th);
-            context_kv_request.set_tensor("position_ids", make_mrope_position_ids(0, prompt_len));
-            // Note: context_kv model expects 2D position_ids [1, N], not 3D mRoPE.
+            // context_kv model expects 2D position_ids [1, N], not 3D mRoPE.
             // Use simple 1D position_ids for draft model RoPE.
             ov::Tensor kv_pos_ids(ov::element::i64, {1, prompt_len});
             {
@@ -1044,6 +1075,25 @@ int main(int argc, char* argv[]) try {
     }
     if (ctx_window > 0) {
         std::cerr << "[DFlash] context_hidden sliding window: " << ctx_window << " tokens" << std::endl;
+    }
+
+    // ── Context stride for draft model ──
+    // Downsample context_hidden by taking every Kth token instead of all tokens.
+    // Reduces draft K,V projection from O(T) to O(T/K) while preserving info from full context.
+    // 0 or 1 = no downsampling (use all tokens).
+    size_t ctx_stride = 1;
+    if (const char* env = std::getenv("OV_GENAI_DFLASH_CTX_STRIDE")) {
+        ctx_stride = std::max(static_cast<size_t>(1), static_cast<size_t>(std::atoi(env)));
+    }
+    if (ctx_stride > 1) {
+        std::cerr << "[DFlash] context_hidden stride: " << ctx_stride
+                  << " (use every " << ctx_stride << "th token)" << std::endl;
+    }
+    // Pre-allocate strided context buffer (reused across steps to avoid per-step allocation)
+    ov::Tensor strided_ctx_buffer;
+    if (ctx_stride > 1) {
+        const size_t max_strided_len = (max_ctx_len + ctx_stride - 1) / ctx_stride;
+        strided_ctx_buffer = ov::Tensor(ctx_elem, {1, max_strided_len, ctx_hidden_dim});
     }
 
     std::cout << "\n[Generating...]" << std::flush;
@@ -1127,20 +1177,47 @@ int main(int argc, char* argv[]) try {
                                              ? ctx_window : context_hidden_len;
             const size_t ctx_offset = context_hidden_len - effective_ctx_len;
 
-            const size_t total_pos = effective_ctx_len + block_size;
+            // Apply context stride: copy every ctx_stride-th token into contiguous buffer
+            size_t draft_ctx_len = effective_ctx_len;
+            ov::Tensor ctx_for_draft;
+            if (ctx_stride > 1 && effective_ctx_len > ctx_stride) {
+                // Always include first and last few tokens for best context coverage
+                draft_ctx_len = (effective_ctx_len + ctx_stride - 1) / ctx_stride;
+                ov::Tensor dst_view(strided_ctx_buffer, {0, 0, 0}, {1, draft_ctx_len, ctx_hidden_dim});
+                const size_t row_bytes = ctx_hidden_dim * ctx_elem_size;
+                const auto* src_base = static_cast<const uint8_t*>(ctx_hidden_storage.data()) +
+                    ctx_offset * ctx_hidden_dim * ctx_elem_size;
+                auto* dst_base = static_cast<uint8_t*>(dst_view.data());
+                for (size_t j = 0; j < draft_ctx_len; ++j) {
+                    size_t src_idx = j * ctx_stride;
+                    if (src_idx >= effective_ctx_len) src_idx = effective_ctx_len - 1;
+                    std::memcpy(dst_base + j * row_bytes,
+                                src_base + src_idx * row_bytes,
+                                row_bytes);
+                }
+                ctx_for_draft = dst_view;
+            } else {
+                ctx_for_draft = ov::Tensor(ctx_hidden_storage,
+                                           {0, ctx_offset, 0},
+                                           {1, ctx_offset + effective_ctx_len, ctx_hidden_dim});
+            }
+
+            const size_t total_pos = draft_ctx_len + block_size;
             ov::Tensor draft_pos(ov::element::i64, {1, total_pos});
             {
                 auto* pd = draft_pos.data<int64_t>();
-                for (size_t i = 0; i < effective_ctx_len; ++i)
-                    pd[i] = static_cast<int64_t>(ctx_offset + i);
-                for (size_t i = effective_ctx_len; i < total_pos; ++i)
-                    pd[i] = static_cast<int64_t>(context_hidden_len - 1 + (i - effective_ctx_len));
+                // Context position IDs: map strided indices back to original positions
+                for (size_t i = 0; i < draft_ctx_len; ++i) {
+                    size_t orig_idx = (ctx_stride > 1) ? (i * ctx_stride) : i;
+                    if (orig_idx >= effective_ctx_len) orig_idx = effective_ctx_len - 1;
+                    pd[i] = static_cast<int64_t>(ctx_offset + orig_idx);
+                }
+                // Draft block position IDs: sequential from context end
+                for (size_t i = draft_ctx_len; i < total_pos; ++i)
+                    pd[i] = static_cast<int64_t>(context_hidden_len - 1 + (i - draft_ctx_len));
             }
 
-            ov::Tensor ctx_hidden_view(ctx_hidden_storage,
-                                       {0, ctx_offset, 0},
-                                       {1, ctx_offset + effective_ctx_len, ctx_hidden_dim});
-            draft_request.set_tensor("context_hidden", ctx_hidden_view);
+            draft_request.set_tensor("context_hidden", ctx_for_draft);
             draft_request.set_tensor("input_ids", draft_block_ids_tensor);
             draft_request.set_tensor("position_ids", draft_pos);
             draft_request.infer();
