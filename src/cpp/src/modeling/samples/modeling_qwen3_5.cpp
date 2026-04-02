@@ -11,6 +11,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <sstream>
 #include <iostream>
 #include <memory>
 #include <optional>
@@ -38,6 +39,7 @@
 #include "modeling/models/qwen3_5/processing_qwen3_5.hpp"
 #include "modeling/models/qwen3_5/qwen3_5_weight_specs.hpp"
 #include "modeling/weights/quantization_config.hpp"
+#include "modeling/ops/turboquant.hpp"
 #include "modeling/weights/synthetic_weight_source.hpp"
 #include "sampling/logit_processor.hpp"
 
@@ -213,6 +215,23 @@ std::string quant_cache_suffix(const ov::genai::modeling::weights::QuantizationC
     }
     return "_q" + quant_mode_cache_token(cfg.mode) + "_b" + quant_mode_cache_token(cfg.backup_mode) +
            "_g" + std::to_string(cfg.group_size);
+}
+
+// Append TurboQuant KV cache settings to the cache stem so that models built
+// with different TurboQuant parameters (bits, clip) get distinct filenames.
+std::string turboquant_cache_suffix(const ov::genai::modeling::turboquant::TurboQuantKVConfig& tq) {
+    if (!tq.enabled) {
+        return "";
+    }
+    // e.g. "_tqkv8" or "_tqkv4c2.5"
+    std::string s = "_tqkv" + std::to_string(tq.bits);
+    if (tq.clip_val != 4.0f) {
+        // Include clip value only when non-default to keep filenames short.
+        std::ostringstream oss;
+        oss << std::fixed << std::setprecision(1) << tq.clip_val;
+        s += "c" + oss.str();
+    }
+    return s;
 }
 
 SampleOptions parse_cli(int argc, char* argv[]) {
@@ -875,7 +894,10 @@ int main(int argc, char* argv[]) try {
         return std::filesystem::current_path();
     }();
     const std::filesystem::path ir_dir = use_dummy_mode_flag ? app_dir : model_dir;
-    std::string text_ir_stem = (use_vl ? "qwen3_5_text_vl" : "qwen3_5_text") + quant_cache_suffix(text_quant_config);
+    const auto tq_kv_cfg = ov::genai::modeling::turboquant::parse_turboquant_kv_config_from_env();
+    std::string text_ir_stem = (use_vl ? "qwen3_5_text_vl" : "qwen3_5_text") +
+                               quant_cache_suffix(text_quant_config) +
+                               turboquant_cache_suffix(tq_kv_cfg);
     if (opts.num_layers.has_value()) {
         text_ir_stem += "_l" + std::to_string(*opts.num_layers);
     }

@@ -21,6 +21,7 @@
 #include "modeling/ops/rope.hpp"
 #include "modeling/ops/shape.hpp"
 #include "modeling/ops/tensor_ops.hpp"
+#include "modeling/ops/turboquant.hpp"
 #include "modeling/weights/weight_loader.hpp"
 
 namespace {
@@ -70,6 +71,13 @@ bool use_fused_conv_op() {
     if (!raw || raw[0] == '\0')
         return true;  // enabled by default
     return std::string(raw) != "0";
+}
+
+const ov::genai::modeling::turboquant::TurboQuantKVConfig& turboquant_kv_config() {
+    // Parse once; all attention layers in the same process share the config.
+    static const ov::genai::modeling::turboquant::TurboQuantKVConfig cfg =
+        ov::genai::modeling::turboquant::parse_turboquant_kv_config_from_env();
+    return cfg;
 }
 
 ov::genai::modeling::models::Qwen3_5TextModelConfig apply_qwen3_5_layer_limit(
@@ -219,18 +227,28 @@ Tensor Qwen3_5Attention::forward(const Tensor& hidden_states,
     }
 
     const std::string cache_prefix = full_path().empty() ? name() : full_path();
-    auto cached = ops::append_kv_cache(k_heads, v_heads, beam_idx, num_kv_heads_, head_dim_, cache_prefix, ctx());
-    auto k_expanded = ops::llm::repeat_kv(cached.first, num_heads_, num_kv_heads_, head_dim_);
-    auto v_expanded = ops::llm::repeat_kv(cached.second, num_heads_, num_kv_heads_, head_dim_);
+    const auto& tq_cfg = turboquant_kv_config();
+    auto [q_rot, k_cached, v_cached, R_const] = ops::append_kv_cache_turboquant(
+        q_heads, k_heads, v_heads, beam_idx, num_kv_heads_, head_dim_, cache_prefix, ctx(),
+        tq_cfg);
+    auto k_expanded = ops::llm::repeat_kv(k_cached, num_heads_, num_kv_heads_, head_dim_);
+    auto v_expanded = ops::llm::repeat_kv(v_cached, num_heads_, num_kv_heads_, head_dim_);
 
-    const Tensor* sdpa_mask = precomputed_sdpa_mask;
-    std::optional<Tensor> local_mask;
-    if (!sdpa_mask) {
-        local_mask = attention_mask ? ops::llm::build_kv_causal_mask_with_attention(q_heads, cached.first, *attention_mask)
-                                    : ops::llm::build_kv_causal_mask(q_heads, cached.first);
-        sdpa_mask = &(*local_mask);
+    auto attn_raw = ops::llm::sdpa(q_rot, k_expanded, v_expanded, scaling_, 3, nullptr, true, policy);
+
+    // Unrotate output only when TurboQuant is active. When disabled the path
+    // goes through standard FP16 cache and no correction is needed.
+    Tensor attn;
+    if (tq_cfg.enabled) {
+        // attn_raw @ R recovers the original (unrotated) space.
+        // SDPA(Q@R^T, K@R^T, V@R^T) @ R = softmax(Q K^T/√D) @ V  (R orthogonal).
+        attn = ops::matmul(attn_raw.to(ov::element::f32),
+                           R_const.to(ov::element::f32),
+                           /*ta=*/false, /*tb=*/false)
+                   .to(attn_raw.dtype());
+    } else {
+        attn = attn_raw;
     }
-    auto attn = ops::llm::sdpa(q_heads, k_expanded, v_expanded, scaling_, 3, sdpa_mask, false, policy);
 
     const int64_t attn_hidden = static_cast<int64_t>(num_heads_) * static_cast<int64_t>(head_dim_);
     auto merged = attn.permute({0, 2, 1, 3}).reshape({0, 0, attn_hidden});
