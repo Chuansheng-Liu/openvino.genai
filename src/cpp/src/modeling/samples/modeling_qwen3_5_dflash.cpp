@@ -492,8 +492,15 @@ int main(int argc, char* argv[]) try {
     ov::AnyMap compile_cfg = {
         {ov::hint::inference_precision.name(), ov::element::f16},
         {ov::hint::kv_cache_precision.name(), ov::element::f16},
-        {ov::hint::activations_scale_factor.name(), 8.0f}
     };
+    // activations_scale_factor: env var override (0 = disable, default 8.0)
+    float act_scale = 8.0f;
+    if (const char* env = std::getenv("OV_GENAI_DFLASH_ACT_SCALE")) {
+        act_scale = std::stof(env);
+    }
+    if (act_scale > 0.0f) {
+        compile_cfg[ov::hint::activations_scale_factor.name()] = act_scale;
+    }
 
     std::cout << "[compile_cfg] ";
     for (const auto& kv : compile_cfg) {
@@ -622,8 +629,8 @@ int main(int argc, char* argv[]) try {
     std::cout << "[Compiling models on " << device << "...]" << std::endl;
     std::cout << "[Compiling target model...]" << std::endl;
     auto compiled_target = core.compile_model(target_model, device, compile_cfg);
-    std::cout << "[Compiling context_fc model (fc+hidden_norm)...]" << std::endl;
-    auto compiled_context_fc = core.compile_model(context_fc_model, device, compile_cfg);
+    std::cout << "[Compiling context_fc model (fc+hidden_norm) on CPU...]" << std::endl;
+    auto compiled_context_fc = core.compile_model(context_fc_model, "CPU", {});
     std::cout << "[Compiling combined draft model V2 (cached context)...]" << std::endl;
     auto compiled_draft = core.compile_model(combined_draft_model, device, compile_cfg);
     std::cout << "[All 3 models compiled.]" << std::endl;
@@ -873,6 +880,18 @@ int main(int argc, char* argv[]) try {
               << (using_usm_ctx ? " USM host" : " CPU") << ")" << std::endl;
     std::cerr << "[DFlash] initial context_hidden computed for " << prompt_len << " tokens" << std::endl;
 
+    // ── Sliding window for draft model context_hidden ──
+    // Limits how many context_hidden tokens the draft model sees each step.
+    // Reduces draft compute from O(full_context) to O(window) while target model
+    // still verifies with full KV cache.  0 = unlimited (use full context).
+    size_t ctx_window = 0;
+    if (const char* env = std::getenv("OV_GENAI_DFLASH_CTX_WINDOW")) {
+        ctx_window = static_cast<size_t>(std::atoi(env));
+    }
+    if (ctx_window > 0) {
+        std::cerr << "[DFlash] context_hidden sliding window: " << ctx_window << " tokens" << std::endl;
+    }
+
     std::cout << "\n[Generating...]" << std::flush;
 
     const size_t block_size = static_cast<size_t>(dflash_cfg.block_size);
@@ -895,21 +914,27 @@ int main(int argc, char* argv[]) try {
 
         auto draft_start = Clock::now();
 
-        // Draft position_ids (2D): [0..T-1, T-1..T+B-2] — context + draft with overlap
-        const size_t total_pos = context_hidden_len + block_size;
+        // Apply sliding window: limit context_hidden to last ctx_window tokens
+        const size_t effective_ctx_len = (ctx_window > 0 && context_hidden_len > ctx_window)
+                                         ? ctx_window : context_hidden_len;
+        const size_t ctx_offset = context_hidden_len - effective_ctx_len;
+
+        // Draft position_ids (2D): [ctx_offset..ctx_end-1, ctx_end-1..ctx_end+B-2]
+        // Uses absolute positions so RoPE embeddings remain correct
+        const size_t total_pos = effective_ctx_len + block_size;
         ov::Tensor draft_pos(ov::element::i64, {1, total_pos});
         {
             auto* pd = draft_pos.data<int64_t>();
-            for (size_t i = 0; i < context_hidden_len; ++i)
-                pd[i] = static_cast<int64_t>(i);
-            for (size_t i = context_hidden_len; i < total_pos; ++i)
-                pd[i] = static_cast<int64_t>(context_hidden_len - 1 + (i - context_hidden_len));
+            for (size_t i = 0; i < effective_ctx_len; ++i)
+                pd[i] = static_cast<int64_t>(ctx_offset + i);
+            for (size_t i = effective_ctx_len; i < total_pos; ++i)
+                pd[i] = static_cast<int64_t>(context_hidden_len - 1 + (i - effective_ctx_len));
         }
 
-        // Run combined draft model V2 with cached context_hidden (no fc recomputation)
+        // Run combined draft model V2 with (windowed) cached context_hidden
         ov::Tensor ctx_hidden_view(ctx_hidden_storage,
-                                   {0, 0, 0},
-                                   {1, context_hidden_len, ctx_hidden_dim});
+                                   {0, ctx_offset, 0},
+                                   {1, ctx_offset + effective_ctx_len, ctx_hidden_dim});
         draft_request.set_tensor("context_hidden", ctx_hidden_view);
         draft_request.set_tensor("input_ids", make_ids_tensor(block_ids));
         draft_request.set_tensor("position_ids", draft_pos);
@@ -1060,19 +1085,19 @@ int main(int argc, char* argv[]) try {
         ++perf.draft_steps;
         perf.accepted_tokens += accepted;  // raw acceptance (before max_length clipping, matches pipeline)
         perf.accepted_per_step.push_back(accepted);
+        // Collect tokens for batch decode at end (avoid per-step tokenizer overhead)
         {
             std::vector<int64_t> step_toks;
             for (size_t i = 0; i < accepted; ++i)
                 step_toks.push_back(draft_tokens[i]);
             step_toks.push_back(posterior_next);
-            auto text = tokenizer.decode(step_toks, {ov::genai::skip_special_tokens(true)});
             std::cout << "[Step " << perf.draft_steps << "] accepted=" << accepted
                       << " ids=[";
             for (size_t i = 0; i < step_toks.size(); ++i) {
                 if (i) std::cout << ",";
                 std::cout << step_toks[i];
             }
-            std::cout << "] [" << text << "]" << std::endl;
+            std::cout << "]" << std::endl;
         }
 
         // Wait for context_fc to finish (should have completed during postprocessing above)
