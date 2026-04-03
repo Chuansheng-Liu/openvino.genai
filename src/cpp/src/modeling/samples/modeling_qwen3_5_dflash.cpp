@@ -851,9 +851,11 @@ int main(int argc, char* argv[]) try {
     }
 
     // Setup GPU-side snapshot tensors if running on GPU
+    // NOTE: With deferred_state_commit, the GPU plugin manages snapshot states internally
+    // via state_update_mode. We do NOT need to bind external cl_mem tensors for snapshot
+    // outputs — doing so triggers 5904 unnecessary clEnqueueWriteBuffer copies per inference
+    // (48 outputs × 123 steps × ~257μs each = 1.5s). Just skip the binding.
     bool gpu_snapshots = false;
-    std::map<std::string, ov::Tensor> snapshot_remote_tensors;
-    // Try to get GPU context for USM allocations (zero-copy on iGPU)
     ov::RemoteContext remote_context;
     bool has_gpu_context = false;
     try {
@@ -861,37 +863,6 @@ int main(int argc, char* argv[]) try {
         has_gpu_context = true;
     } catch (const std::exception&) {
         has_gpu_context = false;
-    }
-    if (has_snapshots && has_gpu_context) {
-        try {
-            for (auto& output : compiled_target.outputs()) {
-                std::string snap_name;
-                for (auto& name : output.get_names()) {
-                    if (name.find("snapshot.") == 0) { snap_name = name; break; }
-                }
-                if (snap_name.empty()) continue;
-
-                auto pshape = output.get_partial_shape();
-                ov::Shape snap_shape;
-                snap_shape.push_back(1);
-                snap_shape.push_back(static_cast<size_t>(dflash_cfg.block_size));
-                for (size_t d = 2; d < pshape.size(); ++d)
-                    snap_shape.push_back(pshape[d].get_length());
-
-                auto dtype = output.get_element_type();
-                auto snap_remote = remote_context.create_tensor(dtype, snap_shape);
-                snapshot_remote_tensors[snap_name] = snap_remote;
-            }
-            gpu_snapshots = !snapshot_remote_tensors.empty();
-            if (gpu_snapshots) {
-                std::cout << "[Snapshots] GPU-side snapshot tensors allocated: "
-                          << snapshot_remote_tensors.size() << " outputs" << std::endl;
-            }
-        } catch (const std::exception& e) {
-            std::cout << "[Snapshots] GPU context not available, falling back to host: "
-                      << e.what() << std::endl;
-            gpu_snapshots = false;
-        }
     }
 
     const bool use_deferred_state_commit = has_snapshots &&
@@ -912,12 +883,8 @@ int main(int argc, char* argv[]) try {
 
     std::cout << "---------------START INFERENCE --------------------" << std::endl;
 
-    // Bind GPU RemoteTensors for snapshot outputs before prefill.
-    if (gpu_snapshots) {
-        for (auto& [snap_name, snap_remote] : snapshot_remote_tensors) {
-            target_request.set_tensor(snap_name, snap_remote);
-        }
-    }
+    // Snapshot remote tensors no longer bound — see note above.
+    // Deferred state commit still works via state_update_mode.
 
     target_request.get_tensor("attention_mask").set_shape({1, 0});
 
