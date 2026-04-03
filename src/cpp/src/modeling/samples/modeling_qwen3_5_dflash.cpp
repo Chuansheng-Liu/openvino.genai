@@ -16,6 +16,7 @@
 #include <vector>
 
 #include <openvino/openvino.hpp>
+#include <openvino/opsets/opset1.hpp>
 #include <openvino/core/type/bfloat16.hpp>
 #include <openvino/core/type/float16.hpp>
 #include <openvino/runtime/intel_gpu/properties.hpp>
@@ -603,6 +604,16 @@ int main(int argc, char* argv[]) try {
     // GPU: share kernel programs across implementations to reduce memory (helps iGPU bandwidth)
     compile_cfg[ov::intel_gpu::hint::enable_kernels_reuse.name()] = true;
 
+    // Profiling: enable per-layer timing when OV_GENAI_DFLASH_PROFILE=1
+    const bool do_profile = [](){
+        const char* env = std::getenv("OV_GENAI_DFLASH_PROFILE");
+        return env && std::string(env) != "0";
+    }();
+    if (do_profile) {
+        compile_cfg[ov::enable_profiling.name()] = true;
+        std::cout << "[PROFILING ENABLED]" << std::endl;
+    }
+
     std::cout << "[compile_cfg] ";
     for (const auto& kv : compile_cfg) {
         std::cout << kv.first << "=";
@@ -734,6 +745,32 @@ int main(int argc, char* argv[]) try {
 
     // Compile
     std::cout << "[Compiling models on " << device << "...]" << std::endl;
+    // Set snapshot outputs to f16 to eliminate f16→f32 output reorders.
+    // GPU computes in f16 (INFERENCE_PRECISION_HINT=f16), so matching output dtype avoids
+    // per-step reorder_data kernel dispatch (48 reorders/step × ~766μs each = ~19% GPU time).
+    // Approach: Insert Convert(f16) before each snapshot Result node.
+    // NOTE: target_hidden stays f32 because CPU context_fc model requires f32 input.
+    {
+        int f16_outputs = 0;
+        for (auto& result : target_model->get_results()) {
+            for (auto& name : result->output(0).get_names()) {
+                if (name.find("snapshot.") == 0) {
+                    auto parent_output = result->input_value(0);
+                    if (parent_output.get_element_type() != ov::element::f16) {
+                        auto convert = std::make_shared<ov::op::v0::Convert>(parent_output, ov::element::f16);
+                        result->input(0).replace_source_output(convert->output(0));
+                        ++f16_outputs;
+                    }
+                    break;
+                }
+            }
+        }
+        if (f16_outputs > 0) {
+            target_model->validate_nodes_and_infer_types();
+            std::cout << "[opt] Inserted " << f16_outputs << " f16 converts for snapshot outputs" << std::endl;
+        }
+    }
+
     std::cout << "[Compiling target model...]" << std::endl;
     auto compiled_target = core.compile_model(target_model, device, compile_cfg);
     std::cout << "[Compiling context_fc model (fc+hidden_norm) on CPU...]" << std::endl;
@@ -1322,6 +1359,61 @@ int main(int argc, char* argv[]) try {
         const double verify_ms = duration_ms(verify_start, verify_end);
         perf.verify_wall.add(verify_ms);
         step_tracked_ms += verify_ms;
+
+        // Dump per-layer profiling on step 2 (skip step 1 warm-up).
+        if (do_profile && perf.verify_wall.count == 2) {
+            auto dump_profile = [](const ov::InferRequest& req, const std::string& label) {
+                auto info = req.get_profiling_info();
+                std::cout << "\n=== PROFILING: " << label << " (" << info.size() << " nodes) ===" << std::endl;
+                std::vector<std::pair<int64_t, size_t>> sorted;
+                for (size_t i = 0; i < info.size(); ++i)
+                    sorted.push_back({info[i].real_time.count(), i});
+                std::sort(sorted.begin(), sorted.end(), [](auto& a, auto& b){ return a.first > b.first; });
+                // Show top 30 overall
+                size_t shown = 0;
+                for (auto& [t, idx] : sorted) {
+                    if (shown >= 30) break;
+                    auto& p = info[idx];
+                    std::cout << "  " << p.real_time.count() << "us  "
+                              << p.node_type << "  " << p.node_name << std::endl;
+                    ++shown;
+                }
+                // Show ALL reorder nodes
+                std::cout << "\n--- REORDER NODES ---" << std::endl;
+                int64_t reorder_total = 0;
+                size_t reorder_count = 0;
+                for (auto& p : info) {
+                    bool is_reorder = (p.node_type.find("reorder") != std::string::npos ||
+                                       p.node_type.find("Reorder") != std::string::npos ||
+                                       p.node_name.find("reorder") != std::string::npos ||
+                                       p.node_name.find("Reorder") != std::string::npos);
+                    if (is_reorder) {
+                        std::cout << "  " << p.real_time.count() << "us  "
+                                  << p.node_type << "  " << p.node_name << std::endl;
+                        reorder_total += p.real_time.count();
+                        ++reorder_count;
+                    }
+                }
+                std::cout << "Total reorder: " << reorder_count << " nodes, "
+                          << reorder_total << "us" << std::endl;
+                // Show ALL Transpose nodes
+                std::cout << "\n--- TRANSPOSE NODES ---" << std::endl;
+                int64_t tp_total = 0;
+                for (auto& p : info) {
+                    if (p.node_type.find("Transpose") != std::string::npos ||
+                        p.node_type.find("Permute") != std::string::npos) {
+                        std::cout << "  " << p.real_time.count() << "us  "
+                                  << p.node_type << "  " << p.node_name << std::endl;
+                        tp_total += p.real_time.count();
+                    }
+                }
+                std::cout << "Total transpose: " << tp_total << "us" << std::endl;
+                std::cout << "=== END PROFILING ===" << std::endl;
+            };
+            if (!use_kv_cache_draft)
+                dump_profile(draft_request, "DRAFT (combined V2)");
+            dump_profile(target_request, "VERIFY (target)");
+        }
 
         logits = target_request.get_tensor("logits");
         auto posterior_tokens = argmax_logits_slice(logits, 0, verify_len);
