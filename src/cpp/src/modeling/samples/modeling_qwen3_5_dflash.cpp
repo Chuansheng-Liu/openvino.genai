@@ -154,6 +154,27 @@ int64_t argmax_row(const T* data, size_t vocab) {
     return static_cast<int64_t>(max_idx);
 }
 
+// Fast f16 argmax: compare as uint16_t with sign-magnitude→sortable transform.
+// IEEE 754 f16: sign(1) | exp(5) | mantissa(10). For positive floats, uint16_t
+// comparison gives correct ordering. For negatives, bit-flip maps to correct order.
+int64_t argmax_row_f16_fast(const uint16_t* data, size_t vocab) {
+    // Transform: if sign bit set (negative), flip all bits; else flip only sign bit.
+    // This maps f16 ordering to uint16_t ordering for all finite values.
+    auto to_sortable = [](uint16_t v) -> uint16_t {
+        return (v & 0x8000) ? static_cast<uint16_t>(~v) : static_cast<uint16_t>(v ^ 0x8000);
+    };
+    uint16_t max_val = to_sortable(data[0]);
+    size_t max_idx = 0;
+    for (size_t i = 1; i < vocab; ++i) {
+        uint16_t sv = to_sortable(data[i]);
+        if (sv > max_val) {
+            max_val = sv;
+            max_idx = i;
+        }
+    }
+    return static_cast<int64_t>(max_idx);
+}
+
 std::vector<int64_t> argmax_logits_slice(const ov::Tensor& logits, size_t start, size_t count) {
     const auto shape = logits.get_shape();
     if (shape.size() != 3 || shape[0] != 1) {
@@ -169,9 +190,9 @@ std::vector<int64_t> argmax_logits_slice(const ov::Tensor& logits, size_t start,
     tokens.reserve(count);
 
     if (logits.get_element_type() == ov::element::f16) {
-        const auto* data = logits.data<const ov::float16>();
+        const auto* data = reinterpret_cast<const uint16_t*>(logits.data<const ov::float16>());
         for (size_t i = 0; i < count; ++i)
-            tokens.push_back(argmax_row(data + (start + i) * vocab, vocab));
+            tokens.push_back(argmax_row_f16_fast(data + (start + i) * vocab, vocab));
         return tokens;
     }
     if (logits.get_element_type() == ov::element::bf16) {
