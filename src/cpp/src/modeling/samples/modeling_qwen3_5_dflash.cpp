@@ -579,6 +579,8 @@ int main(int argc, char* argv[]) try {
             compile_cfg[ov::hint::dynamic_quantization_group_size.name()] = dyn_quant;
         }
     }
+    // GPU: share kernel programs across implementations to reduce memory (helps iGPU bandwidth)
+    compile_cfg[ov::intel_gpu::hint::enable_kernels_reuse.name()] = true;
 
     std::cout << "[compile_cfg] ";
     for (const auto& kv : compile_cfg) {
@@ -587,6 +589,8 @@ int main(int argc, char* argv[]) try {
             std::cout << kv.second.as<ov::element::Type>().get_type_name();
         } else if (kv.second.is<float>()) {
             std::cout << kv.second.as<float>();
+        } else if (kv.second.is<bool>()) {
+            std::cout << (kv.second.as<bool>() ? "true" : "false");
         } else if (kv.second.is<ov::hint::PerformanceMode>()) {
             auto mode = kv.second.as<ov::hint::PerformanceMode>();
             std::cout << (mode == ov::hint::PerformanceMode::LATENCY ? "LATENCY" :
@@ -1106,9 +1110,22 @@ int main(int argc, char* argv[]) try {
         verbose_steps = (std::string(env) == "1");
     }
 
-    // Pre-allocate reusable tensors for draft step
+    // Pre-allocate reusable tensors for draft and verify steps.
+    // Allocate at max sizes and reuse via set_shape() to avoid per-step allocation.
     ov::Tensor draft_block_ids_tensor(ov::element::i64, {1, static_cast<size_t>(block_size)});
-    ov::Tensor draft_pos_tensor;  // re-allocated only when size changes (V2 path: ctx_len varies)
+    // Draft position_ids: max size = max_ctx_len + block_size (V2 path)
+    ov::Tensor reuse_draft_pos(ov::element::i64, {1, max_ctx_len + block_size});
+    // Verify input_ids: always block_size tokens
+    ov::Tensor reuse_verify_ids(ov::element::i64, {1, block_size});
+    // Verify attention_mask: all-ones, grows up to max_length + block_size
+    ov::Tensor reuse_verify_mask(ov::element::i64, {1, max_length + block_size});
+    std::fill_n(reuse_verify_mask.data<int64_t>(),
+                static_cast<ptrdiff_t>(max_length + block_size), 1LL);
+    // Verify position_ids (mRoPE): [3, 1, block_size]
+    ov::Tensor reuse_verify_pos(ov::element::i64, {3, 1, block_size});
+    // Reusable block_output_ids vector (avoid per-step heap allocation)
+    std::vector<int64_t> block_output_ids;
+    block_output_ids.reserve(block_size);
 
     const auto generation_start = Clock::now();
 
@@ -1203,9 +1220,9 @@ int main(int argc, char* argv[]) try {
             }
 
             const size_t total_pos = draft_ctx_len + block_size;
-            ov::Tensor draft_pos(ov::element::i64, {1, total_pos});
+            reuse_draft_pos.set_shape({1, total_pos});
             {
-                auto* pd = draft_pos.data<int64_t>();
+                auto* pd = reuse_draft_pos.data<int64_t>();
                 // Context position IDs: map strided indices back to original positions
                 for (size_t i = 0; i < draft_ctx_len; ++i) {
                     size_t orig_idx = (ctx_stride > 1) ? (i * ctx_stride) : i;
@@ -1219,7 +1236,7 @@ int main(int argc, char* argv[]) try {
 
             draft_request.set_tensor("context_hidden", ctx_for_draft);
             draft_request.set_tensor("input_ids", draft_block_ids_tensor);
-            draft_request.set_tensor("position_ids", draft_pos);
+            draft_request.set_tensor("position_ids", reuse_draft_pos);
             draft_request.infer();
             draft_logits = draft_request.get_tensor("logits");
         }
@@ -1233,9 +1250,8 @@ int main(int argc, char* argv[]) try {
         perf.draft_wall.add(draft_ms);
         step_tracked_ms += draft_ms;
 
-        // Batch verification: construct block_output_ids
-        std::vector<int64_t> block_output_ids;
-        block_output_ids.reserve(block_size);
+        // Batch verification: construct block_output_ids (reuse pre-allocated vector)
+        block_output_ids.clear();
         block_output_ids.push_back(output_ids.back());  // Last accepted token
         block_output_ids.insert(block_output_ids.end(), draft_tokens.begin(), draft_tokens.end());
 
@@ -1247,11 +1263,24 @@ int main(int argc, char* argv[]) try {
             saved_linear = save_linear_states(target_request);
         }
 
-        // Verify
+        // Verify — reuse pre-allocated tensors (avoid per-step heap allocation)
         auto verify_start = Clock::now();
-        target_request.set_tensor("input_ids", make_ids_tensor(block_output_ids));
-        target_request.set_tensor("attention_mask", make_attention_mask(target_hidden_len + verify_len));
-        target_request.set_tensor("position_ids", make_mrope_position_ids(target_hidden_len, verify_len));
+        reuse_verify_ids.set_shape({1, verify_len});
+        std::memcpy(reuse_verify_ids.data<int64_t>(), block_output_ids.data(),
+                     verify_len * sizeof(int64_t));
+        target_request.set_tensor("input_ids", reuse_verify_ids);
+
+        reuse_verify_mask.set_shape({1, target_hidden_len + verify_len});
+        target_request.set_tensor("attention_mask", reuse_verify_mask);
+
+        {
+            reuse_verify_pos.set_shape({3, 1, verify_len});
+            auto* pd = reuse_verify_pos.data<int64_t>();
+            for (size_t dim = 0; dim < 3; ++dim)
+                for (size_t i = 0; i < verify_len; ++i)
+                    pd[dim * verify_len + i] = static_cast<int64_t>(target_hidden_len + i);
+        }
+        target_request.set_tensor("position_ids", reuse_verify_pos);
         target_request.set_tensor("beam_idx", beam_idx);
         if (vl_mode) {
             target_request.set_tensor("visual_embeds", zero_visual_embeds);
@@ -1323,11 +1352,22 @@ int main(int argc, char* argv[]) try {
             target_kv_state.num_tokens_to_trim = 0;
 
             {
-                std::vector<int64_t> accepted_block(block_output_ids.begin(),
-                                                    block_output_ids.begin() + static_cast<ptrdiff_t>(num_accepted));
-                target_request.set_tensor("input_ids", make_ids_tensor(accepted_block));
-                target_request.set_tensor("attention_mask", make_attention_mask(target_hidden_len + num_accepted));
-                target_request.set_tensor("position_ids", make_mrope_position_ids(target_hidden_len, num_accepted));
+                reuse_verify_ids.set_shape({1, num_accepted});
+                std::memcpy(reuse_verify_ids.data<int64_t>(), block_output_ids.data(),
+                             num_accepted * sizeof(int64_t));
+                target_request.set_tensor("input_ids", reuse_verify_ids);
+
+                reuse_verify_mask.set_shape({1, target_hidden_len + num_accepted});
+                target_request.set_tensor("attention_mask", reuse_verify_mask);
+
+                {
+                    reuse_verify_pos.set_shape({3, 1, num_accepted});
+                    auto* pd = reuse_verify_pos.data<int64_t>();
+                    for (size_t dim = 0; dim < 3; ++dim)
+                        for (size_t i = 0; i < num_accepted; ++i)
+                            pd[dim * num_accepted + i] = static_cast<int64_t>(target_hidden_len + i);
+                }
+                target_request.set_tensor("position_ids", reuse_verify_pos);
                 target_request.set_tensor("beam_idx", beam_idx);
                 if (vl_mode) {
                     target_request.set_tensor("visual_embeds", zero_visual_embeds);
