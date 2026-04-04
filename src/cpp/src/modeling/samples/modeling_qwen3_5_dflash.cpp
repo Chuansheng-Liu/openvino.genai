@@ -586,13 +586,19 @@ int main(int argc, char* argv[]) try {
         {ov::hint::kv_cache_precision.name(), kv_precision},
         {ov::hint::performance_mode.name(), ov::hint::PerformanceMode::LATENCY},
     };
-    // activations_scale_factor: env var override (0 = disable, default 8.0)
-    float act_scale = 8.0f;
+    // activations_scale_factor: disabled by default for speculative decoding.
+    // The GPU plugin's ActivationsScaling pass wraps every MatMul with ÷scale/×scale
+    // eltwise ops to prevent fp16 overflow. This introduces rounding errors that hurt
+    // draft/target agreement (acceptance drops ~3.4pp with scale=8.0).
+    // Note: set_rt_info(8.0f) in model builders is ignored for LLM models by the GPU
+    // plugin (see execution_config.cpp:163 — only applied when !is_llm). So the only
+    // way to enable scaling is via compile_cfg. We leave it disabled unless explicitly
+    // requested via env var.
     if (const char* env = std::getenv("OV_GENAI_DFLASH_ACT_SCALE")) {
-        act_scale = std::stof(env);
-    }
-    if (act_scale > 0.0f) {
-        compile_cfg[ov::hint::activations_scale_factor.name()] = act_scale;
+        float act_scale = std::stof(env);
+        if (act_scale > 0.0f) {
+            compile_cfg[ov::hint::activations_scale_factor.name()] = act_scale;
+        }
     }
     // dynamic_quantization_group_size: match weight quant group_size for optimal GEMM.
     // gs128 aligns activation quantization groups with INT4 weight groups, giving best
