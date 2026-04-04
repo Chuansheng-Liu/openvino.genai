@@ -483,8 +483,8 @@ Tensor Qwen3_5GatedDeltaNet::forward(const Tensor& hidden_states,
     auto b = projected_b;
     auto a = projected_a;
 
-    auto mixed_qkv = projected_qkv.permute({0, 2, 1});
-
+    // FusedConv accepts [B, S, D] directly (channel-last / BSC format).
+    // No permute needed for the fused path; fallback still needs [B, C, S].
     auto batch = shape::dim(masked_hidden, 0);
     auto conv_shape = shape::make({batch,
                                    ops::const_vec(op_ctx, std::vector<int64_t>{static_cast<int64_t>(conv_dim_)}),
@@ -500,22 +500,24 @@ Tensor Qwen3_5GatedDeltaNet::forward(const Tensor& hidden_states,
     Tensor mixed_after_conv;
     if (use_fused_conv_op()) {
         // ── FusedConv op path: fuses Gather + Concat + GroupConv + SiLU + Slice ──
+        // Input is projected_qkv [B, S, D] — no permute needed (BSC kernel).
         auto conv_w_2d = conv1d_weight().reshape({conv_dim_, conv_kernel_size_}, false);
 
         if (g_snapshot_accumulator.active) {
             auto [conv_out, conv_state, conv_snap] = ops::fused_conv_with_snapshots(
-                mixed_qkv, conv_w_2d, beam_idx, conv_init, conv_var, state_update_mode_tensor,
+                projected_qkv, conv_w_2d, beam_idx, conv_init, conv_var, state_update_mode_tensor,
                 g_snapshot_accumulator.snapshot_max_seq);
             mixed_after_conv = conv_out;
             g_snapshot_accumulator.entries.push_back(
                 {"snapshot." + conv_info.variable_id, conv_snap.output()});
         } else {
             auto fused_result = ops::fused_conv(
-                mixed_qkv, conv_w_2d, beam_idx, conv_init, conv_var, state_update_mode_tensor);
+                projected_qkv, conv_w_2d, beam_idx, conv_init, conv_var, state_update_mode_tensor);
             mixed_after_conv = fused_result.first;
         }
     } else {
-        // ── Fallback: original decomposed path ──
+        // ── Fallback: original decomposed path (expects [B, C, S]) ──
+        auto mixed_qkv = projected_qkv.permute({0, 2, 1});
         auto conv_read = std::make_shared<ov::op::v6::ReadValue>(conv_init.output(), conv_var);
         auto conv_cached = ops::gather(Tensor(conv_read->output(0), op_ctx), beam_idx, 0);
 
@@ -523,9 +525,11 @@ Tensor Qwen3_5GatedDeltaNet::forward(const Tensor& hidden_states,
         mixed_after_conv = apply_depthwise_causal_conv(mixed_qkv, conv_cached, &next_conv_state);
         auto conv_assign = std::make_shared<ov::opset13::Assign>(next_conv_state.output(), conv_var);
         ctx().register_sink(conv_assign);
+        // Permute output back to [B, S, D]
+        mixed_after_conv = mixed_after_conv.permute({0, 2, 1});
     }
 
-    auto mixed_bt = mixed_after_conv.permute({0, 2, 1});
+    auto mixed_bt = mixed_after_conv;
     auto q_conv = ops::slice(mixed_bt, 0, key_dim_, 1, 2);
     auto k_conv = ops::slice(mixed_bt, key_dim_, key_dim_ * 2, 1, 2);
     auto v_conv = ops::slice(mixed_bt, key_dim_ * 2, key_dim_ * 2 + value_dim_, 1, 2);
