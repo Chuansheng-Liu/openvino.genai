@@ -1206,6 +1206,42 @@ int main(int argc, char* argv[]) try {
                 ids[i] = mask_token_id;
         }
 
+        // Pre-prepare target verify tensors BEFORE draft inference.
+        // verify_len is always block_size (known ahead of time), so we can
+        // set up attention_mask, position_ids, beam_idx, state_update_mode
+        // while the GPU is busy with draft model.
+        const size_t pre_verify_len = block_size;
+        {
+            reuse_verify_ids.set_shape({1, pre_verify_len});
+            // input_ids[0] = last accepted token (known now)
+            reuse_verify_ids.data<int64_t>()[0] = output_ids.back();
+            // Remaining slots filled after draft argmax
+
+            reuse_verify_mask.set_shape({1, target_hidden_len + pre_verify_len});
+            target_request.set_tensor("attention_mask", reuse_verify_mask);
+
+            reuse_verify_pos.set_shape({3, 1, pre_verify_len});
+            auto* pd = reuse_verify_pos.data<int64_t>();
+            for (size_t dim = 0; dim < 3; ++dim)
+                for (size_t i = 0; i < pre_verify_len; ++i)
+                    pd[dim * pre_verify_len + i] = static_cast<int64_t>(target_hidden_len + i);
+            target_request.set_tensor("position_ids", reuse_verify_pos);
+            target_request.set_tensor("beam_idx", beam_idx);
+            if (vl_mode) {
+                target_request.set_tensor("visual_embeds", zero_visual_embeds);
+                target_request.set_tensor("visual_pos_mask", zero_visual_pos_mask);
+            }
+
+            if (use_deferred_state_commit && pending_snapshot_commit_index >= 0) {
+                set_target_state_update_mode(-(pending_snapshot_commit_index + 1));
+                pending_snapshot_commit_index = -1;
+            } else if (use_deferred_state_commit) {
+                set_target_state_update_mode(0);
+            } else {
+                set_target_state_update_mode(1);
+            }
+        }
+
         auto draft_start = Clock::now();
 
         ov::Tensor draft_logits;
@@ -1322,38 +1358,12 @@ int main(int argc, char* argv[]) try {
             saved_linear = save_linear_states(target_request);
         }
 
-        // Verify — reuse pre-allocated tensors (avoid per-step heap allocation)
+        // Verify — most tensors already set during pre-prepare above.
+        // Only need to fill in the actual draft token IDs.
         auto verify_start = Clock::now();
-        reuse_verify_ids.set_shape({1, verify_len});
         std::memcpy(reuse_verify_ids.data<int64_t>(), block_output_ids.data(),
                      verify_len * sizeof(int64_t));
         target_request.set_tensor("input_ids", reuse_verify_ids);
-
-        reuse_verify_mask.set_shape({1, target_hidden_len + verify_len});
-        target_request.set_tensor("attention_mask", reuse_verify_mask);
-
-        {
-            reuse_verify_pos.set_shape({3, 1, verify_len});
-            auto* pd = reuse_verify_pos.data<int64_t>();
-            for (size_t dim = 0; dim < 3; ++dim)
-                for (size_t i = 0; i < verify_len; ++i)
-                    pd[dim * verify_len + i] = static_cast<int64_t>(target_hidden_len + i);
-        }
-        target_request.set_tensor("position_ids", reuse_verify_pos);
-        target_request.set_tensor("beam_idx", beam_idx);
-        if (vl_mode) {
-            target_request.set_tensor("visual_embeds", zero_visual_embeds);
-            target_request.set_tensor("visual_pos_mask", zero_visual_pos_mask);
-        }
-
-        if (use_deferred_state_commit && pending_snapshot_commit_index >= 0) {
-            set_target_state_update_mode(-(pending_snapshot_commit_index + 1));
-            pending_snapshot_commit_index = -1;
-        } else if (use_deferred_state_commit) {
-            set_target_state_update_mode(0);
-        } else {
-            set_target_state_update_mode(1);
-        }
 
         target_request.infer();
         auto verify_end = Clock::now();
@@ -1417,19 +1427,49 @@ int main(int argc, char* argv[]) try {
         }
 
         logits = target_request.get_tensor("logits");
-        auto posterior_tokens = argmax_logits_slice(logits, 0, verify_len);
 
-        // Find acceptance length
+        // Lazy argmax: compute one row at a time, stop at first draft mismatch.
+        // Saves work when early rejection occurs (avg acceptance ~3.3 out of 15).
+        const auto logits_shape = logits.get_shape();
+        const size_t vocab = logits_shape[2];
         size_t accepted = 0;
-        for (size_t i = 0; i < draft_tokens.size(); ++i) {
-            if (draft_tokens[i] == posterior_tokens[i]) {
+        int64_t posterior_next = 0;
+
+        if (logits.get_element_type() == ov::element::f16) {
+            const auto* ldata = reinterpret_cast<const uint16_t*>(logits.data<const ov::float16>());
+            for (size_t i = 0; i < draft_tokens.size(); ++i) {
+                int64_t tok = argmax_row_f16_fast(ldata + i * vocab, vocab);
+                if (tok != draft_tokens[i]) {
+                    posterior_next = tok;
+                    break;
+                }
                 ++accepted;
-            } else {
-                break;
             }
+            if (accepted == draft_tokens.size()) {
+                posterior_next = argmax_row_f16_fast(ldata + accepted * vocab, vocab);
+            }
+        } else if (logits.get_element_type() == ov::element::f32) {
+            const auto* ldata = logits.data<const float>();
+            for (size_t i = 0; i < draft_tokens.size(); ++i) {
+                int64_t tok = argmax_row(ldata + i * vocab, vocab);
+                if (tok != draft_tokens[i]) {
+                    posterior_next = tok;
+                    break;
+                }
+                ++accepted;
+            }
+            if (accepted == draft_tokens.size()) {
+                posterior_next = argmax_row(ldata + accepted * vocab, vocab);
+            }
+        } else {
+            auto posterior_tokens = argmax_logits_slice(logits, 0, verify_len);
+            for (size_t i = 0; i < draft_tokens.size(); ++i) {
+                if (draft_tokens[i] == posterior_tokens[i]) ++accepted;
+                else break;
+            }
+            posterior_next = posterior_tokens[accepted];
         }
 
-        int64_t posterior_next = posterior_tokens[accepted];
         const size_t num_accepted = accepted + 1;
 
         // Multi-path acceptance handling (matching dflash_strategy)
