@@ -594,9 +594,14 @@ int main(int argc, char* argv[]) try {
     if (act_scale > 0.0f) {
         compile_cfg[ov::hint::activations_scale_factor.name()] = act_scale;
     }
-    // dynamic_quantization_group_size: env var override (0 = disabled, try 32 or 64)
-    if (const char* env = std::getenv("OV_GENAI_DFLASH_DYN_QUANT")) {
-        uint64_t dyn_quant = static_cast<uint64_t>(std::atoi(env));
+    // dynamic_quantization_group_size: match weight quant group_size for optimal GEMM.
+    // gs128 aligns activation quantization groups with INT4 weight groups, giving best
+    // oneDNN kernel performance on Xe2+/Xe3 iGPU (vs default per-token UINT64_MAX).
+    {
+        uint64_t dyn_quant = 128;  // optimal default: match INT4_SYM group_size=128
+        if (const char* env = std::getenv("OV_GENAI_DFLASH_DYN_QUANT")) {
+            dyn_quant = static_cast<uint64_t>(std::atoi(env));
+        }
         if (dyn_quant > 0) {
             compile_cfg[ov::hint::dynamic_quantization_group_size.name()] = dyn_quant;
         }
@@ -1151,6 +1156,35 @@ int main(int argc, char* argv[]) try {
     // Reusable block_output_ids vector (avoid per-step heap allocation)
     std::vector<int64_t> block_output_ids;
     block_output_ids.reserve(block_size);
+
+    // ── Pre-bind logits output to USM host tensors (eliminates HtoH copy in wait()) ──
+    // The GPU plugin detects USM host memory and writes directly to it, skipping the
+    // intermediate device→host copy. Saves ~500μs per infer() call.
+    const auto logits_elem_type = logits.get_element_type();
+    const size_t vocab_size = logits.get_shape().back();
+    bool using_usm_draft_logits = false;
+    bool using_usm_target_logits = false;
+    if (has_gpu_context && !use_kv_cache_draft) {
+        try {
+            auto draft_logits_usm = remote_context.create_host_tensor(
+                logits_elem_type, {1, block_size, vocab_size});
+            draft_request.set_tensor("logits", draft_logits_usm);
+            using_usm_draft_logits = true;
+        } catch (const std::exception&) {}
+    }
+    if (has_gpu_context) {
+        try {
+            auto target_logits_usm = remote_context.create_host_tensor(
+                logits_elem_type, {1, block_size, vocab_size});
+            target_request.set_tensor("logits", target_logits_usm);
+            using_usm_target_logits = true;
+        } catch (const std::exception&) {}
+    }
+    if (using_usm_draft_logits || using_usm_target_logits) {
+        std::cerr << "[DFlash] USM logits bound: draft=" << using_usm_draft_logits
+                  << " target=" << using_usm_target_logits
+                  << " (" << logits_elem_type << " vocab=" << vocab_size << ")" << std::endl;
+    }
 
     const auto generation_start = Clock::now();
 
