@@ -1175,7 +1175,7 @@ int main(int argc, char* argv[]) try {
     if (has_gpu_context) {
         try {
             auto target_logits_usm = remote_context.create_host_tensor(
-                logits_elem_type, {1, block_size, vocab_size});
+                logits_elem_type, {1, block_size + 1, vocab_size});
             target_request.set_tensor("logits", target_logits_usm);
             using_usm_target_logits = true;
         } catch (const std::exception&) {}
