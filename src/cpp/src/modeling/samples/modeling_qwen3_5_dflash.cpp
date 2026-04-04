@@ -1539,7 +1539,9 @@ int main(int argc, char* argv[]) try {
             ov::Tensor dst_slice(target_hidden_storage,
                                  {0, target_hidden_len, 0},
                                  {1, target_hidden_len + num_accepted, hidden_dim});
-            src_slice.copy_to(dst_slice);
+            // Direct CPU memcpy — both tensors are USM host (f32), avoids GPU-enqueued memcpy overhead
+            std::memcpy(dst_slice.data<float>(), src_slice.data<const float>(),
+                        num_accepted * hidden_dim * sizeof(float));
 
             // Launch context_fc async — overlaps GPU work with CPU postprocessing below
             ov::Tensor new_th(target_hidden_storage,
