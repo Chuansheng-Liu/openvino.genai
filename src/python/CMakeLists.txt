@@ -4,6 +4,11 @@
 
 include(FetchContent)
 
+# Ensure OpenCL::OpenCL target is visible here if it was used in openvino_genai_obj
+if(ENABLE_SYSTEM_OPENCL)
+    find_package(OpenCL QUIET)
+endif()
+
 # OpenVINO uses pybind11, and they can conflict.
 if (NOT TARGET pybind11::pybind11)
     FetchContent_Declare(

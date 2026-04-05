@@ -215,6 +215,17 @@ set(TARGET_NAME_OBJ ${TARGET_NAME}_obj)
 
 add_library(${TARGET_NAME_OBJ} OBJECT ${SOURCE_FILES})
 
+# rtn_quantize.hpp uses _mm256_cvtph_ps (F16C) which requires -mf16c on GCC/Clang
+# AVX2 alone does not imply F16C, so we set it per-file for all rtn_quantize users
+if(NOT MSVC)
+    set(_rtn_f16c_sources
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/gguf_utils/gguf_weight_finalizer.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/gguf_utils/gguf_modeling.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/safetensors_utils/safetensors_weight_finalizer.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/safetensors_utils/safetensors_modeling.cpp")
+    set_source_files_properties(${_rtn_f16c_sources} PROPERTIES COMPILE_OPTIONS "-mf16c")
+endif()
+
 target_include_directories(${TARGET_NAME_OBJ}
     PUBLIC "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
            "$<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}>"
