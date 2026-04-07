@@ -465,8 +465,25 @@ int main(int argc, char* argv[]) try {
     if (use_int4_lmhead && target_quant_config.enabled()) {
         target_quant_config.backup_mode = target_quant_config.mode;
     }
+    // Selective quantization: control which weight types get quantized (MoE tuning)
+    if (target_quant_config.enabled()) {
+        if (const char* env = std::getenv("OV_GENAI_DFLASH_QUANT_ATTN")) {
+            target_quant_config.selection.quantize_attention = (std::string(env) == "1");
+        }
+        if (const char* env = std::getenv("OV_GENAI_DFLASH_QUANT_MOE")) {
+            target_quant_config.selection.quantize_moe = (std::string(env) == "1");
+        }
+        if (const char* env = std::getenv("OV_GENAI_DFLASH_QUANT_MLP")) {
+            target_quant_config.selection.quantize_mlp = (std::string(env) == "1");
+        }
+    }
     std::cout << "[quant] target: " << (target_quant_config.enabled() ? quant_mode_name(target_quant_config.mode) : "FP16");
     if (target_quant_config.enabled()) std::cout << ", group_size=" << target_quant_config.group_size;
+    if (target_quant_config.enabled()) {
+        std::cout << " (attn=" << target_quant_config.selection.quantize_attention
+                  << " moe=" << target_quant_config.selection.quantize_moe
+                  << " mlp=" << target_quant_config.selection.quantize_mlp << ")";
+    }
     std::cout << std::endl;
 
     // Draft quantization: CLI arg > FP16 (no env var fallback for draft)
@@ -1448,6 +1465,61 @@ int main(int argc, char* argv[]) try {
         const size_t vocab = logits_shape[2];
         size_t accepted = 0;
         int64_t posterior_next = 0;
+
+        // Debug: dump top-K draft vs target for first 3 steps
+        static bool debug_logits = (std::getenv("OV_GENAI_DFLASH_DEBUG_LOGITS") != nullptr);
+        if (debug_logits && perf.draft_steps < 3) {
+            auto top5 = [](const float* row, size_t v) {
+                std::vector<std::pair<float, int64_t>> vals;
+                for (size_t j = 0; j < v; ++j) vals.push_back({row[j], (int64_t)j});
+                std::partial_sort(vals.begin(), vals.begin() + std::min<size_t>(5, v), vals.end(),
+                    [](auto& a, auto& b){ return a.first > b.first; });
+                std::string s;
+                for (int k = 0; k < 5 && k < (int)v; ++k)
+                    s += " " + std::to_string(vals[k].second) + "(" + std::to_string(vals[k].first) + ")";
+                return s;
+            };
+            auto top5_f16 = [](const uint16_t* row, size_t v) {
+                std::vector<std::pair<float, int64_t>> vals;
+                for (size_t j = 0; j < v; ++j) {
+                    uint16_t bits = row[j];
+                    uint32_t sign = (bits >> 15) & 1;
+                    uint32_t exp  = (bits >> 10) & 0x1F;
+                    uint32_t mant = bits & 0x3FF;
+                    uint32_t f32;
+                    if (exp == 0) f32 = (sign << 31) | (mant << 13);
+                    else if (exp == 0x1F) f32 = (sign << 31) | (0xFF << 23) | (mant << 13);
+                    else f32 = (sign << 31) | ((exp + 112) << 23) | (mant << 13);
+                    float fv; std::memcpy(&fv, &f32, 4);
+                    vals.push_back({fv, (int64_t)j});
+                }
+                std::partial_sort(vals.begin(), vals.begin() + std::min<size_t>(5, v), vals.end(),
+                    [](auto& a, auto& b){ return a.first > b.first; });
+                std::string s;
+                for (int k = 0; k < 5 && k < (int)v; ++k)
+                    s += " " + std::to_string(vals[k].second) + "(" + std::to_string(vals[k].first) + ")";
+                return s;
+            };
+            std::cerr << "\n[DEBUG Step " << (perf.draft_steps + 1) << "] Draft vs Target top-5 for first 3 positions:" << std::endl;
+            std::cerr << "  draft_logits shape: " << draft_logits.get_shape() << " type: " << draft_logits.get_element_type() << std::endl;
+            std::cerr << "  target_logits shape: " << logits.get_shape() << " type: " << logits.get_element_type() << std::endl;
+            for (int pos = 0; pos < 3 && pos < (int)draft_tokens.size(); ++pos) {
+                std::string draft_top, target_top;
+                if (draft_logits.get_element_type() == ov::element::f16) {
+                    draft_top = top5_f16(reinterpret_cast<const uint16_t*>(draft_logits.data<const ov::float16>()) + (pos + 1) * vocab, vocab);
+                } else {
+                    draft_top = top5(draft_logits.data<const float>() + (pos + 1) * vocab, vocab);
+                }
+                if (logits.get_element_type() == ov::element::f16) {
+                    target_top = top5_f16(reinterpret_cast<const uint16_t*>(logits.data<const ov::float16>()) + pos * vocab, vocab);
+                } else {
+                    target_top = top5(logits.data<const float>() + pos * vocab, vocab);
+                }
+                std::cerr << "  [pos " << pos << "] draft_tok=" << draft_tokens[pos]
+                          << " | draft_top5:" << draft_top
+                          << " | target_top5:" << target_top << std::endl;
+            }
+        }
 
         if (logits.get_element_type() == ov::element::f16) {
             const auto* ldata = reinterpret_cast<const uint16_t*>(logits.data<const ov::float16>());
