@@ -449,7 +449,7 @@ std::shared_ptr<ov::Model> create_dflash_draft_model(
     const ov::element::Type dtype = ov::element::f32;
 
     const int64_t ctx_dim = static_cast<int64_t>(cfg.hidden_size) *
-                            static_cast<int64_t>(cfg.num_hidden_layers);
+                            static_cast<int64_t>(cfg.num_ctx_layers());
     auto target_hidden = ctx.parameter("target_hidden", dtype, ov::PartialShape{-1, -1, ctx_dim});
     auto noise_embedding = ctx.parameter("noise_embedding", dtype, ov::PartialShape{-1, -1, cfg.hidden_size});
     auto position_ids = ctx.parameter("position_ids", ov::element::i64, ov::PartialShape{-1, -1});
@@ -518,6 +518,7 @@ std::shared_ptr<ov::Model> build_dflash_model(
     cfg.rope_theta = config.rope_theta;
     cfg.hidden_act = config.hidden_act;
     cfg.attention_bias = config.attention_bias;
+    cfg.target_layer_ids = config.target_layer_ids;
 
     return create_dflash_draft_model(cfg, weight_source, weight_finalizer, ov::element::f32);
 }

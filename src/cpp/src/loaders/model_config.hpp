@@ -93,6 +93,9 @@ struct ModelConfig {
 
     /// Number of layers in target model (for DFlash conditioning)
     int32_t num_target_layers = 0;
+
+    /// Explicit target layer IDs from dflash_config (if present in config.json)
+    std::vector<int32_t> target_layer_ids;
     
     // ========== Normalization ==========
     

@@ -47,6 +47,15 @@ struct DFlashDraftConfig {
     float rope_theta = 10000.0f;
     std::string hidden_act = "silu";
     bool attention_bias = false;
+    std::vector<int32_t> target_layer_ids;
+
+    /// Number of context layers for ctx_dim computation.
+    /// Uses explicit target_layer_ids count if available, else falls back to num_hidden_layers.
+    int32_t num_ctx_layers() const {
+        return target_layer_ids.empty()
+            ? num_hidden_layers
+            : static_cast<int32_t>(target_layer_ids.size());
+    }
 };
 
 class DFlashAttention : public Module {

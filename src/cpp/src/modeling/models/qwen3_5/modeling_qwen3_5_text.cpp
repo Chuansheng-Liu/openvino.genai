@@ -1461,7 +1461,7 @@ std::shared_ptr<ov::Model> create_qwen3_5_dflash_combined_draft_model(
     // ── Inputs ──
     const ov::element::Type dtype = ov::element::f32;
     const int64_t ctx_dim = static_cast<int64_t>(draft_cfg.hidden_size) *
-                            static_cast<int64_t>(draft_cfg.num_hidden_layers);
+                            static_cast<int64_t>(draft_cfg.num_ctx_layers());
     auto target_hidden = ctx.parameter("target_hidden", dtype, ov::PartialShape{-1, -1, ctx_dim});
     auto input_ids = ctx.parameter("input_ids", ov::element::i64, ov::PartialShape{-1, -1});
     auto position_ids = ctx.parameter("position_ids", ov::element::i64, ov::PartialShape{-1, -1});
@@ -1496,7 +1496,7 @@ std::shared_ptr<ov::Model> create_qwen3_5_dflash_context_kv_model(
 
     const ov::element::Type dtype = ov::element::f32;
     const int64_t ctx_dim = static_cast<int64_t>(draft_cfg.hidden_size) *
-                            static_cast<int64_t>(draft_cfg.num_hidden_layers);
+                            static_cast<int64_t>(draft_cfg.num_ctx_layers());
     auto target_hidden = ctx.parameter("target_hidden", dtype, ov::PartialShape{-1, -1, ctx_dim});
     auto position_ids = ctx.parameter("position_ids", ov::element::i64, ov::PartialShape{-1, -1});
 
@@ -1620,7 +1620,7 @@ std::shared_ptr<ov::Model> create_qwen3_5_dflash_context_fc_model(
 
     const ov::element::Type dtype = ov::element::f32;
     const int64_t ctx_dim = static_cast<int64_t>(draft_cfg.hidden_size) *
-                            static_cast<int64_t>(draft_cfg.num_hidden_layers);
+                            static_cast<int64_t>(draft_cfg.num_ctx_layers());
     auto target_hidden = ctx.parameter("target_hidden", dtype, ov::PartialShape{-1, -1, ctx_dim});
 
     auto context_hidden = draft_model.compute_context_hidden(target_hidden);

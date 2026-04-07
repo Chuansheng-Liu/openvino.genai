@@ -399,6 +399,7 @@ int main(int argc, char* argv[]) try {
     dflash_cfg.rope_theta = draft_cfg.rope_theta;
     dflash_cfg.hidden_act = draft_cfg.hidden_act;
     dflash_cfg.attention_bias = draft_cfg.attention_bias;
+    dflash_cfg.target_layer_ids = draft_cfg.target_layer_ids;
 
     if (dflash_cfg.block_size <= 0) {
         dflash_cfg.block_size = 16;
@@ -407,8 +408,13 @@ int main(int argc, char* argv[]) try {
         throw std::runtime_error("block_size must be >= 2 for DFlash decoding");
     }
 
-    const auto target_layer_ids = ov::genai::modeling::models::build_target_layer_ids(
-        dflash_cfg.num_target_layers, dflash_cfg.num_hidden_layers);
+    // Use explicit target_layer_ids from config if available, else compute evenly-spaced
+    auto target_layer_ids = dflash_cfg.target_layer_ids.empty()
+        ? ov::genai::modeling::models::build_target_layer_ids(
+              dflash_cfg.num_target_layers, dflash_cfg.num_hidden_layers)
+        : dflash_cfg.target_layer_ids;
+    // Sync back so num_ctx_layers() uses the right count
+    dflash_cfg.target_layer_ids = target_layer_ids;
     std::cout << "dflash_cfg.block_size is " << dflash_cfg.block_size << std::endl;
     std::cout << "dflash_cfg.num_target_layers is " << dflash_cfg.num_target_layers << std::endl;
     std::cout << "target_layer_ids: ";
