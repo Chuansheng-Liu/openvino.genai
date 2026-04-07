@@ -1259,12 +1259,13 @@ int main(int argc, char* argv[]) try {
         ov::Tensor draft_logits;
         if (use_kv_cache_draft) {
             // ── V3 path: use cached context KV projections ──
-            // Draft position_ids: [T-1, T, T+1, ..., T+B-2] where T = kv_cache_len
+            // Draft position_ids: [T, T+1, ..., T+B-1] where T = kv_cache_len
+            // Must match target verify positions which start at target_hidden_len.
             ov::Tensor draft_pos(ov::element::i64, {1, block_size});
             {
                 auto* pd = draft_pos.data<int64_t>();
                 for (size_t i = 0; i < block_size; ++i)
-                    pd[i] = static_cast<int64_t>(kv_cache_len - 1 + i);
+                    pd[i] = static_cast<int64_t>(kv_cache_len + i);
             }
 
             // Set per-layer context K,V — copy to contiguous tensors
@@ -1337,8 +1338,9 @@ int main(int argc, char* argv[]) try {
                     pd[i] = static_cast<int64_t>(ctx_offset + orig_idx);
                 }
                 // Draft block position IDs: sequential from context end
+                // Must align with target verify positions starting at target_hidden_len.
                 for (size_t i = draft_ctx_len; i < total_pos; ++i)
-                    pd[i] = static_cast<int64_t>(context_hidden_len - 1 + (i - draft_ctx_len));
+                    pd[i] = static_cast<int64_t>(context_hidden_len + (i - draft_ctx_len));
             }
 
             draft_request.set_tensor("context_hidden", ctx_for_draft);
