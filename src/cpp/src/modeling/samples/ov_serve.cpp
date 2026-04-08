@@ -231,6 +231,15 @@ static ParsedRequest parse_chat_request(const json& body, ov::genai::Tokenizer& 
     if (body.contains("seed")) {
         req.params.sampling.rng_seed = body["seed"].get<size_t>();
     }
+    if (body.contains("repetition_penalty")) {
+        req.params.sampling.repetition_penalty = body["repetition_penalty"].get<float>();
+    }
+    if (body.contains("frequency_penalty")) {
+        req.params.sampling.frequency_penalty = body["frequency_penalty"].get<float>();
+    }
+    if (body.contains("presence_penalty")) {
+        req.params.sampling.presence_penalty = body["presence_penalty"].get<float>();
+    }
 
     // Stop strings
     if (body.contains("stop")) {
@@ -609,6 +618,18 @@ int main(int argc, char* argv[]) {
         params.max_new_tokens = body.value("max_tokens", cfg.max_tokens_default);
         params.sampling.temperature = body.value("temperature", 0.7f);
         params.sampling.top_p = body.value("top_p", 0.95f);
+        if (body.contains("top_k")) {
+            params.sampling.top_k = body["top_k"].get<size_t>();
+        }
+        if (body.contains("repetition_penalty")) {
+            params.sampling.repetition_penalty = body["repetition_penalty"].get<float>();
+        }
+        if (body.contains("frequency_penalty")) {
+            params.sampling.frequency_penalty = body["frequency_penalty"].get<float>();
+        }
+        if (body.contains("presence_penalty")) {
+            params.sampling.presence_penalty = body["presence_penalty"].get<float>();
+        }
         params.enable_thinking = false;  // No thinking in raw completions
 
         auto request_id = make_request_id();
