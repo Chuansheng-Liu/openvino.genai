@@ -25,6 +25,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstring>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -47,6 +48,87 @@
 using json = nlohmann::json;
 using namespace ov::genai::modeling;
 
+// stb_image for decoding base64 images in memory
+#define STB_IMAGE_IMPLEMENTATION
+#include "stb_image.h"
+
+// ═══════════════════════════════════════════════════════════════════
+//  Base64 decode + image loading from data: URI
+// ═══════════════════════════════════════════════════════════════════
+
+static const uint8_t kBase64Table[256] = {
+    64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,
+    64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,
+    64,64,64,64,64,64,64,64,64,64,64,62,64,64,64,63,
+    52,53,54,55,56,57,58,59,60,61,64,64,64, 0,64,64,
+    64, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,
+    15,16,17,18,19,20,21,22,23,24,25,64,64,64,64,64,
+    64,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,
+    41,42,43,44,45,46,47,48,49,50,51,64,64,64,64,64,
+    64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,
+    64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,
+    64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,
+    64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,
+    64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,
+    64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,
+    64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,
+    64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,
+};
+
+static std::vector<uint8_t> base64_decode(const std::string& input) {
+    std::vector<uint8_t> out;
+    out.reserve(input.size() * 3 / 4);
+    uint32_t accum = 0;
+    int bits = 0;
+    for (char c : input) {
+        if (c == '=' || c == '\n' || c == '\r' || c == ' ') continue;
+        uint8_t val = kBase64Table[static_cast<uint8_t>(c)];
+        if (val == 64) continue;  // skip invalid chars
+        accum = (accum << 6) | val;
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            out.push_back(static_cast<uint8_t>((accum >> bits) & 0xFF));
+        }
+    }
+    return out;
+}
+
+/// Decode a data: URI (base64 image) to an ov::Tensor [1, H, W, 3] uint8.
+/// Supports "data:image/...;base64,..." format.
+static ov::Tensor decode_image_from_data_uri(const std::string& uri) {
+    // Find base64 payload after "base64,"
+    auto pos = uri.find("base64,");
+    if (pos == std::string::npos) {
+        throw std::runtime_error("Image URL must be a data: URI with base64 encoding");
+    }
+    std::string b64_data = uri.substr(pos + 7);
+
+    auto raw_bytes = base64_decode(b64_data);
+    if (raw_bytes.empty()) {
+        throw std::runtime_error("Base64 decode produced empty data");
+    }
+
+    int w = 0, h = 0, channels = 0;
+    constexpr int desired_channels = 3;
+    unsigned char* pixels = stbi_load_from_memory(
+        raw_bytes.data(), static_cast<int>(raw_bytes.size()),
+        &w, &h, &channels, desired_channels);
+    if (!pixels) {
+        throw std::runtime_error(std::string("Failed to decode image: ") +
+                                 stbi_failure_reason());
+    }
+
+    // Create ov::Tensor that owns the pixel data
+    size_t byte_count = static_cast<size_t>(h) * w * desired_channels;
+    ov::Tensor image(ov::element::u8, {1, static_cast<size_t>(h),
+                                        static_cast<size_t>(w),
+                                        static_cast<size_t>(desired_channels)});
+    std::memcpy(image.data(), pixels, byte_count);
+    stbi_image_free(pixels);
+    return image;
+}
+
 // ═══════════════════════════════════════════════════════════════════
 //  Config
 // ═══════════════════════════════════════════════════════════════════
@@ -58,6 +140,7 @@ struct ServerConfig {
     std::string host = "0.0.0.0";
     int workers = 1;
     bool enable_thinking = true;
+    bool enable_vision = false;
     int max_tokens_default = 2048;
 };
 
@@ -138,6 +221,7 @@ struct ParsedRequest {
     bool stream = false;
     std::string model_name;
     std::vector<json> tools;         // tool definitions (passed to chat template)
+    std::vector<ov::Tensor> images;  // decoded images (max 1 currently)
 };
 
 static ParsedRequest parse_chat_request(const json& body, ov::genai::Tokenizer& tokenizer,
@@ -160,8 +244,29 @@ static ParsedRequest parse_chat_request(const json& body, ov::genai::Tokenizer& 
     for (const auto& msg : messages) {
         std::string role = msg.at("role").get<std::string>();
         std::string content;
-        if (msg.contains("content") && msg["content"].is_string()) {
-            content = msg["content"].get<std::string>();
+
+        // Handle both string content and multimodal content array
+        if (msg.contains("content")) {
+            if (msg["content"].is_string()) {
+                content = msg["content"].get<std::string>();
+            } else if (msg["content"].is_array()) {
+                // OpenAI multimodal content array: [{type: "text"}, {type: "image_url"}]
+                for (const auto& part : msg["content"]) {
+                    std::string part_type = part.value("type", "");
+                    if (part_type == "text") {
+                        if (!content.empty()) content += "\n";
+                        content += part.at("text").get<std::string>();
+                    } else if (part_type == "image_url") {
+                        auto url = part.at("image_url").at("url").get<std::string>();
+                        auto image = decode_image_from_data_uri(url);
+                        req.images.push_back(std::move(image));
+                        // Insert vision marker into prompt at image position
+                        content += "<|vision_start|><|vision_end|>";
+                    }
+                }
+            } else if (msg["content"].is_null()) {
+                content = "";
+            }
         }
 
         if (role == "system" && !req.tools.empty() && !has_system) {
@@ -333,7 +438,10 @@ static std::string sse_done() {
 
 static void print_usage() {
     std::cerr << "Usage: ov_serve --model <path> [--port 8080] [--host 0.0.0.0] "
-                 "[--workers 1] [--device GPU]\n";
+                 "[--workers 1] [--device GPU] [--vl] [--no-thinking]\n"
+                 "\n"
+                 "  --vl          Enable vision-language (load vision encoder)\n"
+                 "  --no-thinking Disable thinking mode\n";
 }
 
 int main(int argc, char* argv[]) {
@@ -349,6 +457,7 @@ int main(int argc, char* argv[]) {
         else if (arg == "--device" && i + 1 < argc) cfg.device = argv[++i];
         else if (arg == "--max-tokens" && i + 1 < argc) cfg.max_tokens_default = std::stoi(argv[++i]);
         else if (arg == "--no-thinking") cfg.enable_thinking = false;
+        else if (arg == "--vl") cfg.enable_vision = true;
         else if (arg == "--help" || arg == "-h") { print_usage(); return 0; }
     }
 
@@ -365,7 +474,7 @@ int main(int argc, char* argv[]) {
     LoadParams lp;
     lp.device = cfg.device;
     lp.cache_ir = true;
-    lp.enable_vision = false;  // text-only for now
+    lp.enable_vision = cfg.enable_vision;
 
     ModelLoader loader(cfg.model_path, lp);
 
@@ -436,6 +545,35 @@ int main(int argc, char* argv[]) {
             err["error"]["type"] = "invalid_request_error";
             res.set_content(err.dump(), "application/json");
             return;
+        }
+
+        // VL validation
+        if (!parsed.images.empty()) {
+            if (!cfg.enable_vision) {
+                res.status = 400;
+                json err;
+                err["error"]["message"] = "Image input requires --vl flag. "
+                    "Restart server with: ov_serve --model <path> --vl";
+                err["error"]["type"] = "invalid_request_error";
+                res.set_content(err.dump(), "application/json");
+                return;
+            }
+            if (parsed.images.size() > 1) {
+                res.status = 400;
+                json err;
+                err["error"]["message"] = "Only one image per request is currently supported";
+                err["error"]["type"] = "invalid_request_error";
+                res.set_content(err.dump(), "application/json");
+                return;
+            }
+            if (!parsed.tools.empty()) {
+                res.status = 400;
+                json err;
+                err["error"]["message"] = "Tool calling with images is not supported";
+                err["error"]["type"] = "invalid_request_error";
+                res.set_content(err.dump(), "application/json");
+                return;
+            }
         }
 
         auto request_id = make_request_id();
@@ -551,7 +689,12 @@ int main(int argc, char* argv[]) {
                         };
 
                         try {
-                            session->generate(sp.prompt, sp.params, callback);
+                            if (!sp.images.empty()) {
+                                session->generate_vl(sp.prompt, sp.images[0],
+                                                     sp.params, callback);
+                            } else {
+                                session->generate(sp.prompt, sp.params, callback);
+                            }
                         } catch (const std::exception& e) {
                             // Send error as SSE event before closing
                             json err_chunk;
@@ -570,7 +713,13 @@ int main(int argc, char* argv[]) {
                 WorkerPool::Guard worker(pool);
                 auto* session = worker.get();
 
-                auto result = session->generate(parsed.prompt, parsed.params);
+                GenerateResult result;
+                if (!parsed.images.empty()) {
+                    result = session->generate_vl(parsed.prompt, parsed.images[0],
+                                                  parsed.params);
+                } else {
+                    result = session->generate(parsed.prompt, parsed.params);
+                }
 
                 // Parse tool calls from output
                 ToolCallParser tool_parser;
@@ -674,7 +823,8 @@ int main(int argc, char* argv[]) {
     std::cerr << "[ov_serve] Starting server on " << cfg.host << ":" << cfg.port << "\n";
     std::cerr << "[ov_serve] Workers: " << cfg.workers
               << ", Device: " << cfg.device
-              << ", Thinking: " << (cfg.enable_thinking ? "on" : "off") << "\n";
+              << ", Thinking: " << (cfg.enable_thinking ? "on" : "off")
+              << ", Vision: " << (cfg.enable_vision ? "on" : "off") << "\n";
     std::cerr << "[ov_serve] Endpoints:\n"
               << "  POST /v1/chat/completions\n"
               << "  POST /v1/completions\n"

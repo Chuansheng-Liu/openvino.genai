@@ -771,6 +771,324 @@ class TestThinking:
 
 
 # ═══════════════════════════════════════════════════════════════════
+#  9. Vision-Language (VL) Tests
+# ═══════════════════════════════════════════════════════════════════
+
+# Helper: generate a small valid PNG image (8x8 red square) as base64
+def make_test_image_base64():
+    """Create a minimal 8x8 red PNG as base64 data: URI."""
+    import base64
+    import struct
+    import zlib
+
+    width, height = 8, 8
+    # Raw pixel rows: filter byte (0) + RGB for each pixel
+    raw_data = b""
+    for _ in range(height):
+        raw_data += b"\x00"  # filter: none
+        raw_data += b"\xff\x00\x00" * width  # red pixels
+
+    def make_chunk(chunk_type, data):
+        c = chunk_type + data
+        return struct.pack(">I", len(data)) + c + struct.pack(">I", zlib.crc32(c) & 0xFFFFFFFF)
+
+    png = b"\x89PNG\r\n\x1a\n"
+    png += make_chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+    png += make_chunk(b"IDAT", zlib.compress(raw_data))
+    png += make_chunk(b"IEND", b"")
+
+    b64 = base64.b64encode(png).decode()
+    return f"data:image/png;base64,{b64}"
+
+
+# Check if server has VL enabled
+def is_vl_enabled():
+    """Heuristic: try a small VL request; if 400 with 'vl flag' message, VL is off."""
+    try:
+        r = requests.post(
+            chat_url(),
+            json={
+                "model": "qwen3.5",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image_url", "image_url": {"url": make_test_image_base64()}},
+                            {"type": "text", "text": "hi"},
+                        ],
+                    }
+                ],
+                "max_tokens": 5,
+            },
+            timeout=10,
+        )
+        if r.status_code == 400:
+            data = r.json()
+            msg = data.get("error", {}).get("message", "")
+            if "--vl" in msg:
+                return False
+        return True
+    except Exception:
+        return False
+
+
+vl_enabled = pytest.mark.skipif(
+    not is_vl_enabled(),
+    reason="Server not started with --vl (vision not enabled)",
+)
+
+
+class TestVisionLanguage:
+    """Tests for VL (vision-language) support.
+    Requires server started with --vl flag.
+    """
+
+    @vl_enabled
+    def test_vl_basic_base64(self):
+        """Send a base64 image and get a description."""
+        img_uri = make_test_image_base64()
+        r = requests.post(
+            chat_url(),
+            json={
+                "model": "qwen3.5",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image_url", "image_url": {"url": img_uri}},
+                            {"type": "text", "text": "What color is this image? Answer in one word."},
+                        ],
+                    }
+                ],
+                "max_tokens": 1500,
+                "temperature": 0.0,
+            },
+            timeout=TIMEOUT,
+        )
+        assert r.status_code == 200
+        data = r.json()
+        msg = data["choices"][0]["message"]
+        # Should have content (thinking may consume some tokens)
+        content = msg.get("content") or ""
+        reasoning = msg.get("reasoning_content") or ""
+        assert len(content) > 0 or len(reasoning) > 0
+        assert data["usage"]["prompt_tokens"] > 50  # image tokens + text
+
+    @vl_enabled
+    def test_vl_streaming(self):
+        """VL request with streaming SSE."""
+        img_uri = make_test_image_base64()
+        r = requests.post(
+            chat_url(),
+            json={
+                "model": "qwen3.5",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image_url", "image_url": {"url": img_uri}},
+                            {"type": "text", "text": "Describe this image briefly."},
+                        ],
+                    }
+                ],
+                "max_tokens": 1500,
+                "stream": True,
+            },
+            timeout=TIMEOUT,
+            stream=True,
+        )
+        assert r.status_code == 200
+
+        events = parse_sse_events(r)
+        assert len(events) > 2  # role + at least one token + finish
+
+        # Check first event has role
+        first = events[0]
+        delta = first.get("choices", [{}])[0].get("delta", {})
+        assert delta.get("role") == "assistant"
+
+        # Check last event has finish_reason
+        last = events[-1]
+        fr = last.get("choices", [{}])[0].get("finish_reason")
+        assert fr in ("stop", "length")
+
+    @vl_enabled
+    def test_vl_with_system_message(self):
+        """VL request with a system message (multi-turn ChatML)."""
+        img_uri = make_test_image_base64()
+        r = requests.post(
+            chat_url(),
+            json={
+                "model": "qwen3.5",
+                "messages": [
+                    {"role": "system", "content": "You are a color expert."},
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image_url", "image_url": {"url": img_uri}},
+                            {"type": "text", "text": "What color do you see?"},
+                        ],
+                    },
+                ],
+                "max_tokens": 1500,
+                "temperature": 0.0,
+            },
+            timeout=TIMEOUT,
+        )
+        assert r.status_code == 200
+        data = r.json()
+        assert data["choices"][0]["finish_reason"] in ("stop", "length")
+
+    @vl_enabled
+    def test_vl_text_only_still_works(self):
+        """Text-only request to VL-enabled server still works."""
+        r = requests.post(
+            chat_url(),
+            json={
+                "model": "qwen3.5",
+                "messages": [{"role": "user", "content": "What is 2+2?"}],
+                "max_tokens": 500,
+                "temperature": 0.0,
+            },
+            timeout=TIMEOUT,
+        )
+        assert r.status_code == 200
+        data = r.json()
+        content = data["choices"][0]["message"].get("content") or ""
+        assert "4" in content
+
+    def test_vl_no_vision_model_returns_error(self):
+        """If server has no --vl flag, images should return 400."""
+        if is_vl_enabled():
+            pytest.skip("Server has VL enabled; this test is for non-VL servers")
+
+        img_uri = make_test_image_base64()
+        r = requests.post(
+            chat_url(),
+            json={
+                "model": "qwen3.5",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image_url", "image_url": {"url": img_uri}},
+                            {"type": "text", "text": "describe"},
+                        ],
+                    }
+                ],
+                "max_tokens": 100,
+            },
+            timeout=TIMEOUT,
+        )
+        assert r.status_code == 400
+        data = r.json()
+        assert "--vl" in data["error"]["message"]
+
+    def test_vl_multiple_images_rejected(self):
+        """Multiple images in one request should return 400."""
+        img_uri = make_test_image_base64()
+        r = requests.post(
+            chat_url(),
+            json={
+                "model": "qwen3.5",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image_url", "image_url": {"url": img_uri}},
+                            {"type": "image_url", "image_url": {"url": img_uri}},
+                            {"type": "text", "text": "Compare these."},
+                        ],
+                    }
+                ],
+                "max_tokens": 100,
+            },
+            timeout=TIMEOUT,
+        )
+        # Should be 400 (multiple images) or 400 (no VL)
+        assert r.status_code == 400
+
+    def test_vl_tools_with_image_rejected(self):
+        """Tools + image combination should return 400."""
+        img_uri = make_test_image_base64()
+        r = requests.post(
+            chat_url(),
+            json={
+                "model": "qwen3.5",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image_url", "image_url": {"url": img_uri}},
+                            {"type": "text", "text": "What's the weather in this photo?"},
+                        ],
+                    }
+                ],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "get_weather",
+                            "parameters": {"type": "object", "properties": {}},
+                        },
+                    }
+                ],
+                "max_tokens": 100,
+            },
+            timeout=TIMEOUT,
+        )
+        assert r.status_code == 400
+
+    def test_vl_invalid_base64_returns_error(self):
+        """Malformed base64 data should return 400."""
+        r = requests.post(
+            chat_url(),
+            json={
+                "model": "qwen3.5",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": "data:image/png;base64,INVALID_DATA!!!"},
+                            },
+                            {"type": "text", "text": "describe"},
+                        ],
+                    }
+                ],
+                "max_tokens": 100,
+            },
+            timeout=TIMEOUT,
+        )
+        assert r.status_code == 400
+
+    def test_vl_url_without_base64_returns_error(self):
+        """HTTP URL (non data: URI) should return 400."""
+        r = requests.post(
+            chat_url(),
+            json={
+                "model": "qwen3.5",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": "https://example.com/photo.jpg"},
+                            },
+                            {"type": "text", "text": "describe"},
+                        ],
+                    }
+                ],
+                "max_tokens": 100,
+            },
+            timeout=TIMEOUT,
+        )
+        assert r.status_code == 400
+
+
+# ═══════════════════════════════════════════════════════════════════
 #  Main entry point
 # ═══════════════════════════════════════════════════════════════════
 

@@ -215,8 +215,12 @@ struct Session::Impl {
     }
 
     /// Tokenize a VL prompt with image token placeholders.
+    /// When raw_prompt=true, the prompt is already ChatML-formatted and contains
+    /// <|vision_start|><|vision_end|> as a marker; we expand it with image_pad tokens.
+    /// When raw_prompt=false, build_vl_prompt wraps a plain user message.
     std::pair<ov::Tensor, ov::Tensor> tokenize_vl(const std::string& prompt,
-                                                    const ov::Tensor& grid_thw) {
+                                                    const ov::Tensor& grid_thw,
+                                                    bool raw_prompt = false) {
         auto* tok = model_.tokenizer();
         if (!tok) {
             throw std::runtime_error("Tokenizer not available");
@@ -226,7 +230,25 @@ struct Session::Impl {
         const int64_t image_tokens = models::Qwen3_5VisionPreprocessor::count_visual_tokens(
             grid_thw, cfg.vision.spatial_merge_size);
 
-        std::string vl_prompt = build_vl_prompt(prompt, image_tokens);
+        std::string vl_prompt;
+        if (raw_prompt) {
+            // Expand <|vision_start|><|vision_end|> marker with image_pad tokens
+            vl_prompt = prompt;
+            const std::string marker = "<|vision_start|><|vision_end|>";
+            auto pos = vl_prompt.find(marker);
+            if (pos != std::string::npos) {
+                std::string expansion = "<|vision_start|>";
+                expansion.reserve(expansion.size() +
+                                  static_cast<size_t>(image_tokens) * 13 + 16);
+                for (int64_t i = 0; i < image_tokens; ++i) {
+                    expansion += "<|image_pad|>";
+                }
+                expansion += "<|vision_end|>";
+                vl_prompt.replace(pos, marker.size(), expansion);
+            }
+        } else {
+            vl_prompt = build_vl_prompt(prompt, image_tokens);
+        }
         auto result = tok->encode(vl_prompt, ov::genai::add_special_tokens(false));
         return {result.input_ids, result.attention_mask};
     }
@@ -602,7 +624,8 @@ GenerateResult Session::generate_vl(const std::string& prompt,
         auto [visual_embeds, grid_thw] = impl_->encode_vision(image);
 
         // Tokenize VL prompt
-        auto [input_ids, attention_mask] = impl_->tokenize_vl(prompt, grid_thw);
+        auto [input_ids, attention_mask] = impl_->tokenize_vl(prompt, grid_thw,
+                                                               params.raw_prompt);
 
         // Plan with VL
         const auto& cfg = impl_->model_.config();
