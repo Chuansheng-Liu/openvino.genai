@@ -29,6 +29,7 @@ struct GenerateParams {
     bool enable_thinking = true;
     std::vector<std::string> stop_strings;
     int timeout_ms = 0;             // 0 = no timeout
+    bool raw_prompt = false;        // if true, skip chat template (prompt is pre-formatted)
 };
 
 /// Stream event types for progressive output.

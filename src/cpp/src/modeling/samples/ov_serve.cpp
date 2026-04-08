@@ -211,11 +211,16 @@ static ParsedRequest parse_chat_request(const json& body, ov::genai::Tokenizer& 
     }
 
     chat_text += "<|im_start|>assistant\n";
+    // If thinking is enabled, add <think> trigger so model uses structured tags
+    if (cfg.enable_thinking) {
+        chat_text += "<think>\n";
+    }
     req.prompt = chat_text;
 
     // Generation params
     req.params.max_new_tokens = body.value("max_tokens", cfg.max_tokens_default);
     req.params.enable_thinking = cfg.enable_thinking;
+    req.params.raw_prompt = true;  // prompt is already ChatML-formatted
 
     float temperature = body.value("temperature", 0.7f);
     req.params.sampling.temperature = temperature;
@@ -425,57 +430,75 @@ int main(int argc, char* argv[]) {
         }
 
         auto request_id = make_request_id();
-        WorkerPool::Guard worker(pool);
-        auto* session = worker.get();
 
         try {
             if (parsed.stream) {
                 // ── Streaming SSE ──
-                res.set_header("Content-Type", "text/event-stream");
-                res.set_header("Cache-Control", "no-cache");
-                res.set_header("Connection", "keep-alive");
+                // IMPORTANT: For streaming, session lifecycle must live inside the
+                // content provider lambda. set_chunked_content_provider returns
+                // immediately; the lambda runs after this handler exits.
+                // Capturing local variables by reference would be use-after-free.
+                auto sp = std::move(parsed);  // move into value captures
+                auto rid = request_id;
+                auto mn = model_name;
 
-                // Send initial role chunk
-                {
-                    json chunk;
-                    chunk["id"] = request_id;
-                    chunk["object"] = "chat.completion.chunk";
-                    chunk["created"] = unix_timestamp();
-                    chunk["model"] = model_name;
-                    json delta;
-                    delta["role"] = "assistant";
-                    json choice;
-                    choice["index"] = 0;
-                    choice["delta"] = delta;
-                    chunk["choices"] = json::array({choice});
-                    res.set_chunked_content_provider(
-                        "text/event-stream",
-                        [&](size_t /*offset*/, httplib::DataSink& sink) {
-                            // Send role chunk
-                            std::string role_sse = sse_chunk(chunk);
+                res.set_chunked_content_provider(
+                    "text/event-stream",
+                    [&pool, sp = std::move(sp), rid, mn](size_t /*offset*/,
+                                                         httplib::DataSink& sink) {
+                        // Acquire session inside content provider (lives until lambda ends)
+                        WorkerPool::Guard worker(pool);
+                        auto* session = worker.get();
+
+                        // Send initial role chunk
+                        {
+                            json role_chunk;
+                            role_chunk["id"] = rid;
+                            role_chunk["object"] = "chat.completion.chunk";
+                            role_chunk["created"] = unix_timestamp();
+                            role_chunk["model"] = mn;
+                            json delta;
+                            delta["role"] = "assistant";
+                            json choice;
+                            choice["index"] = 0;
+                            choice["delta"] = delta;
+                            role_chunk["choices"] = json::array({choice});
+                            std::string role_sse = sse_chunk(role_chunk);
                             sink.write(role_sse.c_str(), role_sse.size());
+                        }
 
-                            ThinkingTracker thinking_tracker;
-                            ToolCallParser tool_parser;
-                            bool is_in_thinking = false;
+                        // Session already processes through ThinkingTracker internally;
+                        // sc.is_thinking tells us which category each token belongs to.
+                        ToolCallParser tool_parser;
 
-                            auto callback = [&](const StreamChunk& sc) -> bool {
-                                if (sc.event == StreamEvent::TOKEN && !sc.token_text.empty()) {
-                                    // Process through thinking tracker
-                                    auto tr = thinking_tracker.process(sc.token_text);
-
-                                    // Send thinking content
-                                    if (!tr.thinking_text.empty()) {
-                                        if (!is_in_thinking) {
-                                            is_in_thinking = true;
-                                        }
+                        auto callback = [&](const StreamChunk& sc) -> bool {
+                            if (sc.event == StreamEvent::TOKEN && !sc.token_text.empty()) {
+                                if (sc.is_thinking) {
+                                    // Send as reasoning_content delta
+                                    json tc;
+                                    tc["id"] = rid;
+                                    tc["object"] = "chat.completion.chunk";
+                                    tc["created"] = unix_timestamp();
+                                    tc["model"] = mn;
+                                    json d;
+                                    d["reasoning_content"] = sc.token_text;
+                                    json c;
+                                    c["index"] = 0;
+                                    c["delta"] = d;
+                                    tc["choices"] = json::array({c});
+                                    std::string s = sse_chunk(tc);
+                                    sink.write(s.c_str(), s.size());
+                                } else {
+                                    // Content text — run through tool parser
+                                    auto pr = tool_parser.process(sc.token_text);
+                                    if (!pr.text.empty()) {
                                         json tc;
-                                        tc["id"] = request_id;
+                                        tc["id"] = rid;
                                         tc["object"] = "chat.completion.chunk";
                                         tc["created"] = unix_timestamp();
-                                        tc["model"] = model_name;
+                                        tc["model"] = mn;
                                         json d;
-                                        d["reasoning_content"] = tr.thinking_text;
+                                        d["content"] = pr.text;
                                         json c;
                                         c["index"] = 0;
                                         c["delta"] = d;
@@ -483,72 +506,61 @@ int main(int argc, char* argv[]) {
                                         std::string s = sse_chunk(tc);
                                         sink.write(s.c_str(), s.size());
                                     }
-
-                                    // Send content text
-                                    if (!tr.content_text.empty()) {
-                                        // Run through tool parser
-                                        auto pr = tool_parser.process(tr.content_text);
-                                        if (!pr.text.empty()) {
-                                            json tc;
-                                            tc["id"] = request_id;
-                                            tc["object"] = "chat.completion.chunk";
-                                            tc["created"] = unix_timestamp();
-                                            tc["model"] = model_name;
-                                            json d;
-                                            d["content"] = pr.text;
-                                            json c;
-                                            c["index"] = 0;
-                                            c["delta"] = d;
-                                            tc["choices"] = json::array({c});
-                                            std::string s = sse_chunk(tc);
-                                            sink.write(s.c_str(), s.size());
-                                        }
-                                    }
-                                } else if (sc.event == StreamEvent::FINISH) {
-                                    // Final chunk with finish_reason
-                                    auto flush_result = tool_parser.flush();
-                                    std::string finish_reason =
-                                        (sc.stop_reason == StopReason::MAX_TOKENS)
-                                            ? "length"
-                                            : "stop";
-
-                                    json fc;
-                                    fc["id"] = request_id;
-                                    fc["object"] = "chat.completion.chunk";
-                                    fc["created"] = unix_timestamp();
-                                    fc["model"] = model_name;
-                                    json d;
-                                    d = json::object();  // empty delta
-                                    json c;
-                                    c["index"] = 0;
-                                    c["delta"] = d;
-                                    c["finish_reason"] = finish_reason;
-                                    fc["choices"] = json::array({c});
-
-                                    // Add usage if available
-                                    json usage;
-                                    usage["prompt_tokens"] = sc.prompt_tokens;
-                                    usage["completion_tokens"] = sc.generated_tokens;
-                                    usage["total_tokens"] = sc.prompt_tokens + sc.generated_tokens;
-                                    fc["usage"] = usage;
-
-                                    std::string s = sse_chunk(fc);
-                                    sink.write(s.c_str(), s.size());
-
-                                    // Send [DONE]
-                                    std::string done = sse_done();
-                                    sink.write(done.c_str(), done.size());
                                 }
-                                return true;  // continue generating
-                            };
+                            } else if (sc.event == StreamEvent::FINISH) {
+                                auto flush_result = tool_parser.flush();
+                                std::string finish_reason =
+                                    (sc.stop_reason == StopReason::MAX_TOKENS)
+                                        ? "length"
+                                        : "stop";
 
-                            session->generate(parsed.prompt, parsed.params, callback);
-                            sink.done();
-                            return true;
-                        });
-                }
+                                json fc;
+                                fc["id"] = rid;
+                                fc["object"] = "chat.completion.chunk";
+                                fc["created"] = unix_timestamp();
+                                fc["model"] = mn;
+                                json d = json::object();  // empty delta
+                                json c;
+                                c["index"] = 0;
+                                c["delta"] = d;
+                                c["finish_reason"] = finish_reason;
+                                fc["choices"] = json::array({c});
+
+                                json usage;
+                                usage["prompt_tokens"] = sc.prompt_tokens;
+                                usage["completion_tokens"] = sc.generated_tokens;
+                                usage["total_tokens"] = sc.prompt_tokens + sc.generated_tokens;
+                                fc["usage"] = usage;
+
+                                std::string s = sse_chunk(fc);
+                                sink.write(s.c_str(), s.size());
+
+                                std::string done = sse_done();
+                                sink.write(done.c_str(), done.size());
+                            }
+                            return true;  // continue generating
+                        };
+
+                        try {
+                            session->generate(sp.prompt, sp.params, callback);
+                        } catch (const std::exception& e) {
+                            // Send error as SSE event before closing
+                            json err_chunk;
+                            err_chunk["error"] = e.what();
+                            std::string s = sse_chunk(err_chunk);
+                            sink.write(s.c_str(), s.size());
+                            std::string done = sse_done();
+                            sink.write(done.c_str(), done.size());
+                        }
+                        sink.done();
+                        return true;
+                    });
+                // Handler returns here; content provider runs asynchronously
             } else {
                 // ── Non-streaming ──
+                WorkerPool::Guard worker(pool);
+                auto* session = worker.get();
+
                 auto result = session->generate(parsed.prompt, parsed.params);
 
                 // Parse tool calls from output
@@ -566,7 +578,6 @@ int main(int argc, char* argv[]) {
             err["error"]["type"] = "server_error";
             res.set_content(err.dump(), "application/json");
         }
-        // RAII Guard handles session release automatically
     });
 
     // Text completions

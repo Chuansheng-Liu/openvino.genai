@@ -188,9 +188,10 @@ struct Session::Impl {
         return {visual_embeds, inputs.grid_thw};
     }
 
-    /// Tokenize a text prompt using chat template.
+    /// Tokenize a text prompt using chat template (or raw if pre-formatted).
     std::pair<ov::Tensor, ov::Tensor> tokenize_text(const std::string& prompt,
-                                                     bool enable_thinking) {
+                                                     bool enable_thinking,
+                                                     bool raw_prompt = false) {
         auto* tok = model_.tokenizer();
         if (!tok) {
             throw std::runtime_error("Tokenizer not available");
@@ -199,10 +200,13 @@ struct Session::Impl {
         std::string final_prompt = prompt;
         bool add_special = true;
 
-        if (!tok->get_chat_template().empty()) {
+        if (!raw_prompt && !tok->get_chat_template().empty()) {
             ov::genai::ChatHistory history({{{"role", "user"}, {"content", prompt}}});
             ov::genai::JsonContainer extra({{"enable_thinking", enable_thinking}});
             final_prompt = tok->apply_chat_template(history, true, {}, std::nullopt, extra);
+            add_special = false;
+        } else if (raw_prompt) {
+            // Prompt is already fully formatted (ChatML etc.), just tokenize
             add_special = false;
         }
 
@@ -309,6 +313,13 @@ struct Session::Impl {
         if (token_processor_) token_processor_->reset();
         thinking_tracker_.reset();
         tool_call_parser_.reset();
+
+        // When enable_thinking=true, the prompt already contains <think> (either
+        // from chat template or raw prompt), so the model output starts inside the
+        // thinking block. Initialize tracker accordingly.
+        if (params.enable_thinking) {
+            thinking_tracker_.start_in_thinking();
+        }
 
         // Accumulated text for the final result
         std::string accumulated_thinking;
@@ -501,12 +512,14 @@ struct Session::Impl {
         result.text = accumulated_content;
 
         // If no streaming was active, decode all at once
-        if (result.text.empty() && model_.tokenizer()) {
+        if (result.text.empty() && result.thinking_text.empty() && model_.tokenizer()) {
             std::string full_text = model_.tokenizer()->decode(
                 result.token_ids, ov::genai::skip_special_tokens(true));
             // If thinking tracker was used, split the text
             if (params.enable_thinking) {
                 ThinkingTracker final_tracker;
+                // Model output starts inside thinking block (prompt has <think>)
+                final_tracker.start_in_thinking();
                 auto tr = final_tracker.process(full_text);
                 result.thinking_text = tr.thinking_text;
                 result.text = tr.content_text;
@@ -556,7 +569,8 @@ GenerateResult Session::generate(const std::string& prompt,
 
     try {
         // Tokenize
-        auto [input_ids, attention_mask] = impl_->tokenize_text(prompt, params.enable_thinking);
+        auto [input_ids, attention_mask] = impl_->tokenize_text(
+            prompt, params.enable_thinking, params.raw_prompt);
 
         // Plan inputs
         const auto& cfg = impl_->model_.config();

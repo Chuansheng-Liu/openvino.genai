@@ -41,6 +41,9 @@ public:
     /// Reset to initial state.
     void reset();
 
+    /// Set state to IN_THINKING (used when <think> is in prompt, not in output).
+    void start_in_thinking() { state_ = ThinkingState::IN_THINKING; }
+
 private:
     ThinkingState state_ = ThinkingState::BEFORE_THINKING;
     std::string buffer_;  // Partial tag match buffer
