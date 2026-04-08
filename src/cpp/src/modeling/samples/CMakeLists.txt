@@ -372,3 +372,26 @@ add_custom_command(TARGET ov_serve POST_BUILD
 
 set_target_properties(ov_serve PROPERTIES
     INSTALL_RPATH_USE_LINK_PATH ON)
+
+# ── convert_ir: HF model → OpenVINO IR converter ──
+
+add_executable(convert_ir
+    convert_ir.cpp
+    $<TARGET_OBJECTS:openvino_genai_obj>)
+
+target_include_directories(convert_ir PRIVATE
+    "${OpenVINOGenAI_SOURCE_DIR}/src/cpp/src"
+    "${OpenVINOGenAI_SOURCE_DIR}/openvino/thirdparty/json/nlohmann_json/include"
+    "${OpenVINOGenAI_SOURCE_DIR}/build/_deps/nlohmann_json-src/include"
+    $<TARGET_PROPERTY:openvino::genai,INTERFACE_INCLUDE_DIRECTORIES>)
+
+target_link_libraries(convert_ir PRIVATE
+    $<TARGET_PROPERTY:openvino_genai_obj,LINK_LIBRARIES>)
+
+target_compile_definitions(convert_ir PRIVATE
+    openvino_genai_EXPORTS)
+
+add_dependencies(convert_ir openvino_genai)
+
+set_target_properties(convert_ir PROPERTIES
+    INSTALL_RPATH_USE_LINK_PATH ON)

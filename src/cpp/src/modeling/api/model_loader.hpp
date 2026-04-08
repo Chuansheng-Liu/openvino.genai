@@ -26,6 +26,14 @@ struct LoadParams {
     int max_pixels = 0;                         // VL: max pixel count
 };
 
+/// Parameters controlling IR conversion (no GPU compile needed).
+struct ConvertParams {
+    weights::QuantizationConfig quant_config;   // defaults from env if empty
+    bool enable_vision = false;                 // also convert vision model
+    std::optional<int> num_layers;              // debug: override layer count
+    bool force = false;                         // overwrite existing IR
+};
+
 /// Loads and compiles a Qwen3.5 model, ready for creating inference sessions.
 ///
 /// RAII: constructor loads everything (config → weights → IR → compile).
@@ -72,6 +80,12 @@ public:
 
     /// Stop token IDs loaded from generation_config.json.
     const std::set<int64_t>& stop_token_ids() const;
+
+    /// Convert HF model to OpenVINO IR files (no GPU compile needed).
+    /// Saves .xml/.bin to model directory. Subsequent ModelLoader construction
+    /// will reuse cached IR, skipping the expensive build step.
+    static void convert(const std::filesystem::path& model_dir,
+                        const ConvertParams& params = {});
 
 private:
     struct Impl;

@@ -5,6 +5,7 @@
 
 #include <cstring>
 #include <filesystem>
+#include <iomanip>
 #include <iostream>
 #include <memory>
 #include <set>
@@ -349,5 +350,114 @@ ov::genai::Tokenizer* ModelLoader::tokenizer() { return impl_->tokenizer_.get();
 const std::filesystem::path& ModelLoader::model_dir() const { return impl_->model_dir_; }
 const std::string& ModelLoader::device() const { return impl_->device_; }
 const std::set<int64_t>& ModelLoader::stop_token_ids() const { return impl_->stop_token_ids_; }
+
+void ModelLoader::convert(const std::filesystem::path& model_dir, const ConvertParams& params) {
+    // ─── Validate ───
+    if (!std::filesystem::exists(model_dir) || !std::filesystem::is_directory(model_dir)) {
+        throw std::runtime_error("Model directory does not exist: " + model_dir.string());
+    }
+    if (!std::filesystem::exists(model_dir / "config.json")) {
+        throw std::runtime_error("Model directory missing config.json: " + model_dir.string());
+    }
+    if (!has_safetensors_file(model_dir)) {
+        throw std::runtime_error("Model directory missing .safetensors files: " + model_dir.string());
+    }
+
+    // ─── Config ───
+    auto cfg = models::Qwen3_5Config::from_json_file(model_dir);
+    if (params.num_layers.has_value()) {
+        int nl = *params.num_layers;
+        if (nl <= 0 || nl > cfg.text.num_hidden_layers) {
+            throw std::runtime_error("num_layers must be in [1, " +
+                std::to_string(cfg.text.num_hidden_layers) + "], got: " + std::to_string(nl));
+        }
+        cfg.text.num_hidden_layers = nl;
+        if (!cfg.text.layer_types.empty()) {
+            if (cfg.text.layer_types.size() >= static_cast<size_t>(nl)) {
+                cfg.text.layer_types.resize(static_cast<size_t>(nl));
+            } else {
+                cfg.text.layer_types.clear();
+            }
+        }
+        cfg.finalize();
+        cfg.validate();
+    }
+
+    // ─── Quantization ───
+    auto quant = params.quant_config;
+    if (!quant.enabled()) {
+        quant = weights::parse_quantization_config_from_env();
+    }
+    if (quant.enabled() && quant.group_size <= 0) {
+        throw std::runtime_error("Quantization group_size must be > 0");
+    }
+    // Vision quantization disabled (same as load)
+    weights::QuantizationConfig vision_quant{};
+
+    // ─── IR paths ───
+    const bool use_vl = params.enable_vision;
+    std::string text_ir_stem = (use_vl ? "qwen3_5_text_vl" : "qwen3_5_text") + quant_cache_suffix(quant);
+    if (params.num_layers.has_value()) {
+        text_ir_stem += "_l" + std::to_string(*params.num_layers);
+    }
+    std::string vision_ir_stem = "qwen3_5_vision" + quant_cache_suffix(vision_quant);
+    const auto text_xml = model_dir / (text_ir_stem + ".xml");
+    const auto text_bin = model_dir / (text_ir_stem + ".bin");
+    const auto vision_xml = model_dir / (vision_ir_stem + ".xml");
+    const auto vision_bin = model_dir / (vision_ir_stem + ".bin");
+
+    // ─── Check existing ───
+    if (!params.force) {
+        bool text_exists = has_ir_model_pair(text_xml, text_bin);
+        bool vision_ok = !use_vl || has_ir_model_pair(vision_xml, vision_bin);
+        if (text_exists && vision_ok) {
+            std::cout << "[convert] IR already exists (use --force to overwrite):" << std::endl;
+            std::cout << "  text:   " << text_xml << std::endl;
+            if (use_vl) std::cout << "  vision: " << vision_xml << std::endl;
+            return;
+        }
+    }
+
+    // ─── Load weights ───
+    std::cout << "[convert] Loading safetensors from " << model_dir << " ..." << std::endl;
+    auto data = ov::genai::safetensors::load_safetensors(model_dir);
+    auto source = std::make_unique<ov::genai::safetensors::SafetensorsWeightSource>(std::move(data));
+
+    // ─── Build and save vision model ───
+    if (use_vl) {
+        std::cout << "[convert] Building vision IR ..." << std::endl;
+        ov::genai::safetensors::SafetensorsWeightFinalizer finalizer(vision_quant);
+        auto vision_model = models::create_qwen3_5_vision_model(cfg, *source, finalizer);
+        const std::string pe_name = resolve_pos_embed_name(*source);
+        ov::Tensor pos_embed = source->get_tensor(pe_name);
+        embed_pos_embed_in_vision_model(vision_model, pos_embed);
+        ov::serialize(vision_model, vision_xml.string(), vision_bin.string());
+        std::cout << "[convert] Saved vision IR: " << vision_xml << std::endl;
+    }
+
+    // ─── Build and save text model ───
+    bool need_text = params.force || !has_ir_model_pair(text_xml, text_bin);
+    if (need_text) {
+        std::cout << "[convert] Building text IR (" << cfg.text.num_hidden_layers << " layers"
+                  << (quant.enabled() ? ", quantized" : "") << ") ..." << std::endl;
+        ov::genai::safetensors::SafetensorsWeightFinalizer finalizer(quant);
+        auto text_model = models::create_qwen3_5_text_model(cfg, *source, finalizer, false, use_vl);
+        ov::serialize(text_model, text_xml.string(), text_bin.string());
+        std::cout << "[convert] Saved text IR: " << text_xml << std::endl;
+    }
+
+    // ─── Summary ───
+    auto file_size_mb = [](const std::filesystem::path& p) -> double {
+        if (!std::filesystem::exists(p)) return 0;
+        return static_cast<double>(std::filesystem::file_size(p)) / (1024.0 * 1024.0);
+    };
+    std::cout << "\n[convert] Done! IR files saved to " << model_dir << std::endl;
+    std::cout << "  " << text_ir_stem << ".xml + .bin"
+              << " (" << std::fixed << std::setprecision(1) << file_size_mb(text_bin) << " MB)" << std::endl;
+    if (use_vl) {
+        std::cout << "  " << vision_ir_stem << ".xml + .bin"
+                  << " (" << file_size_mb(vision_bin) << " MB)" << std::endl;
+    }
+}
 
 }  // namespace ov::genai::modeling
