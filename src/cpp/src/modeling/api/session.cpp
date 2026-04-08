@@ -300,6 +300,19 @@ struct Session::Impl {
             auto usm_vis_mask = clone_as_usm_host(gpu_ctx_, *visual_pos_mask);
             text_request_.set_tensor(models::Qwen3_5TextIO::kVisualEmbeds, usm_vis);
             text_request_.set_tensor(models::Qwen3_5TextIO::kVisualPosMask, usm_vis_mask);
+        } else if (model_.compiled_vision()) {
+            // VL model loaded but text-only request: provide zero visual tensors
+            // matching prompt sequence length so Select nodes don't get shape mismatch.
+            const auto hidden = static_cast<size_t>(model_.config().text.hidden_size);
+            const auto seq = static_cast<size_t>(prompt_len);
+            auto zero_vis = make_usm_host_tensor(gpu_ctx_, ov::element::f32,
+                                                  {kBatch, seq, hidden});
+            std::memset(zero_vis.data(), 0, zero_vis.get_byte_size());
+            auto zero_mask = make_usm_host_tensor(gpu_ctx_, ov::element::boolean,
+                                                   {kBatch, seq});
+            std::memset(zero_mask.data(), 0, zero_mask.get_byte_size());
+            text_request_.set_tensor(models::Qwen3_5TextIO::kVisualEmbeds, zero_vis);
+            text_request_.set_tensor(models::Qwen3_5TextIO::kVisualPosMask, zero_mask);
         }
 
         const auto prefill_start = std::chrono::steady_clock::now();
@@ -455,6 +468,10 @@ struct Session::Impl {
             text_request_.set_tensor(models::Qwen3_5TextIO::kBeamIdx, beam_idx_);
 
             if (use_vl) {
+                text_request_.set_tensor(models::Qwen3_5TextIO::kVisualEmbeds, decode_visual_);
+                text_request_.set_tensor(models::Qwen3_5TextIO::kVisualPosMask, decode_visual_mask_);
+            } else if (model_.compiled_vision()) {
+                // VL model, text-only: use pre-allocated [B, 1] zero tensors
                 text_request_.set_tensor(models::Qwen3_5TextIO::kVisualEmbeds, decode_visual_);
                 text_request_.set_tensor(models::Qwen3_5TextIO::kVisualPosMask, decode_visual_mask_);
             }
