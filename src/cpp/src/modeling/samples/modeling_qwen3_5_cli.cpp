@@ -173,6 +173,9 @@ int main(int argc, char* argv[]) try {
         std::cout << "TPOT: " << tpot << " ms/token" << std::endl;
         std::cout << "Throughput: " << result.throughput << " tokens/s" << std::endl;
     }
+    if (!result.thinking_text.empty()) {
+        std::cout << "Thinking Process:" << result.thinking_text << std::endl;
+    }
     std::cout << result.text << std::endl;
 
     return 0;

@@ -18,6 +18,9 @@
 #include "openvino/genai/generation_config.hpp"
 #include "openvino/genai/tokenizer.hpp"
 #include "modeling/api/sampler.hpp"
+#include "modeling/api/thinking_tracker.hpp"
+#include "modeling/api/token_processor.hpp"
+#include "modeling/api/tool_call_parser.hpp"
 #include "modeling/api/types.hpp"
 #include "modeling/models/qwen3_5/modeling_qwen3_5_vision.hpp"
 #include "modeling/models/qwen3_5/processing_qwen3_5.hpp"
@@ -111,6 +114,11 @@ struct Session::Impl {
     // Vision (stateless, created once)
     std::optional<ov::InferRequest> vision_request_;
 
+    // Streaming pipeline components
+    std::optional<TokenProcessor> token_processor_;
+    ThinkingTracker thinking_tracker_;
+    ToolCallParser tool_call_parser_;
+
     static constexpr size_t kBatch = 1;
 
     explicit Impl(ModelLoader& model) : model_(model) {
@@ -136,6 +144,11 @@ struct Session::Impl {
             std::memset(decode_visual_mask_.data(), 0, decode_visual_mask_.get_byte_size());
 
             vision_request_ = model_.compiled_vision()->create_infer_request();
+        }
+
+        // Initialize token processor if tokenizer available
+        if (model_.tokenizer()) {
+            token_processor_.emplace(*model_.tokenizer());
         }
     }
 
@@ -292,6 +305,70 @@ struct Session::Impl {
         rope_deltas_ = rope_deltas;
         const int64_t* rope_data = rope_deltas_.data<const int64_t>();
 
+        // Reset streaming pipeline for this generation
+        if (token_processor_) token_processor_->reset();
+        thinking_tracker_.reset();
+        tool_call_parser_.reset();
+
+        // Accumulated text for the final result
+        std::string accumulated_thinking;
+        std::string accumulated_content;
+        int thinking_tokens = 0;
+        bool sent_thinking_start = false;
+
+        // Helper: run text through thinking tracker + tool parser + callback
+        auto emit_text = [&](const std::string& text, int64_t token_id) -> bool {
+            if (text.empty() || !callback) return true;
+
+            // Step 1: Thinking tracker splits into thinking vs content
+            auto tr = thinking_tracker_.process(text);
+
+            // Send THINKING_START event on first entry
+            if (thinking_tracker_.is_thinking() && !sent_thinking_start) {
+                StreamChunk start_chunk;
+                start_chunk.event = StreamEvent::THINKING_START;
+                if (!callback(start_chunk)) return false;
+                sent_thinking_start = true;
+            }
+
+            // Emit thinking text
+            if (!tr.thinking_text.empty()) {
+                accumulated_thinking += tr.thinking_text;
+                StreamChunk chunk;
+                chunk.event = StreamEvent::TOKEN;
+                chunk.token_id = token_id;
+                chunk.token_text = tr.thinking_text;
+                chunk.is_thinking = true;
+                if (!callback(chunk)) return false;
+            }
+
+            // Send THINKING_END when tracker transitions out
+            if (sent_thinking_start &&
+                thinking_tracker_.state() == ThinkingState::AFTER_THINKING &&
+                !tr.content_text.empty()) {
+                StreamChunk end_chunk;
+                end_chunk.event = StreamEvent::THINKING_END;
+                if (!callback(end_chunk)) return false;
+            }
+
+            // Step 2: Tool call parser on content text
+            if (!tr.content_text.empty()) {
+                auto tp = tool_call_parser_.process(tr.content_text);
+                if (!tp.text.empty()) {
+                    accumulated_content += tp.text;
+                    StreamChunk chunk;
+                    chunk.event = StreamEvent::TOKEN;
+                    chunk.token_id = token_id;
+                    chunk.token_text = tp.text;
+                    chunk.is_thinking = false;
+                    if (!callback(chunk)) return false;
+                }
+                // Tool calls are accumulated and reported in GenerateResult
+            }
+
+            return true;
+        };
+
         // Notify PREFILL_DONE
         if (callback) {
             StreamChunk chunk;
@@ -303,16 +380,21 @@ struct Session::Impl {
             }
         }
 
-        // Notify first token
-        if (callback && !stop_requested_.load()) {
-            StreamChunk chunk;
-            chunk.event = StreamEvent::TOKEN;
-            chunk.token_id = next_id;
-            if (model_.tokenizer()) {
-                chunk.token_text = model_.tokenizer()->decode({next_id}, ov::genai::skip_special_tokens(true));
-            }
-            if (!callback(chunk)) {
-                stop_requested_.store(true);
+        // Process first token through streaming pipeline
+        if (!stop_requested_.load()) {
+            if (token_processor_) {
+                std::string delta = token_processor_->process(next_id);
+                if (!emit_text(delta, next_id)) {
+                    stop_requested_.store(true);
+                }
+            } else if (callback) {
+                // No tokenizer — emit token ID only
+                StreamChunk chunk;
+                chunk.event = StreamEvent::TOKEN;
+                chunk.token_id = next_id;
+                if (!callback(chunk)) {
+                    stop_requested_.store(true);
+                }
             }
         }
 
@@ -363,14 +445,21 @@ struct Session::Impl {
             decode_steps += 1;
             past_len_ += 1;
 
-            // Stream token
-            if (callback) {
+            // Count thinking tokens
+            if (thinking_tracker_.is_thinking()) {
+                thinking_tokens++;
+            }
+
+            // Stream token through pipeline
+            if (token_processor_) {
+                std::string delta = token_processor_->process(next_id);
+                if (!emit_text(delta, next_id)) {
+                    stop_requested_.store(true);
+                }
+            } else if (callback) {
                 StreamChunk chunk;
                 chunk.event = StreamEvent::TOKEN;
                 chunk.token_id = next_id;
-                if (model_.tokenizer()) {
-                    chunk.token_text = model_.tokenizer()->decode({next_id}, ov::genai::skip_special_tokens(true));
-                }
                 if (!callback(chunk)) {
                     stop_requested_.store(true);
                 }
@@ -378,11 +467,20 @@ struct Session::Impl {
         }
         const auto decode_end = std::chrono::steady_clock::now();
 
+        // Flush remaining buffered text
+        if (token_processor_) {
+            std::string remaining = token_processor_->flush();
+            if (!remaining.empty()) {
+                emit_text(remaining, -1);
+            }
+        }
+
         // ─── Build result ───
         GenerateResult result;
         result.token_ids = std::move(generated);
         result.prompt_tokens = static_cast<int>(prompt_len);
         result.generated_tokens = static_cast<int>(result.token_ids.size());
+        result.thinking_tokens = thinking_tokens;
         result.prefill_ms = elapsed_ms(prefill_start, prefill_end);
         result.decode_ms = elapsed_ms(decode_start, decode_end);
         result.ttft_ms = result.prefill_ms;
@@ -398,10 +496,28 @@ struct Session::Impl {
             result.stop_reason = StopReason::EOS;
         }
 
-        // Decode text
-        if (model_.tokenizer()) {
-            result.text = model_.tokenizer()->decode(result.token_ids, ov::genai::skip_special_tokens(true));
+        // Build text results from accumulated streams
+        result.thinking_text = accumulated_thinking;
+        result.text = accumulated_content;
+
+        // If no streaming was active, decode all at once
+        if (result.text.empty() && model_.tokenizer()) {
+            std::string full_text = model_.tokenizer()->decode(
+                result.token_ids, ov::genai::skip_special_tokens(true));
+            // If thinking tracker was used, split the text
+            if (params.enable_thinking) {
+                ThinkingTracker final_tracker;
+                auto tr = final_tracker.process(full_text);
+                result.thinking_text = tr.thinking_text;
+                result.text = tr.content_text;
+            } else {
+                result.text = full_text;
+            }
         }
+
+        // Collect tool calls from parser
+        auto tool_flush = tool_call_parser_.flush();
+        // (tool calls already in result via accumulated_content)
 
         // Notify FINISH
         if (callback) {
@@ -410,11 +526,12 @@ struct Session::Impl {
             chunk.stop_reason = result.stop_reason;
             chunk.prompt_tokens = result.prompt_tokens;
             chunk.generated_tokens = result.generated_tokens;
+            chunk.thinking_tokens = result.thinking_tokens;
             chunk.prefill_ms = result.prefill_ms;
             chunk.decode_ms = result.decode_ms;
             chunk.ttft_ms = result.ttft_ms;
             chunk.throughput = result.throughput;
-            callback(chunk);  // FINISH callback return value ignored
+            callback(chunk);
         }
 
         return result;
