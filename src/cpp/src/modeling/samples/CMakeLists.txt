@@ -337,3 +337,38 @@ add_custom_command(TARGET modeling_glm_ocr POST_BUILD
 set_target_properties(modeling_glm_ocr PROPERTIES
     # Ensure out of box LC_RPATH on macOS with SIP
     INSTALL_RPATH_USE_LINK_PATH ON)
+
+# ── ov_serve: OpenAI-compatible HTTP server ──
+
+# Download cpp-httplib (header-only HTTP library)
+file(DOWNLOAD
+    https://raw.githubusercontent.com/yhirose/cpp-httplib/v0.18.3/httplib.h
+    ${CMAKE_BINARY_DIR}/httplib.h)
+
+add_executable(ov_serve
+    ov_serve.cpp
+    $<TARGET_OBJECTS:openvino_genai_obj>)
+
+target_include_directories(ov_serve PRIVATE
+    "${CMAKE_BINARY_DIR}"
+    "${OpenVINOGenAI_SOURCE_DIR}/src/cpp/src"
+    "${OpenVINOGenAI_SOURCE_DIR}/openvino/thirdparty/json/nlohmann_json/include"
+    "${OpenVINOGenAI_SOURCE_DIR}/build/_deps/nlohmann_json-src/include"
+    $<TARGET_PROPERTY:openvino::genai,INTERFACE_INCLUDE_DIRECTORIES>)
+
+target_link_libraries(ov_serve PRIVATE
+    $<TARGET_PROPERTY:openvino_genai_obj,LINK_LIBRARIES>)
+
+target_compile_definitions(ov_serve PRIVATE
+    openvino_genai_EXPORTS)
+
+add_dependencies(ov_serve openvino_genai)
+
+add_custom_command(TARGET ov_serve POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "$<TARGET_FILE_DIR:openvino_genai>/${tokenizers_dll_name}"
+            "$<TARGET_FILE_DIR:ov_serve>"
+    VERBATIM)
+
+set_target_properties(ov_serve PROPERTIES
+    INSTALL_RPATH_USE_LINK_PATH ON)
