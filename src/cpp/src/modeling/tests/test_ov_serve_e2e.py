@@ -774,31 +774,29 @@ class TestThinking:
 #  9. Vision-Language (VL) Tests
 # ═══════════════════════════════════════════════════════════════════
 
-# Helper: generate a small valid PNG image (8x8 red square) as base64
+# Helper: generate a valid BMP image (64x64 red square) as base64
 def make_test_image_base64():
-    """Create a minimal 8x8 red PNG as base64 data: URI."""
+    """Create a 64x64 red BMP as base64 data: URI.
+
+    Tiny images can fail VL preprocess because height/width are below the resize factor.
+    """
     import base64
     import struct
-    import zlib
 
-    width, height = 8, 8
-    # Raw pixel rows: filter byte (0) + RGB for each pixel
-    raw_data = b""
-    for _ in range(height):
-        raw_data += b"\x00"  # filter: none
-        raw_data += b"\xff\x00\x00" * width  # red pixels
+    width, height = 64, 64
+    row_stride = ((width * 3 + 3) // 4) * 4
+    image_size = row_stride * height
+    file_size = 14 + 40 + image_size
 
-    def make_chunk(chunk_type, data):
-        c = chunk_type + data
-        return struct.pack(">I", len(data)) + c + struct.pack(">I", zlib.crc32(c) & 0xFFFFFFFF)
+    bmp = bytearray()
+    bmp += b"BM"
+    bmp += struct.pack("<IHHI", file_size, 0, 0, 54)
+    bmp += struct.pack("<IIIHHIIIIII", 40, width, height, 1, 24, 0, image_size, 2835, 2835, 0, 0)
+    pixel_row = (b"\x00\x00\xff" * width) + (b"\x00" * (row_stride - width * 3))
+    bmp += pixel_row * height
 
-    png = b"\x89PNG\r\n\x1a\n"
-    png += make_chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
-    png += make_chunk(b"IDAT", zlib.compress(raw_data))
-    png += make_chunk(b"IEND", b"")
-
-    b64 = base64.b64encode(png).decode()
-    return f"data:image/png;base64,{b64}"
+    b64 = base64.b64encode(bmp).decode()
+    return f"data:image/bmp;base64,{b64}"
 
 
 # Check if server has VL enabled
@@ -820,7 +818,7 @@ def is_vl_enabled():
                 ],
                 "max_tokens": 5,
             },
-            timeout=10,
+            timeout=min(TIMEOUT, 30),
         )
         if r.status_code == 400:
             data = r.json()
@@ -832,10 +830,9 @@ def is_vl_enabled():
         return False
 
 
-vl_enabled = pytest.mark.skipif(
-    not is_vl_enabled(),
-    reason="Server not started with --vl (vision not enabled)",
-)
+def require_vl_enabled():
+    if not is_vl_enabled():
+        pytest.skip("Server not started with --vl (vision not enabled)")
 
 
 class TestVisionLanguage:
@@ -843,8 +840,8 @@ class TestVisionLanguage:
     Requires server started with --vl flag.
     """
 
-    @vl_enabled
     def test_vl_basic_base64(self):
+        require_vl_enabled()
         """Send a base64 image and get a description."""
         img_uri = make_test_image_base64()
         r = requests.post(
@@ -874,8 +871,8 @@ class TestVisionLanguage:
         assert len(content) > 0 or len(reasoning) > 0
         assert data["usage"]["prompt_tokens"] > 50  # image tokens + text
 
-    @vl_enabled
     def test_vl_streaming(self):
+        require_vl_enabled()
         """VL request with streaming SSE."""
         img_uri = make_test_image_base64()
         r = requests.post(
@@ -902,18 +899,20 @@ class TestVisionLanguage:
         events = parse_sse_events(r)
         assert len(events) > 2  # role + at least one token + finish
 
-        # Check first event has role
-        first = events[0]
+        # Check first data event has role
+        data_events = [d for t, d in events if t == "data" and d]
+        assert len(data_events) > 0, "No data events in SSE stream"
+        first = data_events[0]
         delta = first.get("choices", [{}])[0].get("delta", {})
         assert delta.get("role") == "assistant"
 
-        # Check last event has finish_reason
-        last = events[-1]
+        # Check last data event has finish_reason
+        last = data_events[-1]
         fr = last.get("choices", [{}])[0].get("finish_reason")
         assert fr in ("stop", "length")
 
-    @vl_enabled
     def test_vl_with_system_message(self):
+        require_vl_enabled()
         """VL request with a system message (multi-turn ChatML)."""
         img_uri = make_test_image_base64()
         r = requests.post(
@@ -939,8 +938,8 @@ class TestVisionLanguage:
         data = r.json()
         assert data["choices"][0]["finish_reason"] in ("stop", "length")
 
-    @vl_enabled
     def test_vl_text_only_still_works(self):
+        require_vl_enabled()
         """Text-only request to VL-enabled server still works."""
         r = requests.post(
             chat_url(),
