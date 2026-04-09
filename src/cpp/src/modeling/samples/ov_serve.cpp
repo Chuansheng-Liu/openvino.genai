@@ -94,7 +94,7 @@ static std::vector<uint8_t> base64_decode(const std::string& input) {
     return out;
 }
 
-/// Decode a data: URI (base64 image) to an ov::Tensor [1, H, W, 3] uint8.
+/// Decode a data: URI (base64 image) to an ov::Tensor [H, W, 3] uint8.
 /// Supports "data:image/...;base64,..." format.
 static ov::Tensor decode_image_from_data_uri(const std::string& uri) {
     // Find base64 payload after "base64,"
@@ -121,9 +121,9 @@ static ov::Tensor decode_image_from_data_uri(const std::string& uri) {
 
     // Create ov::Tensor that owns the pixel data
     size_t byte_count = static_cast<size_t>(h) * w * desired_channels;
-    ov::Tensor image(ov::element::u8, {1, static_cast<size_t>(h),
-                                        static_cast<size_t>(w),
-                                        static_cast<size_t>(desired_channels)});
+    ov::Tensor image(ov::element::u8, {static_cast<size_t>(h),
+                                       static_cast<size_t>(w),
+                                       static_cast<size_t>(desired_channels)});
     std::memcpy(image.data(), pixels, byte_count);
     stbi_image_free(pixels);
     return image;
@@ -142,7 +142,16 @@ struct ServerConfig {
     bool enable_thinking = true;
     bool enable_vision = false;
     int max_tokens_default = 2048;
+    float repetition_penalty = 1.1f;  // Default to prevent degeneration
+    float presence_penalty = 1.5f;    // Qwen3.5 official recommendation
+    float min_temperature = 0.0f;     // 0 = no override; set via --min-temp
+    int warmup_tokens = 4096;         // 0 = disable warmup
 };
+
+/// Check if an exception is a GPU out-of-memory error (CL_OUT_OF_RESOURCES).
+static bool is_gpu_oom(const std::exception& e) {
+    return std::string(e.what()).find("CL_OUT_OF_RESOURCES") != std::string::npos;
+}
 
 // ═══════════════════════════════════════════════════════════════════
 //  Worker Pool — owns N Sessions, thread-safe acquire/release
@@ -150,7 +159,7 @@ struct ServerConfig {
 
 class WorkerPool {
 public:
-    WorkerPool(ModelLoader& loader, int n) {
+    WorkerPool(ModelLoader& loader, int n) : loader_(loader) {
         for (int i = 0; i < n; ++i) {
             sessions_.push_back(std::make_unique<Session>(loader));
             available_.push(sessions_.back().get());
@@ -172,6 +181,23 @@ public:
         cv_.notify_one();
     }
 
+    /// Warmup all sessions to pre-allocate GPU memory.
+    void warmup(int warmup_tokens) {
+        for (auto& s : sessions_) {
+            s->warmup(warmup_tokens);
+        }
+    }
+
+    /// Recreate a session after GPU error (e.g., CL_OUT_OF_RESOURCES).
+    /// Caller must hold the session (acquired, not yet released).
+    void recreate_session(Session* s, int warmup_tokens) {
+        std::cerr << "[ov_serve] Recreating session after GPU error\n";
+        s->recreate();
+        if (warmup_tokens > 0) {
+            s->warmup(warmup_tokens);
+        }
+    }
+
     size_t size() const { return sessions_.size(); }
 
     /// RAII guard — ensures session is always released back to pool.
@@ -189,6 +215,7 @@ public:
     };
 
 private:
+    ModelLoader& loader_;
     std::vector<std::unique_ptr<Session>> sessions_;
     std::queue<Session*> available_;
     std::mutex mu_;
@@ -316,9 +343,12 @@ static ParsedRequest parse_chat_request(const json& body, ov::genai::Tokenizer& 
     }
 
     chat_text += "<|im_start|>assistant\n";
-    // If thinking is enabled, add <think> trigger so model uses structured tags
     if (cfg.enable_thinking) {
+        // Trigger structured thinking with <think> tag
         chat_text += "<think>\n";
+    } else {
+        // Suppress thinking: empty think block tells model to skip thinking
+        chat_text += "<think>\n</think>\n\n";
     }
     req.prompt = chat_text;
 
@@ -328,6 +358,9 @@ static ParsedRequest parse_chat_request(const json& body, ov::genai::Tokenizer& 
     req.params.raw_prompt = true;  // prompt is already ChatML-formatted
 
     float temperature = body.value("temperature", 0.7f);
+    if (cfg.min_temperature > 0.0f && temperature < cfg.min_temperature) {
+        temperature = cfg.min_temperature;
+    }
     req.params.sampling.temperature = temperature;
     req.params.sampling.top_p = body.value("top_p", 0.95f);
     if (body.contains("top_k")) {
@@ -338,12 +371,16 @@ static ParsedRequest parse_chat_request(const json& body, ov::genai::Tokenizer& 
     }
     if (body.contains("repetition_penalty")) {
         req.params.sampling.repetition_penalty = body["repetition_penalty"].get<float>();
+    } else {
+        req.params.sampling.repetition_penalty = cfg.repetition_penalty;
     }
     if (body.contains("frequency_penalty")) {
         req.params.sampling.frequency_penalty = body["frequency_penalty"].get<float>();
     }
     if (body.contains("presence_penalty")) {
         req.params.sampling.presence_penalty = body["presence_penalty"].get<float>();
+    } else {
+        req.params.sampling.presence_penalty = cfg.presence_penalty;
     }
 
     // Stop strings
@@ -438,10 +475,13 @@ static std::string sse_done() {
 
 static void print_usage() {
     std::cerr << "Usage: ov_serve --model <path> [--port 8080] [--host 0.0.0.0] "
-                 "[--workers 1] [--device GPU] [--vl] [--no-thinking]\n"
+                 "[--workers 1] [--device GPU] [--vl] [--no-thinking] [--rep-penalty 1.1]\n"
                  "\n"
-                 "  --vl          Enable vision-language (load vision encoder)\n"
-                 "  --no-thinking Disable thinking mode\n";
+                 "  --vl              Enable vision-language (load vision encoder)\n"
+                 "  --no-thinking     Disable thinking mode\n"
+                 "  --rep-penalty     Repetition penalty (default: 1.1)\n"
+                 "  --min-temp        Minimum temperature floor (default: 0, no override)\n"
+                 "  --warmup-tokens   Max sequence length for GPU warmup (default: 4096, 0=disable)\n";
 }
 
 int main(int argc, char* argv[]) {
@@ -456,6 +496,9 @@ int main(int argc, char* argv[]) {
         else if (arg == "--workers" && i + 1 < argc) cfg.workers = std::stoi(argv[++i]);
         else if (arg == "--device" && i + 1 < argc) cfg.device = argv[++i];
         else if (arg == "--max-tokens" && i + 1 < argc) cfg.max_tokens_default = std::stoi(argv[++i]);
+        else if (arg == "--rep-penalty" && i + 1 < argc) cfg.repetition_penalty = std::stof(argv[++i]);
+        else if (arg == "--min-temp" && i + 1 < argc) cfg.min_temperature = std::stof(argv[++i]);
+        else if (arg == "--warmup-tokens" && i + 1 < argc) cfg.warmup_tokens = std::stoi(argv[++i]);
         else if (arg == "--no-thinking") cfg.enable_thinking = false;
         else if (arg == "--vl") cfg.enable_vision = true;
         else if (arg == "--help" || arg == "-h") { print_usage(); return 0; }
@@ -486,6 +529,17 @@ int main(int argc, char* argv[]) {
     std::cerr << "[ov_serve] Creating " << cfg.workers << " worker session(s)...\n";
     WorkerPool pool(loader, cfg.workers);
     std::cerr << "[ov_serve] Workers ready\n";
+
+    // ── GPU warmup ──
+    if (cfg.warmup_tokens > 0) {
+        std::cerr << "[ov_serve] Warming up " << pool.size()
+                  << " session(s) with max_seq_len=" << cfg.warmup_tokens << "...\n";
+        auto tw0 = std::chrono::steady_clock::now();
+        pool.warmup(cfg.warmup_tokens);
+        auto tw1 = std::chrono::steady_clock::now();
+        double warmup_sec = std::chrono::duration<double>(tw1 - tw0).count();
+        std::cerr << "[ov_serve] Warmup complete in " << warmup_sec << "s\n";
+    }
 
     auto* tokenizer = loader.tokenizer();
     std::string model_name = "qwen3.5";
@@ -578,6 +632,16 @@ int main(int argc, char* argv[]) {
 
         auto request_id = make_request_id();
 
+        std::cerr << "[ov_serve] " << request_id
+                  << " temp=" << parsed.params.sampling.temperature
+                  << " top_p=" << parsed.params.sampling.top_p
+                  << " top_k=" << parsed.params.sampling.top_k
+                  << " rep=" << parsed.params.sampling.repetition_penalty
+                  << " pres=" << parsed.params.sampling.presence_penalty
+                  << " freq=" << parsed.params.sampling.frequency_penalty
+                  << " max_tokens=" << parsed.params.max_new_tokens
+                  << " stream=" << parsed.stream << "\n";
+
         try {
             if (parsed.stream) {
                 // ── Streaming SSE ──
@@ -588,10 +652,11 @@ int main(int argc, char* argv[]) {
                 auto sp = std::move(parsed);  // move into value captures
                 auto rid = request_id;
                 auto mn = model_name;
+                auto warmup_tok = cfg.warmup_tokens;
 
                 res.set_chunked_content_provider(
                     "text/event-stream",
-                    [&pool, sp = std::move(sp), rid, mn](size_t /*offset*/,
+                    [&pool, sp = std::move(sp), rid, mn, warmup_tok](size_t /*offset*/,
                                                          httplib::DataSink& sink) {
                         // Acquire session inside content provider (lives until lambda ends)
                         WorkerPool::Guard worker(pool);
@@ -696,6 +761,12 @@ int main(int argc, char* argv[]) {
                                 session->generate(sp.prompt, sp.params, callback);
                             }
                         } catch (const std::exception& e) {
+                            if (is_gpu_oom(e)) {
+                                std::cerr << "[ov_serve] streaming GPU OOM, recreating session...\n";
+                                try {
+                                    pool.recreate_session(session, warmup_tok);
+                                } catch (...) {}
+                            }
                             // Send error as SSE event before closing
                             json err_chunk;
                             err_chunk["error"] = e.what();
@@ -714,11 +785,26 @@ int main(int argc, char* argv[]) {
                 auto* session = worker.get();
 
                 GenerateResult result;
-                if (!parsed.images.empty()) {
-                    result = session->generate_vl(parsed.prompt, parsed.images[0],
-                                                  parsed.params);
-                } else {
-                    result = session->generate(parsed.prompt, parsed.params);
+                auto do_generate = [&]() {
+                    if (!parsed.images.empty()) {
+                        return session->generate_vl(parsed.prompt, parsed.images[0],
+                                                    parsed.params);
+                    } else {
+                        return session->generate(parsed.prompt, parsed.params);
+                    }
+                };
+
+                try {
+                    result = do_generate();
+                } catch (const std::exception& e) {
+                    if (is_gpu_oom(e)) {
+                        std::cerr << "[ov_serve] " << request_id
+                                  << " GPU OOM detected, recreating session...\n";
+                        pool.recreate_session(session, cfg.warmup_tokens);
+                        result = do_generate();  // retry once
+                    } else {
+                        throw;
+                    }
                 }
 
                 // Parse tool calls from output
@@ -766,18 +852,25 @@ int main(int argc, char* argv[]) {
         GenerateParams params;
         params.max_new_tokens = body.value("max_tokens", cfg.max_tokens_default);
         params.sampling.temperature = body.value("temperature", 0.7f);
+        if (cfg.min_temperature > 0.0f && params.sampling.temperature < cfg.min_temperature) {
+            params.sampling.temperature = cfg.min_temperature;
+        }
         params.sampling.top_p = body.value("top_p", 0.95f);
         if (body.contains("top_k")) {
             params.sampling.top_k = body["top_k"].get<size_t>();
         }
         if (body.contains("repetition_penalty")) {
             params.sampling.repetition_penalty = body["repetition_penalty"].get<float>();
+        } else {
+            params.sampling.repetition_penalty = cfg.repetition_penalty;
         }
         if (body.contains("frequency_penalty")) {
             params.sampling.frequency_penalty = body["frequency_penalty"].get<float>();
         }
         if (body.contains("presence_penalty")) {
             params.sampling.presence_penalty = body["presence_penalty"].get<float>();
+        } else {
+            params.sampling.presence_penalty = cfg.presence_penalty;
         }
         params.enable_thinking = false;  // No thinking in raw completions
 
@@ -819,16 +912,378 @@ int main(int argc, char* argv[]) {
         // RAII Guard handles session release automatically
     });
 
+    // ═══════════════════════════════════════════════════════════════════
+    //  Ollama-compatible API endpoints
+    // ═══════════════════════════════════════════════════════════════════
+
+    // Helper: ISO 8601 timestamp
+    auto iso_timestamp = []() -> std::string {
+        auto now = std::chrono::system_clock::now();
+        auto t = std::chrono::system_clock::to_time_t(now);
+        std::tm tm{};
+#ifdef _WIN32
+        gmtime_s(&tm, &t);
+#else
+        gmtime_r(&t, &tm);
+#endif
+        char buf[32];
+        std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tm);
+        return std::string(buf);
+    };
+
+    // Helper: parse Ollama "options" object into GenerateParams
+    auto parse_ollama_options = [&cfg](const json& body, GenerateParams& params) {
+        json opts = body.value("options", json::object());
+
+        float temperature = opts.value("temperature", 0.7f);
+        if (cfg.min_temperature > 0.0f && temperature < cfg.min_temperature) {
+            temperature = cfg.min_temperature;
+        }
+        params.sampling.temperature = temperature;
+        params.sampling.top_p = opts.value("top_p", 0.95f);
+        if (opts.contains("top_k")) {
+            params.sampling.top_k = opts["top_k"].get<size_t>();
+        }
+        if (opts.contains("seed")) {
+            params.sampling.rng_seed = opts["seed"].get<size_t>();
+        }
+        if (opts.contains("repeat_penalty")) {
+            params.sampling.repetition_penalty = opts["repeat_penalty"].get<float>();
+        } else {
+            params.sampling.repetition_penalty = cfg.repetition_penalty;
+        }
+        if (opts.contains("frequency_penalty")) {
+            params.sampling.frequency_penalty = opts["frequency_penalty"].get<float>();
+        }
+        if (opts.contains("presence_penalty")) {
+            params.sampling.presence_penalty = opts["presence_penalty"].get<float>();
+        } else {
+            params.sampling.presence_penalty = cfg.presence_penalty;
+        }
+
+        params.max_new_tokens = opts.value("num_predict", cfg.max_tokens_default);
+        if (body.contains("num_predict")) {
+            params.max_new_tokens = body["num_predict"].get<int>();
+        }
+
+        if (body.contains("keep_alive")) {
+            // Ollama keep_alive: ignored (we always keep model loaded)
+        }
+    };
+
+    // GET /api/tags — List models (Ollama format)
+    svr.Get("/api/tags", [&model_name, &iso_timestamp](const httplib::Request&,
+                                                        httplib::Response& res) {
+        json model;
+        model["name"] = model_name + ":latest";
+        model["model"] = model_name + ":latest";
+        model["modified_at"] = iso_timestamp();
+        model["size"] = 0;
+        model["digest"] = "openvino";
+        json details;
+        details["parent_model"] = "";
+        details["format"] = "openvino";
+        details["family"] = "qwen3.5";
+        details["families"] = json::array({"qwen3.5"});
+        details["parameter_size"] = "35B";
+        details["quantization_level"] = "INT4";
+        model["details"] = details;
+
+        json resp;
+        resp["models"] = json::array({model});
+        res.set_content(resp.dump(), "application/json");
+    });
+
+    // POST /api/show — Show model info (Ollama format)
+    svr.Post("/api/show", [&model_name, &iso_timestamp](const httplib::Request&,
+                                                         httplib::Response& res) {
+        json resp;
+        resp["modelfile"] = "# OpenVINO GenAI model";
+        resp["parameters"] = "temperature 0.7\ntop_p 0.95\ntop_k 20";
+        resp["template"] = "ChatML";
+        json details;
+        details["parent_model"] = "";
+        details["format"] = "openvino";
+        details["family"] = "qwen3.5";
+        details["families"] = json::array({"qwen3.5"});
+        details["parameter_size"] = "35B";
+        details["quantization_level"] = "INT4";
+        resp["details"] = details;
+        resp["model_info"] = json::object();
+        resp["modified_at"] = iso_timestamp();
+        res.set_content(resp.dump(), "application/json");
+    });
+
+    // POST /api/chat — Ollama chat (NDJSON streaming)
+    svr.Post("/api/chat",
+             [&pool, &cfg, &model_name, &iso_timestamp, &parse_ollama_options](
+                 const httplib::Request& req, httplib::Response& res) {
+        json body;
+        try {
+            body = json::parse(req.body);
+        } catch (...) {
+            res.status = 400;
+            json err;
+            err["error"] = "Invalid JSON";
+            res.set_content(err.dump(), "application/json");
+            return;
+        }
+
+        bool do_stream = body.value("stream", true);  // Ollama defaults to stream=true
+
+        // Build ChatML prompt from Ollama messages
+        auto messages = body.value("messages", json::array());
+        std::string chat_text;
+
+        for (const auto& msg : messages) {
+            std::string role = msg.value("role", "user");
+            std::string content = msg.value("content", "");
+            chat_text += "<|im_start|>" + role + "\n" + content + "<|im_end|>\n";
+        }
+
+        chat_text += "<|im_start|>assistant\n";
+        if (cfg.enable_thinking) {
+            chat_text += "<think>\n";
+        } else {
+            chat_text += "<think>\n</think>\n\n";
+        }
+
+        GenerateParams params;
+        params.raw_prompt = true;
+        params.enable_thinking = cfg.enable_thinking;
+        parse_ollama_options(body, params);
+
+        std::string mn = model_name;
+
+        std::cerr << "[ov_serve] ollama-chat"
+                  << " temp=" << params.sampling.temperature
+                  << " top_k=" << params.sampling.top_k
+                  << " rep=" << params.sampling.repetition_penalty
+                  << " pres=" << params.sampling.presence_penalty
+                  << " max_tokens=" << params.max_new_tokens
+                  << " stream=" << do_stream << "\n";
+
+        if (do_stream) {
+            // NDJSON streaming (Ollama format: one JSON per line)
+            auto prompt = std::move(chat_text);
+            res.set_chunked_content_provider(
+                "application/x-ndjson",
+                [&pool, params, prompt, mn, &cfg, &iso_timestamp](
+                    size_t, httplib::DataSink& sink) {
+                    WorkerPool::Guard worker(pool);
+                    auto* session = worker.get();
+
+                    auto callback = [&](const StreamChunk& sc) -> bool {
+                        if (sc.event == StreamEvent::TOKEN && !sc.token_text.empty()) {
+                            if (!sc.is_thinking) {
+                                json chunk;
+                                chunk["model"] = mn;
+                                chunk["created_at"] = iso_timestamp();
+                                json msg;
+                                msg["role"] = "assistant";
+                                msg["content"] = sc.token_text;
+                                chunk["message"] = msg;
+                                chunk["done"] = false;
+                                std::string line = chunk.dump() + "\n";
+                                sink.write(line.c_str(), line.size());
+                            }
+                        } else if (sc.event == StreamEvent::FINISH) {
+                            json done_chunk;
+                            done_chunk["model"] = mn;
+                            done_chunk["created_at"] = iso_timestamp();
+                            json msg;
+                            msg["role"] = "assistant";
+                            msg["content"] = "";
+                            done_chunk["message"] = msg;
+                            done_chunk["done"] = true;
+                            done_chunk["done_reason"] =
+                                (sc.stop_reason == StopReason::MAX_TOKENS)
+                                    ? "length" : "stop";
+                            done_chunk["eval_count"] =
+                                static_cast<int>(sc.generated_tokens);
+                            done_chunk["prompt_eval_count"] =
+                                static_cast<int>(sc.prompt_tokens);
+                            std::string line = done_chunk.dump() + "\n";
+                            sink.write(line.c_str(), line.size());
+                        }
+                        return true;
+                    };
+
+                    try {
+                        session->generate(prompt, params, callback);
+                    } catch (const std::exception& e) {
+                        json err;
+                        err["error"] = e.what();
+                        std::string line = err.dump() + "\n";
+                        sink.write(line.c_str(), line.size());
+                    }
+                    sink.done();
+                    return true;
+                });
+        } else {
+            // Non-streaming: return full response
+            WorkerPool::Guard worker(pool);
+            auto* session = worker.get();
+
+            try {
+                auto result = session->generate(chat_text, params);
+
+                json resp;
+                resp["model"] = mn;
+                resp["created_at"] = iso_timestamp();
+                json msg;
+                msg["role"] = "assistant";
+                msg["content"] = result.text;
+                resp["message"] = msg;
+                resp["done"] = true;
+                resp["done_reason"] = (result.stop_reason == StopReason::MAX_TOKENS)
+                                          ? "length" : "stop";
+                resp["eval_count"] = static_cast<int>(result.generated_tokens);
+                resp["prompt_eval_count"] = static_cast<int>(result.prompt_tokens);
+                res.set_content(resp.dump(), "application/json");
+            } catch (const std::exception& e) {
+                res.status = 500;
+                json err;
+                err["error"] = std::string("Generation error: ") + e.what();
+                res.set_content(err.dump(), "application/json");
+            }
+        }
+    });
+
+    // POST /api/generate — Ollama raw generate (NDJSON streaming)
+    svr.Post("/api/generate",
+             [&pool, &cfg, &model_name, &iso_timestamp, &parse_ollama_options](
+                 const httplib::Request& req, httplib::Response& res) {
+        json body;
+        try {
+            body = json::parse(req.body);
+        } catch (...) {
+            res.status = 400;
+            json err;
+            err["error"] = "Invalid JSON";
+            res.set_content(err.dump(), "application/json");
+            return;
+        }
+
+        bool do_stream = body.value("stream", true);
+        std::string prompt = body.value("prompt", "");
+        bool raw = body.value("raw", false);
+
+        // If not raw mode, wrap in ChatML
+        if (!raw) {
+            std::string system = body.value("system", "");
+            std::string wrapped;
+            if (!system.empty()) {
+                wrapped = "<|im_start|>system\n" + system + "<|im_end|>\n";
+            }
+            wrapped += "<|im_start|>user\n" + prompt + "<|im_end|>\n";
+            wrapped += "<|im_start|>assistant\n";
+            if (cfg.enable_thinking) {
+                wrapped += "<think>\n";
+            } else {
+                wrapped += "<think>\n</think>\n\n";
+            }
+            prompt = wrapped;
+        }
+
+        GenerateParams params;
+        params.raw_prompt = true;
+        params.enable_thinking = cfg.enable_thinking;
+        parse_ollama_options(body, params);
+
+        std::string mn = model_name;
+
+        if (do_stream) {
+            res.set_chunked_content_provider(
+                "application/x-ndjson",
+                [&pool, params, prompt, mn, &iso_timestamp](
+                    size_t, httplib::DataSink& sink) {
+                    WorkerPool::Guard worker(pool);
+                    auto* session = worker.get();
+
+                    auto callback = [&](const StreamChunk& sc) -> bool {
+                        if (sc.event == StreamEvent::TOKEN && !sc.token_text.empty()) {
+                            if (!sc.is_thinking) {
+                                json chunk;
+                                chunk["model"] = mn;
+                                chunk["created_at"] = iso_timestamp();
+                                chunk["response"] = sc.token_text;
+                                chunk["done"] = false;
+                                std::string line = chunk.dump() + "\n";
+                                sink.write(line.c_str(), line.size());
+                            }
+                        } else if (sc.event == StreamEvent::FINISH) {
+                            json done_chunk;
+                            done_chunk["model"] = mn;
+                            done_chunk["created_at"] = iso_timestamp();
+                            done_chunk["response"] = "";
+                            done_chunk["done"] = true;
+                            done_chunk["done_reason"] =
+                                (sc.stop_reason == StopReason::MAX_TOKENS)
+                                    ? "length" : "stop";
+                            done_chunk["eval_count"] =
+                                static_cast<int>(sc.generated_tokens);
+                            done_chunk["prompt_eval_count"] =
+                                static_cast<int>(sc.prompt_tokens);
+                            std::string line = done_chunk.dump() + "\n";
+                            sink.write(line.c_str(), line.size());
+                        }
+                        return true;
+                    };
+
+                    try {
+                        session->generate(prompt, params, callback);
+                    } catch (const std::exception& e) {
+                        json err;
+                        err["error"] = e.what();
+                        std::string line = err.dump() + "\n";
+                        sink.write(line.c_str(), line.size());
+                    }
+                    sink.done();
+                    return true;
+                });
+        } else {
+            WorkerPool::Guard worker(pool);
+            auto* session = worker.get();
+
+            try {
+                auto result = session->generate(prompt, params);
+
+                json resp;
+                resp["model"] = mn;
+                resp["created_at"] = iso_timestamp();
+                resp["response"] = result.text;
+                resp["done"] = true;
+                resp["done_reason"] = (result.stop_reason == StopReason::MAX_TOKENS)
+                                          ? "length" : "stop";
+                resp["eval_count"] = static_cast<int>(result.generated_tokens);
+                resp["prompt_eval_count"] = static_cast<int>(result.prompt_tokens);
+                res.set_content(resp.dump(), "application/json");
+            } catch (const std::exception& e) {
+                res.status = 500;
+                json err;
+                err["error"] = std::string("Generation error: ") + e.what();
+                res.set_content(err.dump(), "application/json");
+            }
+        }
+    });
+
     // ── Start server ──
     std::cerr << "[ov_serve] Starting server on " << cfg.host << ":" << cfg.port << "\n";
     std::cerr << "[ov_serve] Workers: " << cfg.workers
               << ", Device: " << cfg.device
               << ", Thinking: " << (cfg.enable_thinking ? "on" : "off")
-              << ", Vision: " << (cfg.enable_vision ? "on" : "off") << "\n";
+              << ", Vision: " << (cfg.enable_vision ? "on" : "off")
+              << ", Rep.Penalty: " << cfg.repetition_penalty
+              << ", Pres.Penalty: " << cfg.presence_penalty << "\n";
     std::cerr << "[ov_serve] Endpoints:\n"
-              << "  POST /v1/chat/completions\n"
-              << "  POST /v1/completions\n"
-              << "  GET  /v1/models\n"
+              << "  POST /v1/chat/completions  (OpenAI)\n"
+              << "  POST /v1/completions       (OpenAI)\n"
+              << "  GET  /v1/models            (OpenAI)\n"
+              << "  POST /api/chat             (Ollama)\n"
+              << "  POST /api/generate         (Ollama)\n"
+              << "  GET  /api/tags             (Ollama)\n"
+              << "  POST /api/show             (Ollama)\n"
               << "  GET  /health\n";
 
     if (!svr.listen(cfg.host, cfg.port)) {

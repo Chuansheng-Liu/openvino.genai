@@ -121,12 +121,12 @@ struct Session::Impl {
 
     static constexpr size_t kBatch = 1;
 
-    explicit Impl(ModelLoader& model) : model_(model) {
-        // Create text InferRequest
+    /// Create/recreate InferRequest and all GPU-context-backed tensors.
+    void init_request_and_tensors() {
         text_request_ = model_.compiled_text().create_infer_request();
         gpu_ctx_ = try_get_gpu_context(model_.compiled_text());
 
-        // Pre-allocate decode tensors
+        // Pre-allocate decode tensors (USM-host for zero-copy on iGPU)
         step_ids_ = make_usm_host_tensor(gpu_ctx_, ov::element::i64, {kBatch, 1});
         step_mask_ = make_usm_host_tensor(gpu_ctx_, ov::element::i64, {kBatch, 1});
         step_mask_.data<int64_t>()[0] = 1;
@@ -145,6 +145,13 @@ struct Session::Impl {
 
             vision_request_ = model_.compiled_vision()->create_infer_request();
         }
+
+        past_len_ = 0;
+        generated_ids_.clear();
+    }
+
+    explicit Impl(ModelLoader& model) : model_(model) {
+        init_request_and_tensors();
 
         // Initialize token processor if tokenizer available
         if (model_.tokenizer()) {
@@ -673,6 +680,134 @@ void Session::reset() {
     impl_->text_request_.reset_state();
     impl_->past_len_ = 0;
     impl_->generated_ids_.clear();
+}
+
+void Session::warmup(int max_seq_len) {
+    if (max_seq_len <= 0) return;
+
+    const auto& cfg = impl_->model_.config();
+    const size_t seq = static_cast<size_t>(max_seq_len);
+    constexpr size_t B = 1;
+    constexpr int kDecodeSteps = 16;
+
+    auto run_text_warmup = [&](const ov::Tensor* visual_embeds,
+                               const ov::Tensor* visual_pos_mask,
+                               const ov::Tensor* grid_thw) {
+        // ── Build dummy prefill inputs ──
+        ov::Tensor input_ids(ov::element::i64, {B, seq});
+        std::fill_n(input_ids.data<int64_t>(), seq, int64_t{1});
+
+        ov::Tensor attention_mask(ov::element::i64, {B, seq});
+        std::fill_n(attention_mask.data<int64_t>(), seq, int64_t{1});
+
+        models::Qwen3_5InputPlanner planner(cfg);
+        auto plan = planner.build_plan(input_ids, &attention_mask, grid_thw);
+
+        auto usm_ids = clone_as_usm_host(impl_->gpu_ctx_, input_ids);
+        auto usm_mask = clone_as_usm_host(impl_->gpu_ctx_, attention_mask);
+        auto usm_pos = clone_as_usm_host(impl_->gpu_ctx_, plan.position_ids);
+
+        // ── Prefill ──
+        impl_->text_request_.reset_state();
+        impl_->text_request_.set_tensor(models::Qwen3_5TextIO::kInputIds, usm_ids);
+        impl_->text_request_.set_tensor(models::Qwen3_5TextIO::kAttentionMask, usm_mask);
+        impl_->text_request_.set_tensor(models::Qwen3_5TextIO::kPositionIds, usm_pos);
+        impl_->text_request_.set_tensor(models::Qwen3_5TextIO::kBeamIdx, impl_->beam_idx_);
+
+        if (visual_embeds && visual_pos_mask) {
+            // VL path: use real visual embeddings
+            auto usm_vis = clone_as_usm_host(impl_->gpu_ctx_, *visual_embeds);
+            auto usm_vis_mask = clone_as_usm_host(impl_->gpu_ctx_, *visual_pos_mask);
+            impl_->text_request_.set_tensor(models::Qwen3_5TextIO::kVisualEmbeds, usm_vis);
+            impl_->text_request_.set_tensor(models::Qwen3_5TextIO::kVisualPosMask, usm_vis_mask);
+        } else if (impl_->model_.compiled_vision()) {
+            // Text-only request on VL model: zero visual tensors
+            const auto hidden = static_cast<size_t>(cfg.text.hidden_size);
+            auto zero_vis = make_usm_host_tensor(impl_->gpu_ctx_, ov::element::f32, {B, seq, hidden});
+            std::memset(zero_vis.data(), 0, zero_vis.get_byte_size());
+            auto zero_mask = make_usm_host_tensor(impl_->gpu_ctx_, ov::element::boolean, {B, seq});
+            std::memset(zero_mask.data(), 0, zero_mask.get_byte_size());
+            impl_->text_request_.set_tensor(models::Qwen3_5TextIO::kVisualEmbeds, zero_vis);
+            impl_->text_request_.set_tensor(models::Qwen3_5TextIO::kVisualPosMask, zero_mask);
+        }
+
+        impl_->text_request_.infer();
+        int64_t past_len = static_cast<int64_t>(seq);
+
+        // ── Decode steps (warm up KV cache growth path) ──
+        for (int step = 0; step < kDecodeSteps; ++step) {
+            impl_->step_ids_.data<int64_t>()[0] = 1;
+
+            auto* pos_data = impl_->decode_pos_.data<int64_t>();
+            pos_data[0] = past_len;
+            pos_data[B] = past_len;
+            pos_data[2 * B] = past_len;
+
+            impl_->text_request_.set_tensor(models::Qwen3_5TextIO::kInputIds, impl_->step_ids_);
+            impl_->text_request_.set_tensor(models::Qwen3_5TextIO::kAttentionMask, impl_->step_mask_);
+            impl_->text_request_.set_tensor(models::Qwen3_5TextIO::kPositionIds, impl_->decode_pos_);
+            impl_->text_request_.set_tensor(models::Qwen3_5TextIO::kBeamIdx, impl_->beam_idx_);
+
+            if (impl_->model_.compiled_vision()) {
+                impl_->text_request_.set_tensor(models::Qwen3_5TextIO::kVisualEmbeds, impl_->decode_visual_);
+                impl_->text_request_.set_tensor(models::Qwen3_5TextIO::kVisualPosMask, impl_->decode_visual_mask_);
+            }
+
+            impl_->text_request_.infer();
+            past_len += 1;
+        }
+
+        impl_->text_request_.reset_state();
+    };
+
+    // ── Phase 1: Text-only warmup (always) ──
+    run_text_warmup(nullptr, nullptr, nullptr);
+
+    // ── Phase 2: VL warmup (if vision model loaded) ──
+    if (impl_->model_.compiled_vision()) {
+        // Create a small dummy image (224x224 RGB) and run through full VL pipeline
+        constexpr size_t kWarmupImageH = 224;
+        constexpr size_t kWarmupImageW = 224;
+        constexpr size_t kChannels = 3;
+        ov::Tensor dummy_image(ov::element::u8, {kWarmupImageH, kWarmupImageW, kChannels});
+        std::memset(dummy_image.data(), 128, dummy_image.get_byte_size());
+
+        // Vision encode
+        auto [visual_embeds, grid_thw] = impl_->encode_vision(dummy_image);
+
+        // Build VL text inputs with image tokens
+        const int64_t num_vis_tokens = models::Qwen3_5VisionPreprocessor::count_visual_tokens(
+            grid_thw, cfg.vision.spatial_merge_size);
+        // Ensure total seq is at least max_seq_len by padding with text tokens
+        const size_t vl_seq = std::max(seq, static_cast<size_t>(num_vis_tokens + 32));
+
+        ov::Tensor vl_input_ids(ov::element::i64, {B, vl_seq});
+        auto* id_data = vl_input_ids.data<int64_t>();
+        // Fill with regular token, mark image positions with image_token_id
+        std::fill_n(id_data, vl_seq, int64_t{1});
+        for (int64_t i = 0; i < num_vis_tokens && i < static_cast<int64_t>(vl_seq); ++i) {
+            id_data[i] = cfg.image_token_id;
+        }
+
+        ov::Tensor vl_mask(ov::element::i64, {B, vl_seq});
+        std::fill_n(vl_mask.data<int64_t>(), vl_seq, int64_t{1});
+
+        models::Qwen3_5InputPlanner planner(cfg);
+        auto plan = planner.build_plan(vl_input_ids, &vl_mask, &grid_thw);
+
+        auto visual_padded = models::Qwen3_5InputPlanner::scatter_visual_embeds(
+            visual_embeds, plan.visual_pos_mask);
+
+        run_text_warmup(&visual_padded, &plan.visual_pos_mask, &grid_thw);
+    }
+
+    impl_->past_len_ = 0;
+    impl_->generated_ids_.clear();
+}
+
+void Session::recreate() {
+    impl_->text_request_ = {};  // release old request first
+    impl_->init_request_and_tensors();
 }
 
 bool Session::is_generating() const {

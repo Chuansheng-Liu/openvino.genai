@@ -56,6 +56,20 @@ public:
     /// Whether generate() is currently executing.
     bool is_generating() const;
 
+    // ─── Lifecycle ───
+
+    /// Pre-warm GPU memory pool by running dummy inference at peak sequence length.
+    /// This prevents CL_OUT_OF_RESOURCES on the first large request by forcing
+    /// the GPU plugin to pre-allocate all intermediate buffers.
+    /// @param max_seq_len  Target total sequence length (prefill + decode warmup).
+    ///                     Should be >= max expected (prompt_tokens + max_new_tokens).
+    void warmup(int max_seq_len);
+
+    /// Recreate the underlying InferRequest from the existing CompiledModel.
+    /// Use after GPU errors (CL_OUT_OF_RESOURCES) to recover from corrupted
+    /// GPU driver state. Also re-creates all GPU-context-backed tensors.
+    void recreate();
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
