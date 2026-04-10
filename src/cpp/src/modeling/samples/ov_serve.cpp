@@ -352,8 +352,12 @@ static ParsedRequest parse_chat_request(const json& body, ov::genai::Tokenizer& 
     }
     req.prompt = chat_text;
 
-    // Generation params
-    req.params.max_new_tokens = body.value("max_tokens", cfg.max_tokens_default);
+    // Generation params — accept both "max_tokens" (legacy) and "max_completion_tokens" (OpenAI v2)
+    if (body.contains("max_completion_tokens")) {
+        req.params.max_new_tokens = body["max_completion_tokens"].get<int>();
+    } else {
+        req.params.max_new_tokens = body.value("max_tokens", cfg.max_tokens_default);
+    }
     req.params.enable_thinking = cfg.enable_thinking;
     req.params.raw_prompt = true;  // prompt is already ChatML-formatted
 
@@ -852,7 +856,11 @@ int main(int argc, char* argv[]) {
         }
 
         GenerateParams params;
-        params.max_new_tokens = body.value("max_tokens", cfg.max_tokens_default);
+        if (body.contains("max_completion_tokens")) {
+            params.max_new_tokens = body["max_completion_tokens"].get<int>();
+        } else {
+            params.max_new_tokens = body.value("max_tokens", cfg.max_tokens_default);
+        }
         params.sampling.temperature = body.value("temperature", 0.7f);
         if (cfg.min_temperature > 0.0f && params.sampling.temperature < cfg.min_temperature) {
             params.sampling.temperature = cfg.min_temperature;
