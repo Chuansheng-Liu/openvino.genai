@@ -14,6 +14,7 @@
 
 #include <openvino/op/constant.hpp>
 #include <openvino/openvino.hpp>
+#include <openvino/runtime/intel_gpu/properties.hpp>
 
 #include "openvino/genai/generation_config.hpp"
 #include "openvino/genai/tokenizer.hpp"
@@ -241,6 +242,11 @@ struct ModelLoader::Impl {
 
         // ─── Weight source (lazy) ───
         ov::Core core;
+        // Enable large (>4 GB) single-buffer allocations on GPU.
+        // Required for models whose combined KV cache exceeds the per-object
+        // OpenCL limit (e.g. Qwen3.5 at 4K+ tokens).
+        if (params.device.find("GPU") != std::string::npos)
+            core.set_property(params.device, ov::intel_gpu::hint::enable_large_allocations(true));
         std::unique_ptr<weights::WeightSource> source;
         auto ensure_source = [&]() -> weights::WeightSource& {
             if (!source) {
