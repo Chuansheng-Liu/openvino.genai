@@ -278,19 +278,24 @@ static ParsedRequest parse_chat_request(const json& body, ov::genai::Tokenizer& 
                 content = msg["content"].get<std::string>();
             } else if (msg["content"].is_array()) {
                 // OpenAI multimodal content array: [{type: "text"}, {type: "image_url"}]
+                // Qwen3.5 VL requires vision markers BEFORE text content,
+                // so collect text and images separately then combine.
+                std::string text_parts;
+                std::string vision_markers;
                 for (const auto& part : msg["content"]) {
                     std::string part_type = part.value("type", "");
                     if (part_type == "text") {
-                        if (!content.empty()) content += "\n";
-                        content += part.at("text").get<std::string>();
+                        if (!text_parts.empty()) text_parts += "\n";
+                        text_parts += part.at("text").get<std::string>();
                     } else if (part_type == "image_url") {
                         auto url = part.at("image_url").at("url").get<std::string>();
                         auto image = decode_image_from_data_uri(url);
                         req.images.push_back(std::move(image));
-                        // Insert vision marker into prompt at image position
-                        content += "<|vision_start|><|vision_end|>";
+                        vision_markers += "<|vision_start|><|vision_end|>";
                     }
                 }
+                // Vision markers always come before text (model requirement)
+                content = vision_markers + text_parts;
             } else if (msg["content"].is_null()) {
                 content = "";
             }
@@ -351,6 +356,21 @@ static ParsedRequest parse_chat_request(const json& body, ov::genai::Tokenizer& 
         chat_text += "<think>\n</think>\n\n";
     }
     req.prompt = chat_text;
+
+    // Debug: log the constructed prompt (truncated)
+    {
+        std::string dbg = chat_text;
+        // Replace base64 image data with placeholder for readability
+        auto pos = dbg.find("data:image");
+        if (pos != std::string::npos) {
+            auto end = dbg.find("\"", pos);
+            if (end != std::string::npos && end - pos > 100) {
+                dbg.replace(pos + 30, end - pos - 30, "...<base64_truncated>...");
+            }
+        }
+        if (dbg.size() > 1000) dbg = dbg.substr(0, 1000) + "...(truncated)";
+        std::cerr << "[ov_serve] PROMPT: " << dbg << "\n";
+    }
 
     // Generation params — accept both "max_tokens" (legacy) and "max_completion_tokens" (OpenAI v2)
     if (body.contains("max_completion_tokens")) {
