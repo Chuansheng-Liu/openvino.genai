@@ -508,7 +508,7 @@ struct Session::Impl {
             // 2) Low token diversity in sliding window (e.g. nonsense word salad)
             // 3) Too many tokens without sentence-ending punctuation (word list degeneration)
             {
-                constexpr size_t kMaxRepeatTokens = 10;
+                constexpr size_t kMaxRepeatTokens = 5;
                 constexpr size_t kDiversityWindow = 40;
                 constexpr size_t kMinUniqueTokens = 10;
 
@@ -566,7 +566,7 @@ struct Session::Impl {
                 } else if (!delta.empty()) {
                     tokens_since_punct++;
                 }
-                constexpr size_t kMaxTokensWithoutPunct = 80;
+                constexpr size_t kMaxTokensWithoutPunct = 50;
                 if (tokens_since_punct > kMaxTokensWithoutPunct && generated.size() > 100) {
                     stop_requested_.store(true);
                 }
