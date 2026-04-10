@@ -146,6 +146,7 @@ struct ServerConfig {
     float presence_penalty = 0.0f;    // OpenAI default; rep_penalty handles repetition
     float min_temperature = 0.0f;     // 0 = no override; set via --min-temp
     int warmup_tokens = 4096;         // 0 = disable warmup
+    bool enable_logging = true;       // Log prompts and request params to stderr
 };
 
 /// Check if an exception is a GPU out-of-memory error (CL_OUT_OF_RESOURCES).
@@ -357,8 +358,8 @@ static ParsedRequest parse_chat_request(const json& body, ov::genai::Tokenizer& 
     }
     req.prompt = chat_text;
 
-    // Debug: log the constructed prompt (truncated)
-    {
+    // Log the constructed prompt (truncated) if logging enabled
+    if (cfg.enable_logging) {
         std::string dbg = chat_text;
         // Replace base64 image data with placeholder for readability
         auto pos = dbg.find("data:image");
@@ -506,7 +507,8 @@ static void print_usage() {
                  "  --rep-penalty     Repetition penalty (default: 1.1)\n"
                  "  --pres-penalty    Presence penalty (default: 0.0)\n"
                  "  --min-temp        Minimum temperature floor (default: 0, no override)\n"
-                 "  --warmup-tokens   Max sequence length for GPU warmup (default: 4096, 0=disable)\n";
+                 "  --warmup-tokens   Max sequence length for GPU warmup (default: 4096, 0=disable)\n"
+                 "  --no-log          Disable request/prompt logging to stderr\n";
 }
 
 int main(int argc, char* argv[]) {
@@ -527,6 +529,7 @@ int main(int argc, char* argv[]) {
         else if (arg == "--warmup-tokens" && i + 1 < argc) cfg.warmup_tokens = std::stoi(argv[++i]);
         else if (arg == "--no-thinking") cfg.enable_thinking = false;
         else if (arg == "--vl") cfg.enable_vision = true;
+        else if (arg == "--no-log") cfg.enable_logging = false;
         else if (arg == "--help" || arg == "-h") { print_usage(); return 0; }
     }
 
@@ -658,15 +661,17 @@ int main(int argc, char* argv[]) {
 
         auto request_id = make_request_id();
 
-        std::cerr << "[ov_serve] " << request_id
-                  << " temp=" << parsed.params.sampling.temperature
-                  << " top_p=" << parsed.params.sampling.top_p
-                  << " top_k=" << parsed.params.sampling.top_k
-                  << " rep=" << parsed.params.sampling.repetition_penalty
-                  << " pres=" << parsed.params.sampling.presence_penalty
-                  << " freq=" << parsed.params.sampling.frequency_penalty
-                  << " max_tokens=" << parsed.params.max_new_tokens
-                  << " stream=" << parsed.stream << "\n";
+        if (cfg.enable_logging) {
+            std::cerr << "[ov_serve] " << request_id
+                      << " temp=" << parsed.params.sampling.temperature
+                      << " top_p=" << parsed.params.sampling.top_p
+                      << " top_k=" << parsed.params.sampling.top_k
+                      << " rep=" << parsed.params.sampling.repetition_penalty
+                      << " pres=" << parsed.params.sampling.presence_penalty
+                      << " freq=" << parsed.params.sampling.frequency_penalty
+                      << " max_tokens=" << parsed.params.max_new_tokens
+                      << " stream=" << parsed.stream << "\n";
+        }
 
         try {
             if (parsed.stream) {
@@ -1085,13 +1090,15 @@ int main(int argc, char* argv[]) {
 
         std::string mn = model_name;
 
-        std::cerr << "[ov_serve] ollama-chat"
-                  << " temp=" << params.sampling.temperature
-                  << " top_k=" << params.sampling.top_k
-                  << " rep=" << params.sampling.repetition_penalty
-                  << " pres=" << params.sampling.presence_penalty
-                  << " max_tokens=" << params.max_new_tokens
-                  << " stream=" << do_stream << "\n";
+        if (cfg.enable_logging) {
+            std::cerr << "[ov_serve] ollama-chat"
+                      << " temp=" << params.sampling.temperature
+                      << " top_k=" << params.sampling.top_k
+                      << " rep=" << params.sampling.repetition_penalty
+                      << " pres=" << params.sampling.presence_penalty
+                      << " max_tokens=" << params.max_new_tokens
+                      << " stream=" << do_stream << "\n";
+        }
 
         if (do_stream) {
             // NDJSON streaming (Ollama format: one JSON per line)
@@ -1305,7 +1312,8 @@ int main(int argc, char* argv[]) {
               << ", Thinking: " << (cfg.enable_thinking ? "on" : "off")
               << ", Vision: " << (cfg.enable_vision ? "on" : "off")
               << ", Rep.Penalty: " << cfg.repetition_penalty
-              << ", Pres.Penalty: " << cfg.presence_penalty << "\n";
+              << ", Pres.Penalty: " << cfg.presence_penalty
+              << ", Logging: " << (cfg.enable_logging ? "on" : "off") << "\n";
     std::cerr << "[ov_serve] Endpoints:\n"
               << "  POST /v1/chat/completions  (OpenAI)\n"
               << "  POST /v1/completions       (OpenAI)\n"
