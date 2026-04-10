@@ -138,6 +138,15 @@ std::set<int64_t> resolve_stop_token_ids(const std::filesystem::path& model_dir,
         const int64_t eos = tokenizer->get_eos_token_id();
         if (eos >= 0) ids.insert(eos);
     }
+    // Fallback: hardcode Qwen3.5 stop tokens if still empty
+    if (ids.empty()) {
+        ids.insert(248044);  // <|endoftext|>
+        ids.insert(248046);  // <|im_end|>
+        std::cerr << "[ModelLoader] WARNING: no stop tokens from config or tokenizer, using Qwen3.5 defaults" << std::endl;
+    }
+    std::cerr << "[ModelLoader] stop_token_ids:";
+    for (auto id : ids) std::cerr << " " << id;
+    std::cerr << std::endl;
     return ids;
 }
 
