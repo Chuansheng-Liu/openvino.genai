@@ -480,6 +480,7 @@ static void print_usage() {
                  "  --vl              Enable vision-language (load vision encoder)\n"
                  "  --no-thinking     Disable thinking mode\n"
                  "  --rep-penalty     Repetition penalty (default: 1.1)\n"
+                 "  --pres-penalty    Presence penalty (default: 1.5)\n"
                  "  --min-temp        Minimum temperature floor (default: 0, no override)\n"
                  "  --warmup-tokens   Max sequence length for GPU warmup (default: 4096, 0=disable)\n";
 }
@@ -497,6 +498,7 @@ int main(int argc, char* argv[]) {
         else if (arg == "--device" && i + 1 < argc) cfg.device = argv[++i];
         else if (arg == "--max-tokens" && i + 1 < argc) cfg.max_tokens_default = std::stoi(argv[++i]);
         else if (arg == "--rep-penalty" && i + 1 < argc) cfg.repetition_penalty = std::stof(argv[++i]);
+        else if (arg == "--pres-penalty" && i + 1 < argc) cfg.presence_penalty = std::stof(argv[++i]);
         else if (arg == "--min-temp" && i + 1 < argc) cfg.min_temperature = std::stof(argv[++i]);
         else if (arg == "--warmup-tokens" && i + 1 < argc) cfg.warmup_tokens = std::stoi(argv[++i]);
         else if (arg == "--no-thinking") cfg.enable_thinking = false;
