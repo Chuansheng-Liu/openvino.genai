@@ -502,15 +502,31 @@ struct Session::Impl {
             decode_steps += 1;
             past_len_ += 1;
 
-            // Detect degenerate repetition: N consecutive identical tokens → stop
-            constexpr size_t kMaxRepeatTokens = 16;
-            if (generated.size() >= kMaxRepeatTokens) {
-                bool all_same = true;
-                for (size_t i = generated.size() - kMaxRepeatTokens; i < generated.size() - 1; ++i) {
-                    if (generated[i] != generated[i + 1]) { all_same = false; break; }
+            // Detect degenerate output and force stop:
+            // 1) N consecutive identical tokens (e.g. "!!!!!!!")
+            // 2) Low token diversity in sliding window (e.g. nonsense word salad)
+            {
+                constexpr size_t kMaxRepeatTokens = 10;
+                constexpr size_t kDiversityWindow = 40;
+                constexpr size_t kMinUniqueTokens = 10;  // <25% unique → degenerate
+
+                const size_t n = generated.size();
+
+                // Check consecutive identical tokens
+                if (n >= kMaxRepeatTokens) {
+                    bool all_same = true;
+                    for (size_t i = n - kMaxRepeatTokens; i < n - 1; ++i) {
+                        if (generated[i] != generated[i + 1]) { all_same = false; break; }
+                    }
+                    if (all_same) stop_requested_.store(true);
                 }
-                if (all_same) {
-                    stop_requested_.store(true);
+
+                // Check sliding window diversity
+                if (n >= kDiversityWindow) {
+                    std::set<int64_t> unique_in_window(
+                        generated.end() - kDiversityWindow, generated.end());
+                    if (unique_in_window.size() < kMinUniqueTokens)
+                        stop_requested_.store(true);
                 }
             }
 
