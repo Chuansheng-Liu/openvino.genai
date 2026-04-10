@@ -144,6 +144,7 @@ struct ServerConfig {
     int max_tokens_default = 2048;
     float repetition_penalty = 1.1f;  // Default to prevent degeneration
     float presence_penalty = 0.0f;    // OpenAI default; rep_penalty handles repetition
+    float frequency_penalty = 0.0f;   // 0 = off; >0 penalizes tokens by occurrence count
     float min_temperature = 0.0f;     // 0 = no override; set via --min-temp
     int warmup_tokens = 4096;         // 0 = disable warmup
     bool enable_logging = true;       // Log prompts and request params to stderr
@@ -382,7 +383,7 @@ static ParsedRequest parse_chat_request(const json& body, ov::genai::Tokenizer& 
     req.params.enable_thinking = cfg.enable_thinking;
     req.params.raw_prompt = true;  // prompt is already ChatML-formatted
 
-    float temperature = body.value("temperature", 0.7f);
+    float temperature = body.value("temperature", 0.0f);
     if (cfg.min_temperature > 0.0f && temperature < cfg.min_temperature) {
         temperature = cfg.min_temperature;
     }
@@ -401,6 +402,8 @@ static ParsedRequest parse_chat_request(const json& body, ov::genai::Tokenizer& 
     }
     if (body.contains("frequency_penalty")) {
         req.params.sampling.frequency_penalty = body["frequency_penalty"].get<float>();
+    } else {
+        req.params.sampling.frequency_penalty = cfg.frequency_penalty;
     }
     if (body.contains("presence_penalty")) {
         req.params.sampling.presence_penalty = body["presence_penalty"].get<float>();
@@ -506,6 +509,7 @@ static void print_usage() {
                  "  --no-thinking     Disable thinking mode\n"
                  "  --rep-penalty     Repetition penalty (default: 1.1)\n"
                  "  --pres-penalty    Presence penalty (default: 0.0)\n"
+                 "  --freq-penalty    Frequency penalty (default: 0.0)\n"
                  "  --min-temp        Minimum temperature floor (default: 0, no override)\n"
                  "  --warmup-tokens   Max sequence length for GPU warmup (default: 4096, 0=disable)\n"
                  "  --no-log          Disable request/prompt logging to stderr\n";
@@ -525,6 +529,7 @@ int main(int argc, char* argv[]) {
         else if (arg == "--max-tokens" && i + 1 < argc) cfg.max_tokens_default = std::stoi(argv[++i]);
         else if (arg == "--rep-penalty" && i + 1 < argc) cfg.repetition_penalty = std::stof(argv[++i]);
         else if (arg == "--pres-penalty" && i + 1 < argc) cfg.presence_penalty = std::stof(argv[++i]);
+        else if (arg == "--freq-penalty" && i + 1 < argc) cfg.frequency_penalty = std::stof(argv[++i]);
         else if (arg == "--min-temp" && i + 1 < argc) cfg.min_temperature = std::stof(argv[++i]);
         else if (arg == "--warmup-tokens" && i + 1 < argc) cfg.warmup_tokens = std::stoi(argv[++i]);
         else if (arg == "--no-thinking") cfg.enable_thinking = false;
@@ -886,7 +891,7 @@ int main(int argc, char* argv[]) {
         } else {
             params.max_new_tokens = body.value("max_tokens", cfg.max_tokens_default);
         }
-        params.sampling.temperature = body.value("temperature", 0.7f);
+        params.sampling.temperature = body.value("temperature", 0.0f);
         if (cfg.min_temperature > 0.0f && params.sampling.temperature < cfg.min_temperature) {
             params.sampling.temperature = cfg.min_temperature;
         }
@@ -901,6 +906,8 @@ int main(int argc, char* argv[]) {
         }
         if (body.contains("frequency_penalty")) {
             params.sampling.frequency_penalty = body["frequency_penalty"].get<float>();
+        } else {
+            params.sampling.frequency_penalty = cfg.frequency_penalty;
         }
         if (body.contains("presence_penalty")) {
             params.sampling.presence_penalty = body["presence_penalty"].get<float>();
@@ -970,7 +977,7 @@ int main(int argc, char* argv[]) {
     auto parse_ollama_options = [&cfg](const json& body, GenerateParams& params) {
         json opts = body.value("options", json::object());
 
-        float temperature = opts.value("temperature", 0.7f);
+        float temperature = opts.value("temperature", 0.0f);
         if (cfg.min_temperature > 0.0f && temperature < cfg.min_temperature) {
             temperature = cfg.min_temperature;
         }
@@ -989,6 +996,8 @@ int main(int argc, char* argv[]) {
         }
         if (opts.contains("frequency_penalty")) {
             params.sampling.frequency_penalty = opts["frequency_penalty"].get<float>();
+        } else {
+            params.sampling.frequency_penalty = cfg.frequency_penalty;
         }
         if (opts.contains("presence_penalty")) {
             params.sampling.presence_penalty = opts["presence_penalty"].get<float>();
@@ -1034,7 +1043,7 @@ int main(int argc, char* argv[]) {
                                                          httplib::Response& res) {
         json resp;
         resp["modelfile"] = "# OpenVINO GenAI model";
-        resp["parameters"] = "temperature 0.7\ntop_p 0.95\ntop_k 20";
+        resp["parameters"] = "temperature 0\ntop_p 0.95\ntop_k 20";
         resp["template"] = "ChatML";
         json details;
         details["parent_model"] = "";
@@ -1313,6 +1322,7 @@ int main(int argc, char* argv[]) {
               << ", Vision: " << (cfg.enable_vision ? "on" : "off")
               << ", Rep.Penalty: " << cfg.repetition_penalty
               << ", Pres.Penalty: " << cfg.presence_penalty
+              << ", Freq.Penalty: " << cfg.frequency_penalty
               << ", Logging: " << (cfg.enable_logging ? "on" : "off") << "\n";
     std::cerr << "[ov_serve] Endpoints:\n"
               << "  POST /v1/chat/completions  (OpenAI)\n"
