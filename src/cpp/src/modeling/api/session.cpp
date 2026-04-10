@@ -502,6 +502,18 @@ struct Session::Impl {
             decode_steps += 1;
             past_len_ += 1;
 
+            // Detect degenerate repetition: N consecutive identical tokens → stop
+            constexpr size_t kMaxRepeatTokens = 16;
+            if (generated.size() >= kMaxRepeatTokens) {
+                bool all_same = true;
+                for (size_t i = generated.size() - kMaxRepeatTokens; i < generated.size() - 1; ++i) {
+                    if (generated[i] != generated[i + 1]) { all_same = false; break; }
+                }
+                if (all_same) {
+                    stop_requested_.store(true);
+                }
+            }
+
             // Count thinking tokens
             if (thinking_tracker_.is_thinking()) {
                 thinking_tokens++;
