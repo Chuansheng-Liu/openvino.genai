@@ -453,6 +453,7 @@ struct Session::Impl {
 
         // ─── Decode loop ───
         size_t decode_steps = 0;
+        size_t tokens_since_punct = 0;
         const auto decode_start = std::chrono::steady_clock::now();
 
         for (int step = 1; step < params.max_new_tokens && !stop_requested_.load(); ++step) {
@@ -505,10 +506,11 @@ struct Session::Impl {
             // Detect degenerate output and force stop:
             // 1) N consecutive identical tokens (e.g. "!!!!!!!")
             // 2) Low token diversity in sliding window (e.g. nonsense word salad)
+            // 3) Too many tokens without sentence-ending punctuation (word list degeneration)
             {
                 constexpr size_t kMaxRepeatTokens = 10;
                 constexpr size_t kDiversityWindow = 40;
-                constexpr size_t kMinUniqueTokens = 10;  // <25% unique → degenerate
+                constexpr size_t kMinUniqueTokens = 10;
 
                 const size_t n = generated.size();
 
@@ -535,9 +537,40 @@ struct Session::Impl {
                 thinking_tokens++;
             }
 
-            // Stream token through pipeline
+            // Stream token through pipeline + check for punctuation absence
             if (token_processor_) {
                 std::string delta = token_processor_->process(next_id);
+
+                // Track tokens since last sentence-ending punctuation.
+                // Normal text has punctuation every ~20-50 tokens; word salad has none.
+                bool has_punct = false;
+                for (unsigned char c : delta) {
+                    // ASCII punctuation
+                    if (c == '.' || c == '!' || c == '?' || c == '\n') { has_punct = true; break; }
+                }
+                // Check for CJK punctuation (UTF-8 encoded)
+                if (!has_punct) {
+                    // 。= E3 80 82, ！= EF BC 81, ？= EF BC 9F, ，= EF BC 8C
+                    for (size_t i = 0; i + 2 < delta.size(); ++i) {
+                        auto b0 = static_cast<unsigned char>(delta[i]);
+                        auto b1 = static_cast<unsigned char>(delta[i+1]);
+                        auto b2 = static_cast<unsigned char>(delta[i+2]);
+                        if (b0 == 0xE3 && b1 == 0x80 && b2 == 0x82) { has_punct = true; break; } // 。
+                        if (b0 == 0xEF && b1 == 0xBC && b2 == 0x81) { has_punct = true; break; } // ！
+                        if (b0 == 0xEF && b1 == 0xBC && b2 == 0x9F) { has_punct = true; break; } // ？
+                        if (b0 == 0xEF && b1 == 0xBC && b2 == 0x8C) { has_punct = true; break; } // ，
+                    }
+                }
+                if (has_punct) {
+                    tokens_since_punct = 0;
+                } else if (!delta.empty()) {
+                    tokens_since_punct++;
+                }
+                constexpr size_t kMaxTokensWithoutPunct = 80;
+                if (tokens_since_punct > kMaxTokensWithoutPunct && generated.size() > 100) {
+                    stop_requested_.store(true);
+                }
+
                 if (!emit_text(delta, next_id)) {
                     stop_requested_.store(true);
                 }
