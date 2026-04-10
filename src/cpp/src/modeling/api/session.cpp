@@ -454,6 +454,7 @@ struct Session::Impl {
         // ─── Decode loop ───
         size_t decode_steps = 0;
         size_t tokens_since_punct = 0;
+        size_t consecutive_symbol_tokens = 0;  // emoji/symbol flood detection
         const auto decode_start = std::chrono::steady_clock::now();
 
         for (int step = 1; step < params.max_new_tokens && !stop_requested_.load(); ++step) {
@@ -507,6 +508,7 @@ struct Session::Impl {
             // 1) N consecutive identical tokens (e.g. "!!!!!!!")
             // 2) Low token diversity in sliding window (e.g. nonsense word salad)
             // 3) Too many tokens without sentence-ending punctuation (word list degeneration)
+            // 4) Symbol/emoji flood (e.g. "🚩🔴🟠⛈️❄️➤♣♥♦♂♀" or "ΩΔΣΠΛΞ")
             {
                 constexpr size_t kMaxRepeatTokens = 5;
                 constexpr size_t kDiversityWindow = 40;
@@ -569,6 +571,60 @@ struct Session::Impl {
                 constexpr size_t kMaxTokensWithoutPunct = 50;
                 if (tokens_since_punct > kMaxTokensWithoutPunct && generated.size() > 100) {
                     stop_requested_.store(true);
+                }
+
+                // 4) Symbol/emoji flood detection: if most chars in the token are
+                //    non-text (not CJK, not Latin letters/digits, not common punct),
+                //    increment counter. Normal text resets it.
+                {
+                    size_t text_chars = 0, total_chars = 0;
+                    for (size_t ci = 0; ci < delta.size(); ) {
+                        auto b0 = static_cast<unsigned char>(delta[ci]);
+                        size_t char_len = 1;
+                        if (b0 < 0x80) {
+                            char_len = 1;
+                            // ASCII letters, digits, common punct, space
+                            if ((b0 >= 'A' && b0 <= 'Z') || (b0 >= 'a' && b0 <= 'z') ||
+                                (b0 >= '0' && b0 <= '9') || b0 == ' ' || b0 == '\n' ||
+                                b0 == '.' || b0 == ',' || b0 == '!' || b0 == '?' ||
+                                b0 == ':' || b0 == ';' || b0 == '-' || b0 == '\'') {
+                                text_chars++;
+                            }
+                        } else if (b0 < 0xE0) {
+                            char_len = 2;
+                        } else if (b0 < 0xF0) {
+                            char_len = 3;
+                            // CJK Unified Ideographs (U+4E00-U+9FFF) = E4 B8 80 - E9 BF BF
+                            // CJK common punctuation (U+3000-U+303F) = E3 80 80 - E3 80 BF
+                            // CJK fullwidth forms (U+FF00-U+FF5E) = EF BC 80 - EF BD 9E
+                            if (ci + 2 < delta.size()) {
+                                auto b1 = static_cast<unsigned char>(delta[ci+1]);
+                                auto b2 = static_cast<unsigned char>(delta[ci+2]);
+                                uint32_t cp = ((b0 & 0x0F) << 12) | ((b1 & 0x3F) << 6) | (b2 & 0x3F);
+                                if ((cp >= 0x4E00 && cp <= 0x9FFF) ||  // CJK ideographs
+                                    (cp >= 0x3400 && cp <= 0x4DBF) ||  // CJK ext A
+                                    (cp >= 0x3000 && cp <= 0x303F) ||  // CJK symbols & punct
+                                    (cp >= 0xFF01 && cp <= 0xFF5E)) {  // fullwidth forms
+                                    text_chars++;
+                                }
+                            }
+                        } else {
+                            char_len = 4;  // emoji, supplementary — treated as non-text
+                        }
+                        total_chars++;
+                        ci += char_len;
+                    }
+                    // If more than half of characters are non-text symbols
+                    bool is_symbol_token = (total_chars > 0 && text_chars * 2 < total_chars);
+                    if (is_symbol_token) {
+                        consecutive_symbol_tokens++;
+                    } else {
+                        consecutive_symbol_tokens = 0;
+                    }
+                    constexpr size_t kMaxConsecutiveSymbolTokens = 10;
+                    if (consecutive_symbol_tokens >= kMaxConsecutiveSymbolTokens && generated.size() > 50) {
+                        stop_requested_.store(true);
+                    }
                 }
 
                 if (!emit_text(delta, next_id)) {
