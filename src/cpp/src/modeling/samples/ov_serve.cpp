@@ -143,7 +143,7 @@ struct ServerConfig {
     bool enable_vision = false;
     int max_tokens_default = 2048;
     float repetition_penalty = 1.1f;  // Default to prevent degeneration
-    float presence_penalty = 1.5f;    // Qwen3.5 official recommendation
+    float presence_penalty = 0.0f;    // OpenAI default; rep_penalty handles repetition
     float min_temperature = 0.0f;     // 0 = no override; set via --min-temp
     int warmup_tokens = 4096;         // 0 = disable warmup
 };
@@ -504,7 +504,7 @@ static void print_usage() {
                  "  --vl              Enable vision-language (load vision encoder)\n"
                  "  --no-thinking     Disable thinking mode\n"
                  "  --rep-penalty     Repetition penalty (default: 1.1)\n"
-                 "  --pres-penalty    Presence penalty (default: 1.5)\n"
+                 "  --pres-penalty    Presence penalty (default: 0.0)\n"
                  "  --min-temp        Minimum temperature floor (default: 0, no override)\n"
                  "  --warmup-tokens   Max sequence length for GPU warmup (default: 4096, 0=disable)\n";
 }
