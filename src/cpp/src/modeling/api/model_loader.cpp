@@ -11,6 +11,7 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #include <openvino/op/constant.hpp>
 #include <openvino/openvino.hpp>
@@ -49,6 +50,19 @@ bool has_safetensors_file(const std::filesystem::path& model_dir) {
 bool has_ir_model_pair(const std::filesystem::path& xml_path, const std::filesystem::path& bin_path) {
     return std::filesystem::exists(xml_path) && std::filesystem::is_regular_file(xml_path) &&
            std::filesystem::exists(bin_path) && std::filesystem::is_regular_file(bin_path);
+}
+
+std::optional<std::pair<std::filesystem::path, std::filesystem::path>> find_ir_model_pair(
+    const std::filesystem::path& model_dir,
+    const std::vector<std::string>& stem_candidates) {
+    for (const auto& stem : stem_candidates) {
+        const auto xml_path = model_dir / (stem + ".xml");
+        const auto bin_path = model_dir / (stem + ".bin");
+        if (has_ir_model_pair(xml_path, bin_path)) {
+            return std::make_pair(xml_path, bin_path);
+        }
+    }
+    return std::nullopt;
 }
 
 bool has_model_input_name(const std::shared_ptr<ov::Model>& model, const std::string& input_name) {
@@ -181,6 +195,7 @@ struct ModelLoader::Impl {
     void load(const std::filesystem::path& model_dir, const LoadParams& params) {
         model_dir_ = model_dir;
         device_ = params.device;
+        const bool use_vl = params.enable_vision;
 
         // ─── Validate model directory ───
         if (!std::filesystem::exists(model_dir) || !std::filesystem::is_directory(model_dir)) {
@@ -189,9 +204,7 @@ struct ModelLoader::Impl {
         if (!std::filesystem::exists(model_dir / "config.json")) {
             throw std::runtime_error("Model directory missing config.json: " + model_dir.string());
         }
-        if (!has_safetensors_file(model_dir)) {
-            throw std::runtime_error("Model directory missing .safetensors files: " + model_dir.string());
-        }
+        const bool has_hf_weights = has_safetensors_file(model_dir);
 
         // ─── Load config ───
         cfg_ = models::Qwen3_5Config::from_json_file(model_dir);
@@ -235,7 +248,6 @@ struct ModelLoader::Impl {
         }
 
         // ─── IR cache paths ───
-        const bool use_vl = params.enable_vision;
         std::string text_ir_stem = (use_vl ? "qwen3_5_text_vl" : "qwen3_5_text") + quant_cache_suffix(text_quant_);
         if (params.num_layers.has_value()) {
             text_ir_stem += "_l" + std::to_string(*params.num_layers);
@@ -246,8 +258,24 @@ struct ModelLoader::Impl {
         const auto vision_xml = model_dir / (vision_ir_stem + ".xml");
         const auto vision_bin = model_dir / (vision_ir_stem + ".bin");
 
-        const bool load_text_from_ir = params.cache_ir && has_ir_model_pair(text_xml, text_bin);
-        const bool load_vision_from_ir = params.cache_ir && use_vl && has_ir_model_pair(vision_xml, vision_bin);
+        const auto text_ir_pair = find_ir_model_pair(
+            model_dir,
+            use_vl
+                ? std::vector<std::string>{text_ir_stem, "qwen3_5_text_vl" + quant_cache_suffix(text_quant_), "qwen3_5_text_vl"}
+                : std::vector<std::string>{text_ir_stem, "qwen3_5_text" + quant_cache_suffix(text_quant_), "qwen3_5_text"});
+        const auto vision_ir_pair = use_vl
+            ? find_ir_model_pair(model_dir, std::vector<std::string>{vision_ir_stem, "qwen3_5_vision"})
+            : std::nullopt;
+
+        if (!has_hf_weights && !text_ir_pair.has_value()) {
+            throw std::runtime_error("Model directory missing text IR and .safetensors files: " + model_dir.string());
+        }
+        if (use_vl && !has_hf_weights && !vision_ir_pair.has_value()) {
+            throw std::runtime_error("VL model directory missing vision IR and .safetensors files: " + model_dir.string());
+        }
+
+        const bool load_text_from_ir = text_ir_pair.has_value() && (!has_hf_weights || params.cache_ir);
+        const bool load_vision_from_ir = use_vl && vision_ir_pair.has_value() && (!has_hf_weights || params.cache_ir);
 
         // ─── Weight source (lazy) ───
         ov::Core core;
@@ -268,8 +296,8 @@ struct ModelLoader::Impl {
         // ─── Vision model ───
         std::shared_ptr<ov::Model> vision_model;
         if (load_vision_from_ir) {
-            std::cout << "[ModelLoader] Reusing cached vision IR: " << vision_xml << std::endl;
-            vision_model = core.read_model(vision_xml.string(), vision_bin.string());
+            std::cout << "[ModelLoader] Reusing cached vision IR: " << vision_ir_pair->first << std::endl;
+            vision_model = core.read_model(vision_ir_pair->first.string(), vision_ir_pair->second.string());
             pos_embed_weight_ = extract_pos_embed_from_vision_model(vision_model);
         } else if (use_vl) {
             auto& ws = ensure_source();
@@ -296,9 +324,12 @@ struct ModelLoader::Impl {
         // ─── Text model ───
         std::shared_ptr<ov::Model> text_model;
         if (load_text_from_ir) {
-            std::cout << "[ModelLoader] Reusing cached text IR: " << text_xml << std::endl;
-            text_model = core.read_model(text_xml.string(), text_bin.string());
+            std::cout << "[ModelLoader] Reusing cached text IR: " << text_ir_pair->first << std::endl;
+            text_model = core.read_model(text_ir_pair->first.string(), text_ir_pair->second.string());
             if (use_vl && !is_vl_text_ir_compatible(text_model)) {
+                if (!has_hf_weights) {
+                    throw std::runtime_error("Bundled text IR is not VL-compatible: " + text_ir_pair->first.string());
+                }
                 std::cout << "[ModelLoader] Cached text IR not VL-compatible, rebuilding" << std::endl;
                 text_model.reset();
             }

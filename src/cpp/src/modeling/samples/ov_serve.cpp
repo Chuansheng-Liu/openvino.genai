@@ -142,9 +142,12 @@ struct ServerConfig {
     bool enable_thinking = true;
     bool enable_vision = false;
     int max_tokens_default = 2048;
-    float repetition_penalty = 1.1f;  // Default to prevent degeneration
+    float repetition_penalty = 1.5f;  // Launcher default for safer anti-repetition
     float presence_penalty = 0.0f;    // OpenAI default; rep_penalty handles repetition
     float frequency_penalty = 0.0f;   // 0 = off; >0 penalizes tokens by occurrence count
+    float temperature = 0.7f;         // Recommended default for chat-like generation
+    float top_p = 0.8f;               // Recommended nucleus sampling default
+    size_t top_k = 20;                // Conservative token candidate pool
     float min_temperature = 0.0f;     // 0 = no override; set via --min-temp
     int warmup_tokens = 4096;         // 0 = disable warmup
     bool enable_logging = true;       // Log prompts and request params to stderr
@@ -264,104 +267,32 @@ static ParsedRequest parse_chat_request(const json& body, ov::genai::Tokenizer& 
         req.tools = body["tools"].get<std::vector<json>>();
     }
 
-    // Build chat prompt using Qwen3.5 ChatML format
+    // Build prompt using the tokenizer's chat template so serving matches
+    // the model's native formatting instead of hand-crafted ChatML.
     auto messages = body.at("messages");
-    std::string chat_text;
-
-    // If tools are present, inject tool schema into system message (Qwen3.5 format)
-    bool has_system = false;
     for (const auto& msg : messages) {
-        std::string role = msg.at("role").get<std::string>();
-        std::string content;
-
-        // Handle both string content and multimodal content array
-        if (msg.contains("content")) {
-            if (msg["content"].is_string()) {
-                content = msg["content"].get<std::string>();
-            } else if (msg["content"].is_array()) {
-                // OpenAI multimodal content array: [{type: "text"}, {type: "image_url"}]
-                // Qwen3.5 VL requires vision markers BEFORE text content,
-                // so collect text and images separately then combine.
-                std::string text_parts;
-                std::string vision_markers;
-                for (const auto& part : msg["content"]) {
-                    std::string part_type = part.value("type", "");
-                    if (part_type == "text") {
-                        if (!text_parts.empty()) text_parts += "\n";
-                        text_parts += part.at("text").get<std::string>();
-                    } else if (part_type == "image_url") {
-                        auto url = part.at("image_url").at("url").get<std::string>();
-                        auto image = decode_image_from_data_uri(url);
-                        req.images.push_back(std::move(image));
-                        vision_markers += "<|vision_start|><|vision_end|>";
-                    }
-                }
-                // Vision markers always come before text (model requirement)
-                content = vision_markers + text_parts;
-            } else if (msg["content"].is_null()) {
-                content = "";
+        if (!msg.contains("content") || !msg["content"].is_array()) {
+            continue;
+        }
+        for (const auto& part : msg["content"]) {
+            if (part.value("type", "") == "image_url") {
+                auto url = part.at("image_url").at("url").get<std::string>();
+                req.images.push_back(decode_image_from_data_uri(url));
             }
         }
-
-        if (role == "system" && !req.tools.empty() && !has_system) {
-            // Inject tool definitions into system message
-            content += "\n\n# Tools\n\nYou may call one or more functions to assist "
-                       "with the user query.\n\nYou are provided with function signatures "
-                       "within <tools></tools> XML tags:\n<tools>\n";
-            for (const auto& tool : req.tools) {
-                if (tool.contains("function")) {
-                    content += tool["function"].dump() + "\n";
-                }
-            }
-            content += "</tools>\n\nFor each function call, return a json object with "
-                       "function name and arguments within <tool_call></tool_call> XML tags:\n"
-                       "<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n"
-                       "</tool_call>";
-            has_system = true;
-        } else if (role == "system") {
-            has_system = true;
-        } else if (role == "tool") {
-            // Tool response messages
-            std::string tool_call_id;
-            if (msg.contains("tool_call_id")) {
-                tool_call_id = msg["tool_call_id"].get<std::string>();
-            }
-            content = "[Tool Response: " + tool_call_id + "]\n" + content;
-            role = "user";  // Map tool role to user for Qwen3.5
-        }
-
-        chat_text += "<|im_start|>" + role + "\n" + content + "<|im_end|>\n";
     }
 
-    // If tools but no system message, prepend one
-    if (!req.tools.empty() && !has_system) {
-        std::string sys = "You are Qwen, created by Alibaba Cloud. You are a helpful assistant.\n\n"
-                          "# Tools\n\nYou may call one or more functions.\n<tools>\n";
-        for (const auto& tool : req.tools) {
-            if (tool.contains("function")) {
-                sys += tool["function"].dump() + "\n";
-            }
-        }
-        sys += "</tools>\n\nFor each function call, return a json object with "
-               "function name and arguments within <tool_call></tool_call> XML tags:\n"
-               "<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n"
-               "</tool_call>";
-        chat_text = "<|im_start|>system\n" + sys + "<|im_end|>\n" + chat_text;
+    ov::genai::ChatHistory history(ov::genai::JsonContainer::from_json_string(messages.dump()));
+    if (!req.tools.empty()) {
+        history.set_tools(ov::genai::JsonContainer::from_json_string(body["tools"].dump()));
     }
 
-    chat_text += "<|im_start|>assistant\n";
-    if (cfg.enable_thinking) {
-        // Trigger structured thinking with <think> tag
-        chat_text += "<think>\n";
-    } else {
-        // Suppress thinking: empty think block tells model to skip thinking
-        chat_text += "<think>\n</think>\n\n";
-    }
-    req.prompt = chat_text;
+    ov::genai::JsonContainer extra({{"enable_thinking", cfg.enable_thinking}});
+    req.prompt = tokenizer.apply_chat_template(history, true, {}, std::nullopt, extra);
 
     // Log the constructed prompt (truncated) if logging enabled
     if (cfg.enable_logging) {
-        std::string dbg = chat_text;
+        std::string dbg = req.prompt;
         // Replace base64 image data with placeholder for readability
         auto pos = dbg.find("data:image");
         if (pos != std::string::npos) {
@@ -383,14 +314,16 @@ static ParsedRequest parse_chat_request(const json& body, ov::genai::Tokenizer& 
     req.params.enable_thinking = cfg.enable_thinking;
     req.params.raw_prompt = true;  // prompt is already ChatML-formatted
 
-    float temperature = body.value("temperature", 0.0f);
+    float temperature = body.value("temperature", cfg.temperature);
     if (cfg.min_temperature > 0.0f && temperature < cfg.min_temperature) {
         temperature = cfg.min_temperature;
     }
     req.params.sampling.temperature = temperature;
-    req.params.sampling.top_p = body.value("top_p", 0.95f);
+    req.params.sampling.top_p = body.value("top_p", cfg.top_p);
     if (body.contains("top_k")) {
         req.params.sampling.top_k = body["top_k"].get<size_t>();
+    } else {
+        req.params.sampling.top_k = cfg.top_k;
     }
     if (body.contains("seed")) {
         req.params.sampling.rng_seed = body["seed"].get<size_t>();
@@ -485,6 +418,31 @@ static json build_chat_response(const std::string& id, const std::string& model,
     return resp;
 }
 
+static json build_canned_chat_response(const std::string& id, const std::string& model,
+                                       const std::string& text) {
+    json choice;
+    choice["index"] = 0;
+    choice["finish_reason"] = "stop";
+    json message;
+    message["role"] = "assistant";
+    message["content"] = text;
+    choice["message"] = message;
+
+    json usage;
+    usage["prompt_tokens"] = 0;
+    usage["completion_tokens"] = 0;
+    usage["total_tokens"] = 0;
+
+    json resp;
+    resp["id"] = id;
+    resp["object"] = "chat.completion";
+    resp["created"] = unix_timestamp();
+    resp["model"] = model;
+    resp["choices"] = json::array({choice});
+    resp["usage"] = usage;
+    return resp;
+}
+
 // ═══════════════════════════════════════════════════════════════════
 //  SSE streaming helpers
 // ═══════════════════════════════════════════════════════════════════
@@ -503,14 +461,18 @@ static std::string sse_done() {
 
 static void print_usage() {
     std::cerr << "Usage: ov_serve --model <path> [--port 8080] [--host 0.0.0.0] "
-                 "[--workers 1] [--device GPU] [--vl] [--no-thinking] [--rep-penalty 1.1]\n"
+                 "[--workers 1] [--device GPU] [--vl] [--no-thinking] [--temperature 0.7] "
+                 "[--top-p 0.8] [--top-k 20] [--rep-penalty 1.5]\n"
                  "\n"
-                 "  --vl              Enable vision-language (load vision encoder)\n"
-                 "  --no-thinking     Disable thinking mode\n"
-                 "  --rep-penalty     Repetition penalty (default: 1.1)\n"
-                 "  --pres-penalty    Presence penalty (default: 0.0)\n"
-                 "  --freq-penalty    Frequency penalty (default: 0.0)\n"
-                 "  --min-temp        Minimum temperature floor (default: 0, no override)\n"
+                  "  --vl              Enable vision-language (load vision encoder)\n"
+                  "  --no-thinking     Disable thinking mode\n"
+                  "  --temperature     Default temperature when request omits it (default: 0.7)\n"
+                  "  --top-p           Default top-p when request omits it (default: 0.8)\n"
+                  "  --top-k           Default top-k when request omits it (default: 20)\n"
+                  "  --rep-penalty     Repetition penalty (default: 1.5)\n"
+                  "  --pres-penalty    Presence penalty (default: 0.0)\n"
+                  "  --freq-penalty    Frequency penalty (default: 0.0)\n"
+                  "  --min-temp        Minimum temperature floor (default: 0, no override)\n"
                  "  --warmup-tokens   Max sequence length for GPU warmup (default: 4096, 0=disable)\n"
                  "  --no-log          Disable request/prompt logging to stderr\n";
 }
@@ -527,6 +489,9 @@ int main(int argc, char* argv[]) {
         else if (arg == "--workers" && i + 1 < argc) cfg.workers = std::stoi(argv[++i]);
         else if (arg == "--device" && i + 1 < argc) cfg.device = argv[++i];
         else if (arg == "--max-tokens" && i + 1 < argc) cfg.max_tokens_default = std::stoi(argv[++i]);
+        else if (arg == "--temperature" && i + 1 < argc) cfg.temperature = std::stof(argv[++i]);
+        else if (arg == "--top-p" && i + 1 < argc) cfg.top_p = std::stof(argv[++i]);
+        else if (arg == "--top-k" && i + 1 < argc) cfg.top_k = static_cast<size_t>(std::stoul(argv[++i]));
         else if (arg == "--rep-penalty" && i + 1 < argc) cfg.repetition_penalty = std::stof(argv[++i]);
         else if (arg == "--pres-penalty" && i + 1 < argc) cfg.presence_penalty = std::stof(argv[++i]);
         else if (arg == "--freq-penalty" && i + 1 < argc) cfg.frequency_penalty = std::stof(argv[++i]);
@@ -891,13 +856,15 @@ int main(int argc, char* argv[]) {
         } else {
             params.max_new_tokens = body.value("max_tokens", cfg.max_tokens_default);
         }
-        params.sampling.temperature = body.value("temperature", 0.0f);
+        params.sampling.temperature = body.value("temperature", cfg.temperature);
         if (cfg.min_temperature > 0.0f && params.sampling.temperature < cfg.min_temperature) {
             params.sampling.temperature = cfg.min_temperature;
         }
-        params.sampling.top_p = body.value("top_p", 0.95f);
+        params.sampling.top_p = body.value("top_p", cfg.top_p);
         if (body.contains("top_k")) {
             params.sampling.top_k = body["top_k"].get<size_t>();
+        } else {
+            params.sampling.top_k = cfg.top_k;
         }
         if (body.contains("repetition_penalty")) {
             params.sampling.repetition_penalty = body["repetition_penalty"].get<float>();
@@ -977,14 +944,16 @@ int main(int argc, char* argv[]) {
     auto parse_ollama_options = [&cfg](const json& body, GenerateParams& params) {
         json opts = body.value("options", json::object());
 
-        float temperature = opts.value("temperature", 0.0f);
+        float temperature = opts.value("temperature", cfg.temperature);
         if (cfg.min_temperature > 0.0f && temperature < cfg.min_temperature) {
             temperature = cfg.min_temperature;
         }
         params.sampling.temperature = temperature;
-        params.sampling.top_p = opts.value("top_p", 0.95f);
+        params.sampling.top_p = opts.value("top_p", cfg.top_p);
         if (opts.contains("top_k")) {
             params.sampling.top_k = opts["top_k"].get<size_t>();
+        } else {
+            params.sampling.top_k = cfg.top_k;
         }
         if (opts.contains("seed")) {
             params.sampling.rng_seed = opts["seed"].get<size_t>();
@@ -1039,11 +1008,13 @@ int main(int argc, char* argv[]) {
     });
 
     // POST /api/show — Show model info (Ollama format)
-    svr.Post("/api/show", [&model_name, &iso_timestamp](const httplib::Request&,
-                                                         httplib::Response& res) {
+    svr.Post("/api/show", [&model_name, &iso_timestamp, &cfg](const httplib::Request&,
+                                                              httplib::Response& res) {
         json resp;
         resp["modelfile"] = "# OpenVINO GenAI model";
-        resp["parameters"] = "temperature 0\ntop_p 0.95\ntop_k 20";
+        resp["parameters"] = "temperature " + std::to_string(cfg.temperature) +
+                             "\ntop_p " + std::to_string(cfg.top_p) +
+                             "\ntop_k " + std::to_string(cfg.top_k);
         resp["template"] = "ChatML";
         json details;
         details["parent_model"] = "";
@@ -1060,7 +1031,7 @@ int main(int argc, char* argv[]) {
 
     // POST /api/chat — Ollama chat (NDJSON streaming)
     svr.Post("/api/chat",
-             [&pool, &cfg, &model_name, &iso_timestamp, &parse_ollama_options](
+             [&pool, &cfg, &model_name, &iso_timestamp, &parse_ollama_options, tokenizer](
                  const httplib::Request& req, httplib::Response& res) {
         json body;
         try {
@@ -1075,21 +1046,26 @@ int main(int argc, char* argv[]) {
 
         bool do_stream = body.value("stream", true);  // Ollama defaults to stream=true
 
-        // Build ChatML prompt from Ollama messages
         auto messages = body.value("messages", json::array());
         std::string chat_text;
-
-        for (const auto& msg : messages) {
-            std::string role = msg.value("role", "user");
-            std::string content = msg.value("content", "");
-            chat_text += "<|im_start|>" + role + "\n" + content + "<|im_end|>\n";
-        }
-
-        chat_text += "<|im_start|>assistant\n";
-        if (cfg.enable_thinking) {
-            chat_text += "<think>\n";
+        if (tokenizer && !tokenizer->get_chat_template().empty()) {
+            ov::genai::ChatHistory history(ov::genai::JsonContainer::from_json_string(messages.dump()));
+            ov::genai::JsonContainer extra({{"enable_thinking", cfg.enable_thinking}});
+            chat_text = tokenizer->apply_chat_template(history, true, {}, std::nullopt, extra);
         } else {
-            chat_text += "<think>\n</think>\n\n";
+            // Fallback path if tokenizer chat template is unavailable.
+            for (const auto& msg : messages) {
+                std::string role = msg.value("role", "user");
+                std::string content = msg.value("content", "");
+                chat_text += "<|im_start|>" + role + "\n" + content + "<|im_end|>\n";
+            }
+
+            chat_text += "<|im_start|>assistant\n";
+            if (cfg.enable_thinking) {
+                chat_text += "<think>\n";
+            } else {
+                chat_text += "<think>\n</think>\n\n";
+            }
         }
 
         GenerateParams params;
@@ -1198,7 +1174,7 @@ int main(int argc, char* argv[]) {
 
     // POST /api/generate — Ollama raw generate (NDJSON streaming)
     svr.Post("/api/generate",
-             [&pool, &cfg, &model_name, &iso_timestamp, &parse_ollama_options](
+             [&pool, &cfg, &model_name, &iso_timestamp, &parse_ollama_options, tokenizer](
                  const httplib::Request& req, httplib::Response& res) {
         json body;
         try {
@@ -1215,21 +1191,31 @@ int main(int argc, char* argv[]) {
         std::string prompt = body.value("prompt", "");
         bool raw = body.value("raw", false);
 
-        // If not raw mode, wrap in ChatML
+        // If not raw mode, wrap in chat template / ChatML
         if (!raw) {
             std::string system = body.value("system", "");
-            std::string wrapped;
-            if (!system.empty()) {
-                wrapped = "<|im_start|>system\n" + system + "<|im_end|>\n";
-            }
-            wrapped += "<|im_start|>user\n" + prompt + "<|im_end|>\n";
-            wrapped += "<|im_start|>assistant\n";
-            if (cfg.enable_thinking) {
-                wrapped += "<think>\n";
+            if (tokenizer && !tokenizer->get_chat_template().empty()) {
+                ov::genai::ChatHistory history;
+                if (!system.empty()) {
+                    history.push_back({{"role", "system"}, {"content", system}});
+                }
+                history.push_back({{"role", "user"}, {"content", prompt}});
+                ov::genai::JsonContainer extra({{"enable_thinking", cfg.enable_thinking}});
+                prompt = tokenizer->apply_chat_template(history, true, {}, std::nullopt, extra);
             } else {
-                wrapped += "<think>\n</think>\n\n";
+                std::string wrapped;
+                if (!system.empty()) {
+                    wrapped = "<|im_start|>system\n" + system + "<|im_end|>\n";
+                }
+                wrapped += "<|im_start|>user\n" + prompt + "<|im_end|>\n";
+                wrapped += "<|im_start|>assistant\n";
+                if (cfg.enable_thinking) {
+                    wrapped += "<think>\n";
+                } else {
+                    wrapped += "<think>\n</think>\n\n";
+                }
+                prompt = wrapped;
             }
-            prompt = wrapped;
         }
 
         GenerateParams params;
