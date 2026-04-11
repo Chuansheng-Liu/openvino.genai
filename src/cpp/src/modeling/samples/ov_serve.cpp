@@ -284,6 +284,18 @@ static ParsedRequest parse_chat_request(const json& body, ov::genai::Tokenizer& 
         }
     }
 
+    // Only one image supported at the session level.  When multiple are
+    // present (e.g. chat history re-sends old images), keep only the last
+    // one and remember its 0-based index so the prompt builder can place
+    // the vision marker in the right spot.
+    const size_t total_images = req.images.size();
+    const size_t keep_image_idx = total_images > 0 ? total_images - 1 : 0;
+    if (total_images > 1) {
+        auto last = std::move(req.images.back());
+        req.images.clear();
+        req.images.push_back(std::move(last));
+    }
+
     if (req.images.empty()) {
         // Text-only: use native chat template
         ov::genai::ChatHistory history(ov::genai::JsonContainer::from_json_string(messages.dump()));
@@ -295,7 +307,9 @@ static ParsedRequest parse_chat_request(const json& body, ov::genai::Tokenizer& 
     } else {
         // VL: manual ChatML with vision markers so tokenize_vl can
         // expand them to the correct number of <|image_pad|> tokens.
+        // Only emit the vision marker for the image we actually kept.
         std::string chat_text;
+        size_t image_counter = 0;  // tracks which image_url we're visiting
         for (const auto& msg : messages) {
             std::string role = msg.at("role").get<std::string>();
             std::string content;
@@ -304,17 +318,20 @@ static ParsedRequest parse_chat_request(const json& body, ov::genai::Tokenizer& 
                     content = msg["content"].get<std::string>();
                 } else if (msg["content"].is_array()) {
                     std::string text_parts;
-                    std::string vision_markers;
+                    std::string vision_marker;
                     for (const auto& part : msg["content"]) {
                         std::string pt = part.value("type", "");
                         if (pt == "text") {
                             if (!text_parts.empty()) text_parts += "\n";
                             text_parts += part.at("text").get<std::string>();
                         } else if (pt == "image_url") {
-                            vision_markers += "<|vision_start|><|vision_end|>";
+                            if (image_counter == keep_image_idx) {
+                                vision_marker = "<|vision_start|><|vision_end|>";
+                            }
+                            ++image_counter;
                         }
                     }
-                    content = vision_markers + text_parts;
+                    content = vision_marker + text_parts;
                 } else if (msg["content"].is_null()) {
                     content = "";
                 }
@@ -658,11 +675,6 @@ int main(int argc, char* argv[]) {
                 err["error"]["type"] = "invalid_request_error";
                 res.set_content(err.dump(), "application/json");
                 return;
-            }
-            if (parsed.images.size() > 1) {
-                // Only one image supported; keep the last (most recent) one.
-                parsed.images.erase(parsed.images.begin(),
-                                    parsed.images.begin() + static_cast<long>(parsed.images.size() - 1));
             }
             if (!parsed.tools.empty()) {
                 // Ignore tool definitions for image requests
