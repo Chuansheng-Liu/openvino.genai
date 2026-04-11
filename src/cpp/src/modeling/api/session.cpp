@@ -836,6 +836,15 @@ struct Session::Impl {
                 if (!emit_text(delta, next_id)) {
                     stop_requested_.store(true);
                 }
+
+                // When thinking is disabled but the model still emits an
+                // orphan </think> (common with long max_tokens), the tracker
+                // transitions to AFTER_THINKING.  Stop immediately so the
+                // duplicate content that follows </think> is never generated.
+                if (!params.enable_thinking &&
+                    thinking_tracker_.state() == ThinkingState::AFTER_THINKING) {
+                    stop_requested_.store(true);
+                }
             } else if (callback) {
                 StreamChunk chunk;
                 chunk.event = StreamEvent::TOKEN;
@@ -847,8 +856,10 @@ struct Session::Impl {
         }
         const auto decode_end = std::chrono::steady_clock::now();
 
-        // Flush remaining buffered text
-        if (token_processor_) {
+        // Flush remaining buffered text (skip if we stopped due to orphan </think>)
+        if (token_processor_ && !(stop_requested_.load() &&
+                !params.enable_thinking &&
+                thinking_tracker_.state() == ThinkingState::AFTER_THINKING)) {
             std::string remaining = token_processor_->flush();
             if (!remaining.empty()) {
                 emit_text(remaining, -1);
@@ -894,7 +905,13 @@ struct Session::Impl {
                 result.thinking_text = tr.thinking_text;
                 result.text = tr.content_text;
             } else {
-                result.text = full_text;
+                // Thinking disabled — strip orphan </think> and everything after
+                auto close_pos = full_text.find("</think>");
+                if (close_pos != std::string::npos) {
+                    result.text = full_text.substr(0, close_pos);
+                } else {
+                    result.text = full_text;
+                }
             }
         }
 
