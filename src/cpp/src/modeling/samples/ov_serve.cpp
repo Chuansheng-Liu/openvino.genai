@@ -388,6 +388,21 @@ static ParsedRequest parse_chat_request(const json& body, ov::genai::Tokenizer& 
 
     // Log the constructed prompt (truncated) if logging enabled
     if (cfg.enable_logging) {
+        // Count vision markers in prompt
+        size_t vm_count = 0;
+        {
+            const std::string marker = "<|vision_start|>";
+            size_t p = 0;
+            while ((p = req.prompt.find(marker, p)) != std::string::npos) {
+                ++vm_count;
+                p += marker.size();
+            }
+        }
+        if (vm_count > 0 || !req.images.empty()) {
+            std::cerr << "[ov_serve] VL: " << req.images.size() << " images, "
+                      << vm_count << " vision markers, prompt_len="
+                      << req.prompt.size() << " chars\n";
+        }
         std::string dbg = req.prompt;
         // Replace base64 image data with placeholder for readability
         auto pos = dbg.find("data:image");
@@ -397,7 +412,7 @@ static ParsedRequest parse_chat_request(const json& body, ov::genai::Tokenizer& 
                 dbg.replace(pos + 30, end - pos - 30, "...<base64_truncated>...");
             }
         }
-        if (dbg.size() > 1000) dbg = dbg.substr(0, 1000) + "...(truncated)";
+        if (dbg.size() > 2000) dbg = dbg.substr(0, 2000) + "...(truncated)";
         std::cerr << "[ov_serve] PROMPT: " << dbg << "\n";
     }
 
