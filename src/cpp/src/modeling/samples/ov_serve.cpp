@@ -660,12 +660,9 @@ int main(int argc, char* argv[]) {
                 return;
             }
             if (parsed.images.size() > 1) {
-                res.status = 400;
-                json err;
-                err["error"]["message"] = "Only one image per request is currently supported";
-                err["error"]["type"] = "invalid_request_error";
-                res.set_content(err.dump(), "application/json");
-                return;
+                // Only one image supported; keep the last (most recent) one.
+                parsed.images.erase(parsed.images.begin(),
+                                    parsed.images.begin() + static_cast<long>(parsed.images.size() - 1));
             }
             if (!parsed.tools.empty()) {
                 // Ignore tool definitions for image requests
