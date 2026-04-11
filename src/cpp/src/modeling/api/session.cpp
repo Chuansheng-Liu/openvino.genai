@@ -102,6 +102,10 @@ struct Session::Impl {
     ov::Tensor rope_deltas_;        // [B, 1] from InputPlanner
     std::vector<int64_t> generated_ids_;
 
+    // Prefix cache: token IDs currently backed by the KV cache
+    std::vector<int64_t> cached_token_ids_;
+    bool cache_valid_ = false;
+
     // Sampling scratch
     std::vector<float> logit_buf_;
     SamplingContext sampling_ctx_;
@@ -272,11 +276,30 @@ struct Session::Impl {
         const bool use_vl = (visual_embeds != nullptr);
         const bool use_sampling = params.sampling.temperature > 0.0f;
         const int64_t prompt_len = static_cast<int64_t>(input_ids.get_shape().at(1));
+        const int64_t* prompt_data = input_ids.data<const int64_t>();
+
+        // ── Prefix cache check (text-only only) ──
+        size_t prefix_match = 0;
+        if (!use_vl && cache_valid_) {
+            const size_t cached_len = cached_token_ids_.size();
+            const size_t check_len = std::min(static_cast<size_t>(prompt_len), cached_len);
+            for (size_t i = 0; i < check_len; ++i) {
+                if (prompt_data[i] != cached_token_ids_[i]) break;
+                ++prefix_match;
+            }
+        }
+        // Reuse cache only when the new prompt is an exact extension of the
+        // cached sequence (i.e. all cached tokens match the prompt prefix
+        // and the prompt has additional new tokens).
+        const bool use_prefix_cache = !use_vl
+            && cache_valid_
+            && prefix_match > 0
+            && prefix_match == cached_token_ids_.size()
+            && static_cast<size_t>(prompt_len) > prefix_match;
 
         // Collect prompt token IDs for LogitProcessor
         std::vector<int64_t> prompt_token_ids(
-            input_ids.data<const int64_t>(),
-            input_ids.data<const int64_t>() + input_ids.get_size());
+            prompt_data, prompt_data + input_ids.get_size());
 
         // Build penalty-only LogitProcessor
         ov::genai::GenerationConfig penalty_config;
@@ -292,38 +315,93 @@ struct Session::Impl {
                          : std::random_device{}());
 
         // ─── Prefill ───
-        auto usm_ids = clone_as_usm_host(gpu_ctx_, input_ids);
-        auto usm_mask = clone_as_usm_host(gpu_ctx_, attention_mask);
-        auto usm_pos = clone_as_usm_host(gpu_ctx_, position_ids);
+        const auto prefill_start = std::chrono::steady_clock::now();
 
-        text_request_.reset_state();
-        text_request_.set_tensor(models::Qwen3_5TextIO::kInputIds, usm_ids);
-        text_request_.set_tensor(models::Qwen3_5TextIO::kAttentionMask, usm_mask);
-        text_request_.set_tensor(models::Qwen3_5TextIO::kPositionIds, usm_pos);
-        text_request_.set_tensor(models::Qwen3_5TextIO::kBeamIdx, beam_idx_);
+        if (use_prefix_cache) {
+            // Partial prefill: only process new suffix tokens.
+            // The KV cache already contains entries for cached_token_ids_.
+            const size_t suffix_len = static_cast<size_t>(prompt_len) - prefix_match;
 
-        if (use_vl) {
-            auto usm_vis = clone_as_usm_host(gpu_ctx_, *visual_embeds);
-            auto usm_vis_mask = clone_as_usm_host(gpu_ctx_, *visual_pos_mask);
-            text_request_.set_tensor(models::Qwen3_5TextIO::kVisualEmbeds, usm_vis);
-            text_request_.set_tensor(models::Qwen3_5TextIO::kVisualPosMask, usm_vis_mask);
-        } else if (model_.compiled_vision()) {
-            // VL model loaded but text-only request: provide zero visual tensors
-            // matching prompt sequence length so Select nodes don't get shape mismatch.
-            const auto hidden = static_cast<size_t>(model_.config().text.hidden_size);
-            const auto seq = static_cast<size_t>(prompt_len);
-            auto zero_vis = make_usm_host_tensor(gpu_ctx_, ov::element::f32,
-                                                  {kBatch, seq, hidden});
-            std::memset(zero_vis.data(), 0, zero_vis.get_byte_size());
-            auto zero_mask = make_usm_host_tensor(gpu_ctx_, ov::element::boolean,
-                                                   {kBatch, seq});
-            std::memset(zero_mask.data(), 0, zero_mask.get_byte_size());
-            text_request_.set_tensor(models::Qwen3_5TextIO::kVisualEmbeds, zero_vis);
-            text_request_.set_tensor(models::Qwen3_5TextIO::kVisualPosMask, zero_mask);
+            // Suffix input_ids [B, suffix_len]
+            ov::Tensor suffix_ids(ov::element::i64, {kBatch, suffix_len});
+            std::memcpy(suffix_ids.data<int64_t>(),
+                        prompt_data + prefix_match,
+                        suffix_len * sizeof(int64_t));
+
+            // Full attention mask [B, prompt_len] — all 1s
+            ov::Tensor full_mask(ov::element::i64, {kBatch, static_cast<size_t>(prompt_len)});
+            std::fill_n(full_mask.data<int64_t>(), prompt_len, int64_t{1});
+
+            // Position IDs for suffix [3, B, suffix_len] — sequential from prefix_match
+            ov::Tensor suffix_pos(ov::element::i64, {3, kBatch, suffix_len});
+            auto* pos_ptr = suffix_pos.data<int64_t>();
+            for (size_t i = 0; i < suffix_len; ++i) {
+                const int64_t p = static_cast<int64_t>(prefix_match + i);
+                pos_ptr[i] = p;                       // dim 0
+                pos_ptr[suffix_len + i] = p;           // dim 1
+                pos_ptr[2 * suffix_len + i] = p;       // dim 2
+            }
+
+            auto usm_ids = clone_as_usm_host(gpu_ctx_, suffix_ids);
+            auto usm_mask = clone_as_usm_host(gpu_ctx_, full_mask);
+            auto usm_pos = clone_as_usm_host(gpu_ctx_, suffix_pos);
+
+            // DON'T reset_state — reuse existing KV cache
+            text_request_.set_tensor(models::Qwen3_5TextIO::kInputIds, usm_ids);
+            text_request_.set_tensor(models::Qwen3_5TextIO::kAttentionMask, usm_mask);
+            text_request_.set_tensor(models::Qwen3_5TextIO::kPositionIds, usm_pos);
+            text_request_.set_tensor(models::Qwen3_5TextIO::kBeamIdx, beam_idx_);
+
+            if (model_.compiled_vision()) {
+                // VL model, text-only path: zero visual tensors for suffix length
+                const auto hidden = static_cast<size_t>(model_.config().text.hidden_size);
+                auto zero_vis = make_usm_host_tensor(gpu_ctx_, ov::element::f32,
+                                                      {kBatch, suffix_len, hidden});
+                std::memset(zero_vis.data(), 0, zero_vis.get_byte_size());
+                auto zero_mask = make_usm_host_tensor(gpu_ctx_, ov::element::boolean,
+                                                       {kBatch, suffix_len});
+                std::memset(zero_mask.data(), 0, zero_mask.get_byte_size());
+                text_request_.set_tensor(models::Qwen3_5TextIO::kVisualEmbeds, zero_vis);
+                text_request_.set_tensor(models::Qwen3_5TextIO::kVisualPosMask, zero_mask);
+            }
+
+            text_request_.infer();
+        } else {
+            // Full prefill: reset KV cache and process entire prompt.
+            cache_valid_ = false;
+            cached_token_ids_.clear();
+
+            auto usm_ids = clone_as_usm_host(gpu_ctx_, input_ids);
+            auto usm_mask = clone_as_usm_host(gpu_ctx_, attention_mask);
+            auto usm_pos = clone_as_usm_host(gpu_ctx_, position_ids);
+
+            text_request_.reset_state();
+            text_request_.set_tensor(models::Qwen3_5TextIO::kInputIds, usm_ids);
+            text_request_.set_tensor(models::Qwen3_5TextIO::kAttentionMask, usm_mask);
+            text_request_.set_tensor(models::Qwen3_5TextIO::kPositionIds, usm_pos);
+            text_request_.set_tensor(models::Qwen3_5TextIO::kBeamIdx, beam_idx_);
+
+            if (use_vl) {
+                auto usm_vis = clone_as_usm_host(gpu_ctx_, *visual_embeds);
+                auto usm_vis_mask = clone_as_usm_host(gpu_ctx_, *visual_pos_mask);
+                text_request_.set_tensor(models::Qwen3_5TextIO::kVisualEmbeds, usm_vis);
+                text_request_.set_tensor(models::Qwen3_5TextIO::kVisualPosMask, usm_vis_mask);
+            } else if (model_.compiled_vision()) {
+                const auto hidden = static_cast<size_t>(model_.config().text.hidden_size);
+                const auto seq = static_cast<size_t>(prompt_len);
+                auto zero_vis = make_usm_host_tensor(gpu_ctx_, ov::element::f32,
+                                                      {kBatch, seq, hidden});
+                std::memset(zero_vis.data(), 0, zero_vis.get_byte_size());
+                auto zero_mask = make_usm_host_tensor(gpu_ctx_, ov::element::boolean,
+                                                       {kBatch, seq});
+                std::memset(zero_mask.data(), 0, zero_mask.get_byte_size());
+                text_request_.set_tensor(models::Qwen3_5TextIO::kVisualEmbeds, zero_vis);
+                text_request_.set_tensor(models::Qwen3_5TextIO::kVisualPosMask, zero_mask);
+            }
+
+            text_request_.infer();
         }
 
-        const auto prefill_start = std::chrono::steady_clock::now();
-        text_request_.infer();
         const auto prefill_end = std::chrono::steady_clock::now();
 
         ov::Tensor logits = text_request_.get_tensor(models::Qwen3_5TextIO::kLogits);
@@ -655,6 +733,7 @@ struct Session::Impl {
         result.prompt_tokens = static_cast<int>(prompt_len);
         result.generated_tokens = static_cast<int>(result.token_ids.size());
         result.thinking_tokens = thinking_tokens;
+        result.prefix_cached_tokens = use_prefix_cache ? static_cast<int>(prefix_match) : 0;
         result.prefill_ms = elapsed_ms(prefill_start, prefill_end);
         result.decode_ms = elapsed_ms(decode_start, decode_end);
         result.ttft_ms = result.prefill_ms;
@@ -695,6 +774,24 @@ struct Session::Impl {
         auto tool_flush = tool_call_parser_.flush();
         // (tool calls already in result via accumulated_content)
 
+        // ─── Update prefix cache ───
+        // Store all tokens currently in the KV cache (prompt + decoded tokens).
+        // decode_steps tokens were fed during decode; the last token in
+        // result.token_ids is the stop/final token that was NOT fed.
+        if (!use_vl) {
+            cached_token_ids_.clear();
+            cached_token_ids_.reserve(static_cast<size_t>(past_len_));
+            cached_token_ids_.assign(prompt_data, prompt_data + prompt_len);
+            for (size_t i = 0; i < decode_steps; ++i) {
+                cached_token_ids_.push_back(result.token_ids[i]);
+            }
+            cache_valid_ = true;
+        } else {
+            // VL requests invalidate prefix cache (image embeddings differ)
+            cache_valid_ = false;
+            cached_token_ids_.clear();
+        }
+
         // Notify FINISH
         if (callback) {
             StreamChunk chunk;
@@ -703,6 +800,7 @@ struct Session::Impl {
             chunk.prompt_tokens = result.prompt_tokens;
             chunk.generated_tokens = result.generated_tokens;
             chunk.thinking_tokens = result.thinking_tokens;
+            chunk.prefix_cached_tokens = result.prefix_cached_tokens;
             chunk.prefill_ms = result.prefill_ms;
             chunk.decode_ms = result.decode_ms;
             chunk.ttft_ms = result.ttft_ms;
@@ -748,6 +846,10 @@ GenerateResult Session::generate(const std::string& prompt,
         return result;
     } catch (...) {
         impl_->is_generating_.store(false);
+        impl_->cache_valid_ = false;
+        impl_->cached_token_ids_.clear();
+        impl_->text_request_.reset_state();
+        impl_->past_len_ = 0;
         throw;
     }
 }
@@ -785,6 +887,10 @@ GenerateResult Session::generate_vl(const std::string& prompt,
         return result;
     } catch (...) {
         impl_->is_generating_.store(false);
+        impl_->cache_valid_ = false;
+        impl_->cached_token_ids_.clear();
+        impl_->text_request_.reset_state();
+        impl_->past_len_ = 0;
         throw;
     }
 }
@@ -797,6 +903,8 @@ void Session::reset() {
     impl_->text_request_.reset_state();
     impl_->past_len_ = 0;
     impl_->generated_ids_.clear();
+    impl_->cached_token_ids_.clear();
+    impl_->cache_valid_ = false;
 }
 
 void Session::warmup(int max_seq_len) {
@@ -920,6 +1028,8 @@ void Session::warmup(int max_seq_len) {
 
     impl_->past_len_ = 0;
     impl_->generated_ids_.clear();
+    impl_->cached_token_ids_.clear();
+    impl_->cache_valid_ = false;
 }
 
 void Session::recreate() {

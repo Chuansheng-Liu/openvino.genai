@@ -180,7 +180,7 @@ public:
     }
 
     void release(Session* s) {
-        s->reset();
+        // Don't call s->reset() — preserve KV cache for prefix reuse.
         std::lock_guard<std::mutex> lock(mu_);
         available_.push(s);
         cv_.notify_one();
@@ -470,6 +470,8 @@ static json build_chat_response(const std::string& id, const std::string& model,
     perf["prefill_ms"] = std::round(result.prefill_ms * 100.0) / 100.0;
     perf["decode_ms"] = std::round(result.decode_ms * 100.0) / 100.0;
     perf["throughput_tps"] = std::round(result.throughput * 100.0) / 100.0;
+    if (result.prefix_cached_tokens > 0)
+        perf["prefix_cached_tokens"] = result.prefix_cached_tokens;
     usage["performance"] = perf;
 
     json resp;
@@ -803,6 +805,8 @@ int main(int argc, char* argv[]) {
                                 perf["prefill_ms"] = std::round(sc.prefill_ms * 100.0) / 100.0;
                                 perf["decode_ms"] = std::round(sc.decode_ms * 100.0) / 100.0;
                                 perf["throughput_tps"] = std::round(sc.throughput * 100.0) / 100.0;
+                                if (sc.prefix_cached_tokens > 0)
+                                    perf["prefix_cached_tokens"] = sc.prefix_cached_tokens;
                                 usage["performance"] = perf;
                                 fc["usage"] = usage;
 
@@ -818,7 +822,11 @@ int main(int argc, char* argv[]) {
                                               << ", ttft=" << std::round(sc.ttft_ms * 10.0) / 10.0 << "ms"
                                               << ", throughput=" << std::round(sc.throughput * 10.0) / 10.0 << " t/s"
                                               << ", prefill=" << std::round(sc.prefill_ms * 10.0) / 10.0 << "ms"
-                                              << ", decode=" << std::round(sc.decode_ms * 10.0) / 10.0 << "ms\n";
+                                              << ", decode=" << std::round(sc.decode_ms * 10.0) / 10.0 << "ms"
+                                              << (sc.prefix_cached_tokens > 0
+                                                  ? ", cache_hit=" + std::to_string(sc.prefix_cached_tokens) + " tokens"
+                                                  : "")
+                                              << "\n";
                                 }
                             }
                             return true;  // continue generating
@@ -892,7 +900,11 @@ int main(int argc, char* argv[]) {
                               << ", ttft=" << std::round(result.ttft_ms * 10.0) / 10.0 << "ms"
                               << ", throughput=" << std::round(result.throughput * 10.0) / 10.0 << " t/s"
                               << ", prefill=" << std::round(result.prefill_ms * 10.0) / 10.0 << "ms"
-                              << ", decode=" << std::round(result.decode_ms * 10.0) / 10.0 << "ms\n";
+                              << ", decode=" << std::round(result.decode_ms * 10.0) / 10.0 << "ms"
+                              << (result.prefix_cached_tokens > 0
+                                  ? ", cache_hit=" + std::to_string(result.prefix_cached_tokens) + " tokens"
+                                  : "")
+                              << "\n";
                 }
             }
         } catch (const std::exception& e) {
@@ -993,6 +1005,8 @@ int main(int argc, char* argv[]) {
             perf["prefill_ms"] = std::round(result.prefill_ms * 100.0) / 100.0;
             perf["decode_ms"] = std::round(result.decode_ms * 100.0) / 100.0;
             perf["throughput_tps"] = std::round(result.throughput * 100.0) / 100.0;
+            if (result.prefix_cached_tokens > 0)
+                perf["prefix_cached_tokens"] = result.prefix_cached_tokens;
             usage["performance"] = perf;
             resp["usage"] = usage;
 

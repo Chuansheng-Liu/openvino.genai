@@ -65,6 +65,7 @@ struct StreamChunk {
     int prompt_tokens = 0;
     int generated_tokens = 0;
     int thinking_tokens = 0;
+    int prefix_cached_tokens = 0;
     double prefill_ms = 0.0;
     double decode_ms = 0.0;
     double ttft_ms = 0.0;
@@ -82,6 +83,7 @@ struct GenerateResult {
     int prompt_tokens = 0;
     int generated_tokens = 0;
     int thinking_tokens = 0;
+    int prefix_cached_tokens = 0;
     double prefill_ms = 0.0;
     double decode_ms = 0.0;
     double ttft_ms = 0.0;
