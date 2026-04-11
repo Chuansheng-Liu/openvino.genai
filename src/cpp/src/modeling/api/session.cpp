@@ -105,6 +105,7 @@ struct Session::Impl {
     // Prefix cache: token IDs currently backed by the KV cache
     std::vector<int64_t> cached_token_ids_;
     bool cache_valid_ = false;
+    int64_t last_vl_image_tokens_ = 0;  // image_pad count from last VL request
 
     // Sampling scratch
     std::vector<float> logit_buf_;
@@ -221,6 +222,22 @@ struct Session::Impl {
             add_special = false;
         }
 
+        // Expand historical <|vision_start|><|vision_end|> markers with image_pad
+        // tokens so that tokenization matches the cached VL request's token IDs.
+        if (last_vl_image_tokens_ > 0) {
+            const std::string marker = "<|vision_start|><|vision_end|>";
+            size_t pos = 0;
+            while ((pos = final_prompt.find(marker, pos)) != std::string::npos) {
+                std::string expansion = "<|vision_start|>";
+                for (int64_t i = 0; i < last_vl_image_tokens_; ++i) {
+                    expansion += "<|image_pad|>";
+                }
+                expansion += "<|vision_end|>";
+                final_prompt.replace(pos, marker.size(), expansion);
+                pos += expansion.size();
+            }
+        }
+
         auto result = tok->encode(final_prompt, ov::genai::add_special_tokens(add_special));
         return {result.input_ids, result.attention_mask};
     }
@@ -240,6 +257,9 @@ struct Session::Impl {
         const auto& cfg = model_.config();
         const int64_t image_tokens = models::Qwen3_5VisionPreprocessor::count_visual_tokens(
             grid_thw, cfg.vision.spatial_merge_size);
+
+        // Store for text follow-ups to expand historical vision markers
+        last_vl_image_tokens_ = image_tokens;
 
         std::string vl_prompt;
         if (raw_prompt) {
@@ -812,10 +832,6 @@ struct Session::Impl {
         // Store all tokens currently in the KV cache (prompt + decoded tokens).
         // decode_steps tokens were fed during decode; the last token in
         // result.token_ids is the stop/final token that was NOT fed.
-        // Both text and VL requests save the cache.  A subsequent text request
-        // can reuse the KV entries (including image-pad positions computed from
-        // real image embeddings).  Only a new VL request must invalidate and
-        // do a full reset (different image → different embeddings).
         cached_token_ids_.clear();
         cached_token_ids_.reserve(static_cast<size_t>(past_len_));
         cached_token_ids_.assign(prompt_data, prompt_data + prompt_len);
@@ -937,6 +953,7 @@ void Session::reset() {
     impl_->generated_ids_.clear();
     impl_->cached_token_ids_.clear();
     impl_->cache_valid_ = false;
+    impl_->last_vl_image_tokens_ = 0;
 }
 
 void Session::warmup(int max_seq_len) {
