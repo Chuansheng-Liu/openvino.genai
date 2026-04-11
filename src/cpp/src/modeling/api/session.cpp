@@ -124,6 +124,9 @@ struct Session::Impl {
     ThinkingTracker thinking_tracker_;
     ToolCallParser tool_call_parser_;
 
+    // Cached </think> token ID for no-thinking stop (resolved once at init)
+    int64_t think_close_token_id_ = -1;
+
     static constexpr size_t kBatch = 1;
 
     /// Create/recreate InferRequest and all GPU-context-backed tensors.
@@ -161,6 +164,13 @@ struct Session::Impl {
         // Initialize token processor if tokenizer available
         if (model_.tokenizer()) {
             token_processor_.emplace(*model_.tokenizer());
+
+            // Resolve </think> token ID once for no-thinking stop
+            auto vocab = model_.tokenizer()->get_vocab();
+            auto it = vocab.find("</think>");
+            if (it != vocab.end()) {
+                think_close_token_id_ = it->second;
+            }
         }
     }
 
@@ -552,7 +562,15 @@ struct Session::Impl {
         generated.reserve(static_cast<size_t>(params.max_new_tokens));
         generated.push_back(next_id);
 
-        const auto& stop_ids = model_.stop_token_ids();
+        const auto& model_stop_ids = model_.stop_token_ids();
+        // When thinking is disabled, also stop on </think> token to prevent
+        // the model from generating a rogue thinking block.
+        std::set<int64_t> stop_ids_local;
+        if (!params.enable_thinking && think_close_token_id_ >= 0) {
+            stop_ids_local = model_stop_ids;
+            stop_ids_local.insert(think_close_token_id_);
+        }
+        const auto& stop_ids = stop_ids_local.empty() ? model_stop_ids : stop_ids_local;
         past_len_ = compute_past_len(attention_mask);
         rope_deltas_ = rope_deltas;
         const int64_t* rope_data = rope_deltas_.data<const int64_t>();
@@ -664,6 +682,8 @@ struct Session::Impl {
         const auto decode_start = std::chrono::steady_clock::now();
 
         for (int step = 1; step < params.max_new_tokens && !stop_requested_.load(); ++step) {
+            // Check if the token from the previous step (or prefill) is a stop token.
+            // Important: check BEFORE feeding it to the KV cache.
             if (!stop_ids.empty() && stop_ids.count(next_id) > 0) {
                 break;
             }
@@ -705,10 +725,19 @@ struct Session::Impl {
                               : argmax_f32(logit_buf_);
             }
             penalty_processor.register_new_generated_token(next_id);
-            generated.push_back(next_id);
-            penalty_processor.update_generated_len(generated.size());
             decode_steps += 1;
             past_len_ += 1;
+
+            // Check stop tokens immediately after sampling, before pushing
+            // to generated. The token that was FED this step is already in
+            // the KV cache (past_len_ incremented above), but the newly
+            // sampled stop token itself is NOT pushed to generated/cached.
+            if (!stop_ids.empty() && stop_ids.count(next_id) > 0) {
+                break;
+            }
+
+            generated.push_back(next_id);
+            penalty_processor.update_generated_len(generated.size());
 
             // Detect degenerate output and force stop:
             // 1) N consecutive identical tokens (e.g. "!!!!!!!")
@@ -836,15 +865,6 @@ struct Session::Impl {
                 if (!emit_text(delta, next_id)) {
                     stop_requested_.store(true);
                 }
-
-                // When thinking is disabled but the model still emits an
-                // orphan </think> (common with long max_tokens), the tracker
-                // transitions to AFTER_THINKING.  Stop immediately so the
-                // duplicate content that follows </think> is never generated.
-                if (!params.enable_thinking &&
-                    thinking_tracker_.state() == ThinkingState::AFTER_THINKING) {
-                    stop_requested_.store(true);
-                }
             } else if (callback) {
                 StreamChunk chunk;
                 chunk.event = StreamEvent::TOKEN;
@@ -856,10 +876,8 @@ struct Session::Impl {
         }
         const auto decode_end = std::chrono::steady_clock::now();
 
-        // Flush remaining buffered text (skip if we stopped due to orphan </think>)
-        if (token_processor_ && !(stop_requested_.load() &&
-                !params.enable_thinking &&
-                thinking_tracker_.state() == ThinkingState::AFTER_THINKING)) {
+        // Flush remaining buffered text
+        if (token_processor_) {
             std::string remaining = token_processor_->flush();
             if (!remaining.empty()) {
                 emit_text(remaining, -1);
@@ -905,13 +923,7 @@ struct Session::Impl {
                 result.thinking_text = tr.thinking_text;
                 result.text = tr.content_text;
             } else {
-                // Thinking disabled — strip orphan </think> and everything after
-                auto close_pos = full_text.find("</think>");
-                if (close_pos != std::string::npos) {
-                    result.text = full_text.substr(0, close_pos);
-                } else {
-                    result.text = full_text;
-                }
+                result.text = full_text;
             }
         }
 
