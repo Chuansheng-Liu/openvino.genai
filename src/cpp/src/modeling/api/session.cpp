@@ -211,7 +211,11 @@ struct Session::Impl {
             req.set_tensor(models::Qwen3_5VisionIO::kRotarySin, inputs.rotary_sin);
             req.infer();
 
-            ov::Tensor embeds = req.get_tensor(models::Qwen3_5VisionIO::kVisualEmbeds);
+            // Deep-copy: get_tensor returns a reference to the request's internal
+            // buffer which gets overwritten on the next infer() call.
+            ov::Tensor ref = req.get_tensor(models::Qwen3_5VisionIO::kVisualEmbeds);
+            ov::Tensor embeds(ref.get_element_type(), ref.get_shape());
+            std::memcpy(embeds.data(), ref.data(), ref.get_byte_size());
             const auto* g = inputs.grid_thw.data<const int64_t>();
             results.push_back({embeds, g[0], g[1], g[2]});
         }
