@@ -810,7 +810,7 @@ int main(int argc, char* argv[]) {
                                     c["delta"] = d;
                                     tc["choices"] = json::array({c});
                                     std::string s = sse_chunk(tc);
-                                    sink.write(s.c_str(), s.size());
+                                    if (!sink.write(s.c_str(), s.size())) return false;
                                 } else {
                                     // Content text — run through tool parser
                                     auto pr = tool_parser.process(sc.token_text);
@@ -827,7 +827,7 @@ int main(int argc, char* argv[]) {
                                         c["delta"] = d;
                                         tc["choices"] = json::array({c});
                                         std::string s = sse_chunk(tc);
-                                        sink.write(s.c_str(), s.size());
+                                        if (!sink.write(s.c_str(), s.size())) return false;
                                     }
                                 }
                             } else if (sc.event == StreamEvent::FINISH) {
@@ -1280,7 +1280,7 @@ int main(int argc, char* argv[]) {
                                 chunk["message"] = msg;
                                 chunk["done"] = false;
                                 std::string line = chunk.dump() + "\n";
-                                sink.write(line.c_str(), line.size());
+                                if (!sink.write(line.c_str(), line.size())) return false;
                             }
                         } else if (sc.event == StreamEvent::FINISH) {
                             json done_chunk;
@@ -1425,7 +1425,7 @@ int main(int argc, char* argv[]) {
                                 chunk["response"] = sc.token_text;
                                 chunk["done"] = false;
                                 std::string line = chunk.dump() + "\n";
-                                sink.write(line.c_str(), line.size());
+                                if (!sink.write(line.c_str(), line.size())) return false;
                             }
                         } else if (sc.event == StreamEvent::FINISH) {
                             json done_chunk;
