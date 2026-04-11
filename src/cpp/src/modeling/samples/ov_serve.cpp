@@ -142,14 +142,14 @@ struct ServerConfig {
     bool enable_thinking = true;
     bool enable_vision = false;
     int max_tokens_default = 2048;
-    float repetition_penalty = 1.5f;  // Launcher default for safer anti-repetition
-    float presence_penalty = 0.0f;    // OpenAI default; rep_penalty handles repetition
-    float frequency_penalty = 0.0f;   // 0 = off; >0 penalizes tokens by occurrence count
-    float temperature = 0.7f;         // Recommended default for chat-like generation
-    float top_p = 0.8f;               // Recommended nucleus sampling default
-    size_t top_k = 20;                // Conservative token candidate pool
+    float repetition_penalty = 1.0f;  // 1.0 = no penalty
+    float presence_penalty = 0.0f;    // 0.0 = off
+    float frequency_penalty = 0.0f;   // 0.0 = off
+    float temperature = 0.7f;         // standard default
+    float top_p = 0.95f;              // standard default
+    size_t top_k = 0;                 // 0 = disabled (no top-k filtering)
     float min_temperature = 0.0f;     // 0 = no override; set via --min-temp
-    int warmup_tokens = 4096;         // 0 = disable warmup
+    int warmup_tokens = 0;            // 0 = disable warmup
     bool enable_logging = true;       // Log prompts and request params to stderr
 };
 
@@ -267,13 +267,15 @@ static ParsedRequest parse_chat_request(const json& body, ov::genai::Tokenizer& 
         req.tools = body["tools"].get<std::vector<json>>();
     }
 
-    // Build prompt using the tokenizer's chat template so serving matches
-    // the model's native formatting instead of hand-crafted ChatML.
+    // Build prompt: use native chat template for text-only requests;
+    // for VL (image) requests, construct ChatML manually so that
+    // tokenize_vl can expand <|vision_start|><|vision_end|> markers
+    // with the correct pad count based on the actual image grid_thw.
     auto messages = body.at("messages");
+
+    // First pass: extract images from multimodal content arrays
     for (const auto& msg : messages) {
-        if (!msg.contains("content") || !msg["content"].is_array()) {
-            continue;
-        }
+        if (!msg.contains("content") || !msg["content"].is_array()) continue;
         for (const auto& part : msg["content"]) {
             if (part.value("type", "") == "image_url") {
                 auto url = part.at("image_url").at("url").get<std::string>();
@@ -282,13 +284,51 @@ static ParsedRequest parse_chat_request(const json& body, ov::genai::Tokenizer& 
         }
     }
 
-    ov::genai::ChatHistory history(ov::genai::JsonContainer::from_json_string(messages.dump()));
-    if (!req.tools.empty()) {
-        history.set_tools(ov::genai::JsonContainer::from_json_string(body["tools"].dump()));
+    if (req.images.empty()) {
+        // Text-only: use native chat template
+        ov::genai::ChatHistory history(ov::genai::JsonContainer::from_json_string(messages.dump()));
+        if (!req.tools.empty()) {
+            history.set_tools(ov::genai::JsonContainer::from_json_string(body["tools"].dump()));
+        }
+        ov::genai::JsonContainer extra({{"enable_thinking", cfg.enable_thinking}});
+        req.prompt = tokenizer.apply_chat_template(history, true, {}, std::nullopt, extra);
+    } else {
+        // VL: manual ChatML with vision markers so tokenize_vl can
+        // expand them to the correct number of <|image_pad|> tokens.
+        std::string chat_text;
+        for (const auto& msg : messages) {
+            std::string role = msg.at("role").get<std::string>();
+            std::string content;
+            if (msg.contains("content")) {
+                if (msg["content"].is_string()) {
+                    content = msg["content"].get<std::string>();
+                } else if (msg["content"].is_array()) {
+                    std::string text_parts;
+                    std::string vision_markers;
+                    for (const auto& part : msg["content"]) {
+                        std::string pt = part.value("type", "");
+                        if (pt == "text") {
+                            if (!text_parts.empty()) text_parts += "\n";
+                            text_parts += part.at("text").get<std::string>();
+                        } else if (pt == "image_url") {
+                            vision_markers += "<|vision_start|><|vision_end|>";
+                        }
+                    }
+                    content = vision_markers + text_parts;
+                } else if (msg["content"].is_null()) {
+                    content = "";
+                }
+            }
+            chat_text += "<|im_start|>" + role + "\n" + content + "<|im_end|>\n";
+        }
+        chat_text += "<|im_start|>assistant\n";
+        if (cfg.enable_thinking) {
+            chat_text += "<think>\n";
+        } else {
+            chat_text += "<think>\n</think>\n\n";
+        }
+        req.prompt = chat_text;
     }
-
-    ov::genai::JsonContainer extra({{"enable_thinking", cfg.enable_thinking}});
-    req.prompt = tokenizer.apply_chat_template(history, true, {}, std::nullopt, extra);
 
     // Log the constructed prompt (truncated) if logging enabled
     if (cfg.enable_logging) {
@@ -408,6 +448,13 @@ static json build_chat_response(const std::string& id, const std::string& model,
     usage["completion_tokens"] = result.generated_tokens;
     usage["total_tokens"] = result.prompt_tokens + result.generated_tokens;
 
+    json perf;
+    perf["ttft_ms"] = std::round(result.ttft_ms * 100.0) / 100.0;
+    perf["prefill_ms"] = std::round(result.prefill_ms * 100.0) / 100.0;
+    perf["decode_ms"] = std::round(result.decode_ms * 100.0) / 100.0;
+    perf["throughput_tps"] = std::round(result.throughput * 100.0) / 100.0;
+    usage["performance"] = perf;
+
     json resp;
     resp["id"] = id;
     resp["object"] = "chat.completion";
@@ -462,18 +509,18 @@ static std::string sse_done() {
 static void print_usage() {
     std::cerr << "Usage: ov_serve --model <path> [--port 8080] [--host 0.0.0.0] "
                  "[--workers 1] [--device GPU] [--vl] [--no-thinking] [--temperature 0.7] "
-                 "[--top-p 0.8] [--top-k 20] [--rep-penalty 1.5]\n"
+                 "[--top-p 0.95] [--top-k 0] [--rep-penalty 1.0]\n"
                  "\n"
-                  "  --vl              Enable vision-language (load vision encoder)\n"
-                  "  --no-thinking     Disable thinking mode\n"
-                  "  --temperature     Default temperature when request omits it (default: 0.7)\n"
-                  "  --top-p           Default top-p when request omits it (default: 0.8)\n"
-                  "  --top-k           Default top-k when request omits it (default: 20)\n"
-                  "  --rep-penalty     Repetition penalty (default: 1.5)\n"
-                  "  --pres-penalty    Presence penalty (default: 0.0)\n"
-                  "  --freq-penalty    Frequency penalty (default: 0.0)\n"
-                  "  --min-temp        Minimum temperature floor (default: 0, no override)\n"
-                 "  --warmup-tokens   Max sequence length for GPU warmup (default: 4096, 0=disable)\n"
+                 "  --vl              Enable vision-language (load vision encoder)\n"
+                 "  --no-thinking     Disable thinking mode\n"
+                 "  --temperature     Default temperature (default: 0.7)\n"
+                 "  --top-p           Default top-p (default: 0.95)\n"
+                 "  --top-k           Default top-k (default: 0, disabled)\n"
+                 "  --rep-penalty     Repetition penalty (default: 1.0, no penalty)\n"
+                 "  --pres-penalty    Presence penalty (default: 0.0)\n"
+                 "  --freq-penalty    Frequency penalty (default: 0.0)\n"
+                 "  --min-temp        Minimum temperature floor (default: 0, no override)\n"
+                 "  --warmup-tokens   Max sequence length for GPU warmup (default: 0, disabled)\n"
                  "  --no-log          Disable request/prompt logging to stderr\n";
 }
 
@@ -552,13 +599,14 @@ int main(int argc, char* argv[]) {
     });
 
     // Model list
-    svr.Get("/v1/models", [&model_name](const httplib::Request&, httplib::Response& res) {
+    svr.Get("/v1/models", [&model_name, &loader](const httplib::Request&, httplib::Response& res) {
         json resp;
         resp["object"] = "list";
         json model;
         model["id"] = model_name;
         model["object"] = "model";
         model["owned_by"] = "openvino";
+        model["max_context_length"] = loader.config().text.max_position_embeddings;
         resp["data"] = json::array({model});
         res.set_content(resp.dump(), "application/json");
     });
@@ -620,12 +668,8 @@ int main(int argc, char* argv[]) {
                 return;
             }
             if (!parsed.tools.empty()) {
-                res.status = 400;
-                json err;
-                err["error"]["message"] = "Tool calling with images is not supported";
-                err["error"]["type"] = "invalid_request_error";
-                res.set_content(err.dump(), "application/json");
-                return;
+                // Ignore tool definitions for image requests
+                parsed.tools.clear();
             }
         }
 
@@ -654,10 +698,11 @@ int main(int argc, char* argv[]) {
                 auto rid = request_id;
                 auto mn = model_name;
                 auto warmup_tok = cfg.warmup_tokens;
+                auto log = cfg.enable_logging;
 
                 res.set_chunked_content_provider(
                     "text/event-stream",
-                    [&pool, sp = std::move(sp), rid, mn, warmup_tok](size_t /*offset*/,
+                    [&pool, sp = std::move(sp), rid, mn, warmup_tok, log](size_t /*offset*/,
                                                          httplib::DataSink& sink) {
                         // Acquire session inside content provider (lives until lambda ends)
                         WorkerPool::Guard worker(pool);
@@ -743,6 +788,13 @@ int main(int argc, char* argv[]) {
                                 usage["prompt_tokens"] = sc.prompt_tokens;
                                 usage["completion_tokens"] = sc.generated_tokens;
                                 usage["total_tokens"] = sc.prompt_tokens + sc.generated_tokens;
+
+                                json perf;
+                                perf["ttft_ms"] = std::round(sc.ttft_ms * 100.0) / 100.0;
+                                perf["prefill_ms"] = std::round(sc.prefill_ms * 100.0) / 100.0;
+                                perf["decode_ms"] = std::round(sc.decode_ms * 100.0) / 100.0;
+                                perf["throughput_tps"] = std::round(sc.throughput * 100.0) / 100.0;
+                                usage["performance"] = perf;
                                 fc["usage"] = usage;
 
                                 std::string s = sse_chunk(fc);
@@ -750,6 +802,15 @@ int main(int argc, char* argv[]) {
 
                                 std::string done = sse_done();
                                 sink.write(done.c_str(), done.size());
+
+                                if (log) {
+                                    std::cerr << "[ov_serve] " << rid
+                                              << " done: " << sc.generated_tokens << " tokens"
+                                              << ", ttft=" << std::round(sc.ttft_ms * 10.0) / 10.0 << "ms"
+                                              << ", throughput=" << std::round(sc.throughput * 10.0) / 10.0 << " t/s"
+                                              << ", prefill=" << std::round(sc.prefill_ms * 10.0) / 10.0 << "ms"
+                                              << ", decode=" << std::round(sc.decode_ms * 10.0) / 10.0 << "ms\n";
+                                }
                             }
                             return true;  // continue generating
                         };
@@ -815,6 +876,15 @@ int main(int argc, char* argv[]) {
 
                 auto resp = build_chat_response(request_id, model_name, result, pr.tool_calls);
                 res.set_content(resp.dump(), "application/json");
+
+                if (cfg.enable_logging) {
+                    std::cerr << "[ov_serve] " << request_id
+                              << " done: " << result.generated_tokens << " tokens"
+                              << ", ttft=" << std::round(result.ttft_ms * 10.0) / 10.0 << "ms"
+                              << ", throughput=" << std::round(result.throughput * 10.0) / 10.0 << " t/s"
+                              << ", prefill=" << std::round(result.prefill_ms * 10.0) / 10.0 << "ms"
+                              << ", decode=" << std::round(result.decode_ms * 10.0) / 10.0 << "ms\n";
+                }
             }
         } catch (const std::exception& e) {
             res.status = 500;
@@ -908,6 +978,13 @@ int main(int argc, char* argv[]) {
             usage["prompt_tokens"] = result.prompt_tokens;
             usage["completion_tokens"] = result.generated_tokens;
             usage["total_tokens"] = result.prompt_tokens + result.generated_tokens;
+
+            json perf;
+            perf["ttft_ms"] = std::round(result.ttft_ms * 100.0) / 100.0;
+            perf["prefill_ms"] = std::round(result.prefill_ms * 100.0) / 100.0;
+            perf["decode_ms"] = std::round(result.decode_ms * 100.0) / 100.0;
+            perf["throughput_tps"] = std::round(result.throughput * 100.0) / 100.0;
+            usage["performance"] = perf;
             resp["usage"] = usage;
 
             res.set_content(resp.dump(), "application/json");
@@ -1008,7 +1085,7 @@ int main(int argc, char* argv[]) {
     });
 
     // POST /api/show — Show model info (Ollama format)
-    svr.Post("/api/show", [&model_name, &iso_timestamp, &cfg](const httplib::Request&,
+    svr.Post("/api/show", [&model_name, &iso_timestamp, &cfg, &loader](const httplib::Request&,
                                                               httplib::Response& res) {
         json resp;
         resp["modelfile"] = "# OpenVINO GenAI model";
@@ -1024,7 +1101,9 @@ int main(int argc, char* argv[]) {
         details["parameter_size"] = "35B";
         details["quantization_level"] = "INT4";
         resp["details"] = details;
-        resp["model_info"] = json::object();
+        json model_info;
+        model_info["max_context_length"] = loader.config().text.max_position_embeddings;
+        resp["model_info"] = model_info;
         resp["modified_at"] = iso_timestamp();
         res.set_content(resp.dump(), "application/json");
     });
@@ -1125,6 +1204,12 @@ int main(int argc, char* argv[]) {
                                 static_cast<int>(sc.generated_tokens);
                             done_chunk["prompt_eval_count"] =
                                 static_cast<int>(sc.prompt_tokens);
+                            done_chunk["eval_duration"] =
+                                static_cast<int64_t>(sc.decode_ms * 1e6);
+                            done_chunk["prompt_eval_duration"] =
+                                static_cast<int64_t>(sc.prefill_ms * 1e6);
+                            done_chunk["ttft_ms"] = std::round(sc.ttft_ms * 100.0) / 100.0;
+                            done_chunk["throughput_tps"] = std::round(sc.throughput * 100.0) / 100.0;
                             std::string line = done_chunk.dump() + "\n";
                             sink.write(line.c_str(), line.size());
                         }
@@ -1162,6 +1247,10 @@ int main(int argc, char* argv[]) {
                                           ? "length" : "stop";
                 resp["eval_count"] = static_cast<int>(result.generated_tokens);
                 resp["prompt_eval_count"] = static_cast<int>(result.prompt_tokens);
+                resp["eval_duration"] = static_cast<int64_t>(result.decode_ms * 1e6);
+                resp["prompt_eval_duration"] = static_cast<int64_t>(result.prefill_ms * 1e6);
+                resp["ttft_ms"] = std::round(result.ttft_ms * 100.0) / 100.0;
+                resp["throughput_tps"] = std::round(result.throughput * 100.0) / 100.0;
                 res.set_content(resp.dump(), "application/json");
             } catch (const std::exception& e) {
                 res.status = 500;
@@ -1257,6 +1346,12 @@ int main(int argc, char* argv[]) {
                                 static_cast<int>(sc.generated_tokens);
                             done_chunk["prompt_eval_count"] =
                                 static_cast<int>(sc.prompt_tokens);
+                            done_chunk["eval_duration"] =
+                                static_cast<int64_t>(sc.decode_ms * 1e6);
+                            done_chunk["prompt_eval_duration"] =
+                                static_cast<int64_t>(sc.prefill_ms * 1e6);
+                            done_chunk["ttft_ms"] = std::round(sc.ttft_ms * 100.0) / 100.0;
+                            done_chunk["throughput_tps"] = std::round(sc.throughput * 100.0) / 100.0;
                             std::string line = done_chunk.dump() + "\n";
                             sink.write(line.c_str(), line.size());
                         }
@@ -1290,6 +1385,10 @@ int main(int argc, char* argv[]) {
                                           ? "length" : "stop";
                 resp["eval_count"] = static_cast<int>(result.generated_tokens);
                 resp["prompt_eval_count"] = static_cast<int>(result.prompt_tokens);
+                resp["eval_duration"] = static_cast<int64_t>(result.decode_ms * 1e6);
+                resp["prompt_eval_duration"] = static_cast<int64_t>(result.prefill_ms * 1e6);
+                resp["ttft_ms"] = std::round(result.ttft_ms * 100.0) / 100.0;
+                resp["throughput_tps"] = std::round(result.throughput * 100.0) / 100.0;
                 res.set_content(resp.dump(), "application/json");
             } catch (const std::exception& e) {
                 res.status = 500;
