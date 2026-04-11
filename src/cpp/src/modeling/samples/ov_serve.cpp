@@ -284,17 +284,9 @@ static ParsedRequest parse_chat_request(const json& body, ov::genai::Tokenizer& 
         }
     }
 
-    // Only one image supported at the session level.  When multiple are
-    // present (e.g. chat history re-sends old images), keep only the last
-    // one and remember its 0-based index so the prompt builder can place
-    // the vision marker in the right spot.
+    // Multi-image: all images are kept and passed to the session.
+    // Each image gets a <|vision_start|><|vision_end|> marker in the prompt.
     const size_t total_images = req.images.size();
-    const size_t keep_image_idx = total_images > 0 ? total_images - 1 : 0;
-    if (total_images > 1) {
-        auto last = std::move(req.images.back());
-        req.images.clear();
-        req.images.push_back(std::move(last));
-    }
 
     // Prepend thinking tags to historical assistant messages so that the
     // tokenized prompt matches what was originally generated (the model's
@@ -316,9 +308,11 @@ static ParsedRequest parse_chat_request(const json& body, ov::genai::Tokenizer& 
     }
 
     if (req.images.empty()) {
-        // Text-only: build ChatML manually (same as VL path but without
-        // vision markers) so that we can control thinking tag placement
-        // for prefix cache compatibility.
+        // Text-only: build ChatML manually (same as VL path but with
+        // vision markers for historical images) so that we can control
+        // thinking tag placement for prefix cache compatibility.
+        // Historical image markers will be expanded by tokenize_text using
+        // stored per-image pad counts.
         std::string chat_text;
         for (const auto& msg : messages) {
             std::string role = msg.at("role").get<std::string>();
@@ -326,6 +320,20 @@ static ParsedRequest parse_chat_request(const json& body, ov::genai::Tokenizer& 
             if (msg.contains("content")) {
                 if (msg["content"].is_string()) {
                     content = msg["content"].get<std::string>();
+                } else if (msg["content"].is_array()) {
+                    // Extract text and add vision markers for historical images
+                    std::string text_parts;
+                    std::string vision_markers;
+                    for (const auto& part : msg["content"]) {
+                        std::string pt = part.value("type", "");
+                        if (pt == "text") {
+                            if (!text_parts.empty()) text_parts += "\n";
+                            text_parts += part.at("text").get<std::string>();
+                        } else if (pt == "image_url") {
+                            vision_markers += "<|vision_start|><|vision_end|>";
+                        }
+                    }
+                    content = vision_markers + text_parts;
                 } else if (msg["content"].is_null()) {
                     content = "";
                 }
@@ -342,9 +350,8 @@ static ParsedRequest parse_chat_request(const json& body, ov::genai::Tokenizer& 
     } else {
         // VL: manual ChatML with vision markers so tokenize_vl can
         // expand them to the correct number of <|image_pad|> tokens.
-        // Only emit the vision marker for the image we actually kept.
+        // Emit a vision marker for EVERY image_url in the conversation.
         std::string chat_text;
-        size_t image_counter = 0;  // tracks which image_url we're visiting
         for (const auto& msg : messages) {
             std::string role = msg.at("role").get<std::string>();
             std::string content;
@@ -353,20 +360,17 @@ static ParsedRequest parse_chat_request(const json& body, ov::genai::Tokenizer& 
                     content = msg["content"].get<std::string>();
                 } else if (msg["content"].is_array()) {
                     std::string text_parts;
-                    std::string vision_marker;
+                    std::string vision_markers;
                     for (const auto& part : msg["content"]) {
                         std::string pt = part.value("type", "");
                         if (pt == "text") {
                             if (!text_parts.empty()) text_parts += "\n";
                             text_parts += part.at("text").get<std::string>();
                         } else if (pt == "image_url") {
-                            if (image_counter == keep_image_idx) {
-                                vision_marker = "<|vision_start|><|vision_end|>";
-                            }
-                            ++image_counter;
+                            vision_markers += "<|vision_start|><|vision_end|>";
                         }
                     }
-                    content = vision_marker + text_parts;
+                    content = vision_markers + text_parts;
                 } else if (msg["content"].is_null()) {
                     content = "";
                 }
@@ -869,7 +873,7 @@ int main(int argc, char* argv[]) {
 
                         try {
                             if (!sp.images.empty()) {
-                                session->generate_vl(sp.prompt, sp.images[0],
+                                session->generate_vl(sp.prompt, sp.images,
                                                      sp.params, callback);
                             } else {
                                 session->generate(sp.prompt, sp.params, callback);
@@ -901,7 +905,7 @@ int main(int argc, char* argv[]) {
                 GenerateResult result;
                 auto do_generate = [&]() {
                     if (!parsed.images.empty()) {
-                        return session->generate_vl(parsed.prompt, parsed.images[0],
+                        return session->generate_vl(parsed.prompt, parsed.images,
                                                     parsed.params);
                     } else {
                         return session->generate(parsed.prompt, parsed.params);

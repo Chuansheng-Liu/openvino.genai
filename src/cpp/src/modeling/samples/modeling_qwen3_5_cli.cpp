@@ -157,7 +157,7 @@ int main(int argc, char* argv[]) try {
             return 1;
         }
         ov::Tensor image = utils::load_image(opts.image_path);
-        result = session.generate_vl(opts.prompt, image, gen_params);
+        result = session.generate_vl(opts.prompt, {image}, gen_params);
     } else {
         result = session.generate(opts.prompt, gen_params);
     }

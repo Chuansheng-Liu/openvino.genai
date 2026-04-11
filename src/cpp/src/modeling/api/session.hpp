@@ -38,9 +38,9 @@ public:
                             const GenerateParams& params = {},
                             StreamCallback callback = nullptr);
 
-    /// VL generation with an image tensor. Image should be HWC uint8.
+    /// VL generation with image tensor(s). Each image should be HWC uint8.
     GenerateResult generate_vl(const std::string& prompt,
-                               const ov::Tensor& image,
+                               const std::vector<ov::Tensor>& images,
                                const GenerateParams& params = {},
                                StreamCallback callback = nullptr);
 

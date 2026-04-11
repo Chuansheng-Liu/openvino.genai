@@ -105,7 +105,7 @@ struct Session::Impl {
     // Prefix cache: token IDs currently backed by the KV cache
     std::vector<int64_t> cached_token_ids_;
     bool cache_valid_ = false;
-    int64_t last_vl_image_tokens_ = 0;  // image_pad count from last VL request
+    std::vector<int64_t> last_vl_image_token_counts_;  // per-image pad counts from last VL request
 
     // Sampling scratch
     std::vector<float> logit_buf_;
@@ -178,26 +178,72 @@ struct Session::Impl {
         return active;
     }
 
-    /// Run vision encoder to produce visual embeddings.
-    std::pair<ov::Tensor, ov::Tensor> encode_vision(const ov::Tensor& image) {
+    /// Run vision encoder for multiple images, producing concatenated embeddings.
+    /// Returns (visual_embeds [1, total_tokens, hidden], grid_thw [N, 3]).
+    std::pair<ov::Tensor, ov::Tensor> encode_vision(const std::vector<ov::Tensor>& images) {
         if (!vision_request_.has_value()) {
             throw std::runtime_error("Vision model not available");
+        }
+        if (images.empty()) {
+            throw std::runtime_error("No images provided");
         }
 
         const auto& cfg = model_.config();
         models::Qwen3_5VisionPreprocessor preprocessor(cfg.vision, model_.preprocess_config());
-        auto inputs = preprocessor.preprocess(image, model_.pos_embed_weight());
 
-        auto& req = *vision_request_;
-        req.set_tensor(models::Qwen3_5VisionIO::kPixelValues, inputs.pixel_values);
-        req.set_tensor(models::Qwen3_5VisionIO::kGridThw, inputs.grid_thw);
-        req.set_tensor(models::Qwen3_5VisionIO::kPosEmbeds, inputs.pos_embeds);
-        req.set_tensor(models::Qwen3_5VisionIO::kRotaryCos, inputs.rotary_cos);
-        req.set_tensor(models::Qwen3_5VisionIO::kRotarySin, inputs.rotary_sin);
-        req.infer();
+        // Process each image separately (they may have different resolutions).
+        // Vision encoder returns [V_i, H] (2D) per image.
+        struct ImageResult {
+            ov::Tensor embeds;  // [V_i, hidden]
+            int64_t grid_t, grid_h, grid_w;
+        };
+        std::vector<ImageResult> results;
+        results.reserve(images.size());
 
-        ov::Tensor visual_embeds = req.get_tensor(models::Qwen3_5VisionIO::kVisualEmbeds);
-        return {visual_embeds, inputs.grid_thw};
+        for (const auto& image : images) {
+            auto inputs = preprocessor.preprocess(image, model_.pos_embed_weight());
+
+            auto& req = *vision_request_;
+            req.set_tensor(models::Qwen3_5VisionIO::kPixelValues, inputs.pixel_values);
+            req.set_tensor(models::Qwen3_5VisionIO::kGridThw, inputs.grid_thw);
+            req.set_tensor(models::Qwen3_5VisionIO::kPosEmbeds, inputs.pos_embeds);
+            req.set_tensor(models::Qwen3_5VisionIO::kRotaryCos, inputs.rotary_cos);
+            req.set_tensor(models::Qwen3_5VisionIO::kRotarySin, inputs.rotary_sin);
+            req.infer();
+
+            ov::Tensor embeds = req.get_tensor(models::Qwen3_5VisionIO::kVisualEmbeds);
+            const auto* g = inputs.grid_thw.data<const int64_t>();
+            results.push_back({embeds, g[0], g[1], g[2]});
+        }
+
+        // Build combined grid_thw [N, 3]
+        ov::Tensor combined_grid(ov::element::i64, {images.size(), 3});
+        auto* gdata = combined_grid.data<int64_t>();
+        size_t total_tokens = 0;
+        for (size_t i = 0; i < results.size(); ++i) {
+            gdata[i * 3 + 0] = results[i].grid_t;
+            gdata[i * 3 + 1] = results[i].grid_h;
+            gdata[i * 3 + 2] = results[i].grid_w;
+            total_tokens += results[i].embeds.get_shape().at(0);  // [V_i, H] → V_i
+        }
+
+        if (results.size() == 1) {
+            return {results[0].embeds, combined_grid};
+        }
+
+        // Concatenate visual_embeds along token dimension: [sum(V_i), hidden]
+        const auto hidden = results[0].embeds.get_shape().at(1);  // [V, H] → H
+        const auto elem_type = results[0].embeds.get_element_type();
+        const auto elem_size = elem_type.size();
+        ov::Tensor combined_embeds(elem_type, {total_tokens, hidden});
+        char* dst = static_cast<char*>(combined_embeds.data());
+        for (const auto& r : results) {
+            const size_t nbytes = r.embeds.get_shape().at(0) * hidden * elem_size;
+            std::memcpy(dst, r.embeds.data(), nbytes);
+            dst += nbytes;
+        }
+
+        return {combined_embeds, combined_grid};
     }
 
     /// Tokenize a text prompt using chat template (or raw if pre-formatted).
@@ -224,17 +270,24 @@ struct Session::Impl {
 
         // Expand historical <|vision_start|><|vision_end|> markers with image_pad
         // tokens so that tokenization matches the cached VL request's token IDs.
-        if (last_vl_image_tokens_ > 0) {
+        // Each marker gets its own pad count from last_vl_image_token_counts_.
+        if (!last_vl_image_token_counts_.empty()) {
             const std::string marker = "<|vision_start|><|vision_end|>";
             size_t pos = 0;
-            while ((pos = final_prompt.find(marker, pos)) != std::string::npos) {
+            size_t img_idx = 0;
+            while ((pos = final_prompt.find(marker, pos)) != std::string::npos
+                   && img_idx < last_vl_image_token_counts_.size()) {
+                const int64_t pad_count = last_vl_image_token_counts_[img_idx];
                 std::string expansion = "<|vision_start|>";
-                for (int64_t i = 0; i < last_vl_image_tokens_; ++i) {
+                expansion.reserve(expansion.size() +
+                                  static_cast<size_t>(pad_count) * 13 + 16);
+                for (int64_t i = 0; i < pad_count; ++i) {
                     expansion += "<|image_pad|>";
                 }
                 expansion += "<|vision_end|>";
                 final_prompt.replace(pos, marker.size(), expansion);
                 pos += expansion.size();
+                ++img_idx;
             }
         }
 
@@ -244,8 +297,9 @@ struct Session::Impl {
 
     /// Tokenize a VL prompt with image token placeholders.
     /// When raw_prompt=true, the prompt is already ChatML-formatted and contains
-    /// <|vision_start|><|vision_end|> as a marker; we expand it with image_pad tokens.
-    /// When raw_prompt=false, build_vl_prompt wraps a plain user message.
+    /// <|vision_start|><|vision_end|> markers; we expand each with its per-image
+    /// pad count from grid_thw.
+    /// When raw_prompt=false, build_vl_prompt wraps a plain user message (single image only).
     std::pair<ov::Tensor, ov::Tensor> tokenize_vl(const std::string& prompt,
                                                     const ov::Tensor& grid_thw,
                                                     bool raw_prompt = false) {
@@ -255,30 +309,50 @@ struct Session::Impl {
         }
 
         const auto& cfg = model_.config();
-        const int64_t image_tokens = models::Qwen3_5VisionPreprocessor::count_visual_tokens(
-            grid_thw, cfg.vision.spatial_merge_size);
+        const auto grid_shape = grid_thw.get_shape();
+        const size_t num_images = grid_shape[0];
+        const int64_t* gdata = grid_thw.data<const int64_t>();
+        const int32_t merge = cfg.vision.spatial_merge_size;
+
+        // Compute per-image token counts
+        std::vector<int64_t> per_image_tokens(num_images);
+        for (size_t i = 0; i < num_images; ++i) {
+            const int64_t t = gdata[i * 3 + 0];
+            const int64_t h = gdata[i * 3 + 1];
+            const int64_t w = gdata[i * 3 + 2];
+            per_image_tokens[i] = t * (h / merge) * (w / merge);
+        }
 
         // Store for text follow-ups to expand historical vision markers
-        last_vl_image_tokens_ = image_tokens;
+        last_vl_image_token_counts_ = per_image_tokens;
 
         std::string vl_prompt;
         if (raw_prompt) {
-            // Expand <|vision_start|><|vision_end|> marker with image_pad tokens
+            // Expand ALL <|vision_start|><|vision_end|> markers, each with its
+            // own pad count based on the corresponding image's grid_thw.
             vl_prompt = prompt;
             const std::string marker = "<|vision_start|><|vision_end|>";
-            auto pos = vl_prompt.find(marker);
-            if (pos != std::string::npos) {
+            size_t pos = 0;
+            size_t img_idx = 0;
+            while ((pos = vl_prompt.find(marker, pos)) != std::string::npos
+                   && img_idx < per_image_tokens.size()) {
+                const int64_t pad_count = per_image_tokens[img_idx];
                 std::string expansion = "<|vision_start|>";
                 expansion.reserve(expansion.size() +
-                                  static_cast<size_t>(image_tokens) * 13 + 16);
-                for (int64_t i = 0; i < image_tokens; ++i) {
+                                  static_cast<size_t>(pad_count) * 13 + 16);
+                for (int64_t i = 0; i < pad_count; ++i) {
                     expansion += "<|image_pad|>";
                 }
                 expansion += "<|vision_end|>";
                 vl_prompt.replace(pos, marker.size(), expansion);
+                pos += expansion.size();
+                ++img_idx;
             }
         } else {
-            vl_prompt = build_vl_prompt(prompt, image_tokens);
+            // Single image fallback (non-raw prompt)
+            const int64_t total_tokens = models::Qwen3_5VisionPreprocessor::count_visual_tokens(
+                grid_thw, merge);
+            vl_prompt = build_vl_prompt(prompt, total_tokens);
         }
         auto result = tok->encode(vl_prompt, ov::genai::add_special_tokens(false));
         return {result.input_ids, result.attention_mask};
@@ -899,7 +973,7 @@ GenerateResult Session::generate(const std::string& prompt,
 }
 
 GenerateResult Session::generate_vl(const std::string& prompt,
-                                     const ov::Tensor& image,
+                                     const std::vector<ov::Tensor>& images,
                                      const GenerateParams& params,
                                      StreamCallback callback) {
     std::lock_guard<std::mutex> lock(impl_->generate_mutex_);
@@ -907,8 +981,8 @@ GenerateResult Session::generate_vl(const std::string& prompt,
     impl_->stop_requested_.store(false);
 
     try {
-        // Vision encode
-        auto [visual_embeds, grid_thw] = impl_->encode_vision(image);
+        // Vision encode (handles multiple images)
+        auto [visual_embeds, grid_thw] = impl_->encode_vision(images);
 
         // Tokenize VL prompt
         auto [input_ids, attention_mask] = impl_->tokenize_vl(prompt, grid_thw,
@@ -949,7 +1023,7 @@ void Session::reset() {
     impl_->generated_ids_.clear();
     impl_->cached_token_ids_.clear();
     impl_->cache_valid_ = false;
-    impl_->last_vl_image_tokens_ = 0;
+    impl_->last_vl_image_token_counts_.clear();
 }
 
 void Session::warmup(int max_seq_len) {
@@ -1043,7 +1117,7 @@ void Session::warmup(int max_seq_len) {
         std::memset(dummy_image.data(), 128, dummy_image.get_byte_size());
 
         // Vision encode
-        auto [visual_embeds, grid_thw] = impl_->encode_vision(dummy_image);
+        auto [visual_embeds, grid_thw] = impl_->encode_vision({dummy_image});
 
         // Build VL text inputs with image tokens
         const int64_t num_vis_tokens = models::Qwen3_5VisionPreprocessor::count_visual_tokens(
