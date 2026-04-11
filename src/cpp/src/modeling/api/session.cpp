@@ -279,12 +279,12 @@ struct Session::Impl {
         const int64_t* prompt_data = input_ids.data<const int64_t>();
 
         // ── Prefix cache check ──
-        // Works for text-only requests following any prior request (text or VL).
-        // After VL, the KV cache contains correct entries for image-pad tokens
-        // (computed from real image embeddings), so text follow-ups can safely
-        // reuse that prefix.  Only a new VL request must invalidate (new image).
+        // Works for both text-only and VL requests.  In multi-turn chat the
+        // history (system prompt + prior turns) doesn't change, so cached KV
+        // entries — including image-pad positions from earlier VL turns — are
+        // still valid.  We only need to prefill the new suffix.
         size_t prefix_match = 0;
-        if (!use_vl && cache_valid_) {
+        if (cache_valid_) {
             const size_t cached_len = cached_token_ids_.size();
             const size_t check_len = std::min(static_cast<size_t>(prompt_len), cached_len);
             for (size_t i = 0; i < check_len; ++i) {
@@ -295,8 +295,7 @@ struct Session::Impl {
         // Reuse cache only when the new prompt is an exact extension of the
         // cached sequence (i.e. all cached tokens match the prompt prefix
         // and the prompt has additional new tokens).
-        const bool use_prefix_cache = !use_vl
-            && cache_valid_
+        const bool use_prefix_cache = cache_valid_
             && prefix_match > 0
             && prefix_match == cached_token_ids_.size()
             && static_cast<size_t>(prompt_len) > prefix_match;
@@ -336,14 +335,18 @@ struct Session::Impl {
             ov::Tensor full_mask(ov::element::i64, {kBatch, static_cast<size_t>(prompt_len)});
             std::fill_n(full_mask.data<int64_t>(), prompt_len, int64_t{1});
 
-            // Position IDs for suffix [3, B, suffix_len] — sequential from prefix_match
+            // Position IDs for suffix: slice from InputPlanner's full position_ids
+            // Shape: [3, B, suffix_len] — preserves correct 2D grid positions for VL
             ov::Tensor suffix_pos(ov::element::i64, {3, kBatch, suffix_len});
-            auto* pos_ptr = suffix_pos.data<int64_t>();
-            for (size_t i = 0; i < suffix_len; ++i) {
-                const int64_t p = static_cast<int64_t>(prefix_match + i);
-                pos_ptr[i] = p;                       // dim 0
-                pos_ptr[suffix_len + i] = p;           // dim 1
-                pos_ptr[2 * suffix_len + i] = p;       // dim 2
+            {
+                const auto* full_pos = position_ids.data<const int64_t>();
+                const size_t full_seq = position_ids.get_shape().at(2);
+                auto* dst = suffix_pos.data<int64_t>();
+                for (size_t d = 0; d < 3; ++d) {
+                    std::memcpy(dst + d * suffix_len,
+                                full_pos + d * full_seq + prefix_match,
+                                suffix_len * sizeof(int64_t));
+                }
             }
 
             auto usm_ids = clone_as_usm_host(gpu_ctx_, suffix_ids);
@@ -356,8 +359,35 @@ struct Session::Impl {
             text_request_.set_tensor(models::Qwen3_5TextIO::kPositionIds, usm_pos);
             text_request_.set_tensor(models::Qwen3_5TextIO::kBeamIdx, beam_idx_);
 
-            if (model_.compiled_vision()) {
-                // VL model, text-only path: zero visual tensors for suffix length
+            if (use_vl && visual_embeds && visual_pos_mask) {
+                // VL prefix cache: slice visual_embeds and visual_pos_mask to suffix
+                // visual_embeds shape: [B, full_seq, hidden] → slice to [B, suffix_len, hidden]
+                // visual_pos_mask shape: [B, full_seq] → slice to [B, suffix_len]
+                const auto hidden = visual_embeds->get_shape().at(2);
+                const size_t full_seq = visual_embeds->get_shape().at(1);
+                const size_t elem_size = visual_embeds->get_element_type().size();
+
+                ov::Tensor suffix_vis(visual_embeds->get_element_type(),
+                                      {kBatch, suffix_len, hidden});
+                std::memcpy(suffix_vis.data(),
+                            static_cast<const char*>(visual_embeds->data())
+                                + prefix_match * hidden * elem_size,
+                            suffix_len * hidden * elem_size);
+
+                ov::Tensor suffix_vis_mask(visual_pos_mask->get_element_type(),
+                                           {kBatch, suffix_len});
+                const size_t mask_elem = visual_pos_mask->get_element_type().size();
+                std::memcpy(suffix_vis_mask.data(),
+                            static_cast<const char*>(visual_pos_mask->data())
+                                + prefix_match * mask_elem,
+                            suffix_len * mask_elem);
+
+                auto usm_vis = clone_as_usm_host(gpu_ctx_, suffix_vis);
+                auto usm_vis_mask = clone_as_usm_host(gpu_ctx_, suffix_vis_mask);
+                text_request_.set_tensor(models::Qwen3_5TextIO::kVisualEmbeds, usm_vis);
+                text_request_.set_tensor(models::Qwen3_5TextIO::kVisualPosMask, usm_vis_mask);
+            } else if (model_.compiled_vision()) {
+                // Text-only on VL model: zero visual tensors for suffix length
                 const auto hidden = static_cast<size_t>(model_.config().text.hidden_size);
                 auto zero_vis = make_usm_host_tensor(gpu_ctx_, ov::element::f32,
                                                       {kBatch, suffix_len, hidden});
