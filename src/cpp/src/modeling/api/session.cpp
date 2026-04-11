@@ -278,7 +278,11 @@ struct Session::Impl {
         const int64_t prompt_len = static_cast<int64_t>(input_ids.get_shape().at(1));
         const int64_t* prompt_data = input_ids.data<const int64_t>();
 
-        // ── Prefix cache check (text-only only) ──
+        // ── Prefix cache check ──
+        // Works for text-only requests following any prior request (text or VL).
+        // After VL, the KV cache contains correct entries for image-pad tokens
+        // (computed from real image embeddings), so text follow-ups can safely
+        // reuse that prefix.  Only a new VL request must invalidate (new image).
         size_t prefix_match = 0;
         if (!use_vl && cache_valid_) {
             const size_t cached_len = cached_token_ids_.size();
@@ -778,19 +782,17 @@ struct Session::Impl {
         // Store all tokens currently in the KV cache (prompt + decoded tokens).
         // decode_steps tokens were fed during decode; the last token in
         // result.token_ids is the stop/final token that was NOT fed.
-        if (!use_vl) {
-            cached_token_ids_.clear();
-            cached_token_ids_.reserve(static_cast<size_t>(past_len_));
-            cached_token_ids_.assign(prompt_data, prompt_data + prompt_len);
-            for (size_t i = 0; i < decode_steps; ++i) {
-                cached_token_ids_.push_back(result.token_ids[i]);
-            }
-            cache_valid_ = true;
-        } else {
-            // VL requests invalidate prefix cache (image embeddings differ)
-            cache_valid_ = false;
-            cached_token_ids_.clear();
+        // Both text and VL requests save the cache.  A subsequent text request
+        // can reuse the KV entries (including image-pad positions computed from
+        // real image embeddings).  Only a new VL request must invalidate and
+        // do a full reset (different image → different embeddings).
+        cached_token_ids_.clear();
+        cached_token_ids_.reserve(static_cast<size_t>(past_len_));
+        cached_token_ids_.assign(prompt_data, prompt_data + prompt_len);
+        for (size_t i = 0; i < decode_steps; ++i) {
+            cached_token_ids_.push_back(result.token_ids[i]);
         }
+        cache_valid_ = true;
 
         // Notify FINISH
         if (callback) {
