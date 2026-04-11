@@ -296,14 +296,49 @@ static ParsedRequest parse_chat_request(const json& body, ov::genai::Tokenizer& 
         req.images.push_back(std::move(last));
     }
 
-    if (req.images.empty()) {
-        // Text-only: use native chat template
-        ov::genai::ChatHistory history(ov::genai::JsonContainer::from_json_string(messages.dump()));
-        if (!req.tools.empty()) {
-            history.set_tools(ov::genai::JsonContainer::from_json_string(body["tools"].dump()));
+    // Prepend thinking tags to historical assistant messages so that the
+    // tokenized prompt matches what was originally generated (the model's
+    // output always starts with <think>\n</think>\n\n when thinking is
+    // disabled, or <think>\n...thoughts...</think>\n\n when enabled).
+    // Without this, prefix cache would miss because the cached KV sequence
+    // contains these thinking tokens but the rebuilt prompt does not.
+    const std::string think_prefix = "<think>\n</think>\n\n";
+    for (size_t i = 0; i < messages.size(); ++i) {
+        if (messages[i].value("role", "") == "assistant"
+            && i + 1 < messages.size()  // not the last message (which is the new assistant turn)
+            && messages[i].contains("content")
+            && messages[i]["content"].is_string()) {
+            std::string c = messages[i]["content"].get<std::string>();
+            if (c.find("<think>") == std::string::npos) {
+                messages[i]["content"] = think_prefix + c;
+            }
         }
-        ov::genai::JsonContainer extra({{"enable_thinking", cfg.enable_thinking}});
-        req.prompt = tokenizer.apply_chat_template(history, true, {}, std::nullopt, extra);
+    }
+
+    if (req.images.empty()) {
+        // Text-only: build ChatML manually (same as VL path but without
+        // vision markers) so that we can control thinking tag placement
+        // for prefix cache compatibility.
+        std::string chat_text;
+        for (const auto& msg : messages) {
+            std::string role = msg.at("role").get<std::string>();
+            std::string content;
+            if (msg.contains("content")) {
+                if (msg["content"].is_string()) {
+                    content = msg["content"].get<std::string>();
+                } else if (msg["content"].is_null()) {
+                    content = "";
+                }
+            }
+            chat_text += "<|im_start|>" + role + "\n" + content + "<|im_end|>\n";
+        }
+        chat_text += "<|im_start|>assistant\n";
+        if (cfg.enable_thinking) {
+            chat_text += "<think>\n";
+        } else {
+            chat_text += "<think>\n</think>\n\n";
+        }
+        req.prompt = chat_text;
     } else {
         // VL: manual ChatML with vision markers so tokenize_vl can
         // expand them to the correct number of <|image_pad|> tokens.
@@ -1149,6 +1184,23 @@ int main(int argc, char* argv[]) {
         bool do_stream = body.value("stream", true);  // Ollama defaults to stream=true
 
         auto messages = body.value("messages", json::array());
+
+        // Prepend thinking tags to historical assistant messages (same as OpenAI path)
+        {
+            const std::string think_prefix = "<think>\n</think>\n\n";
+            for (size_t i = 0; i < messages.size(); ++i) {
+                if (messages[i].value("role", "") == "assistant"
+                    && i + 1 < messages.size()
+                    && messages[i].contains("content")
+                    && messages[i]["content"].is_string()) {
+                    std::string c = messages[i]["content"].get<std::string>();
+                    if (c.find("<think>") == std::string::npos) {
+                        messages[i]["content"] = think_prefix + c;
+                    }
+                }
+            }
+        }
+
         std::string chat_text;
         if (tokenizer && !tokenizer->get_chat_template().empty()) {
             ov::genai::ChatHistory history(ov::genai::JsonContainer::from_json_string(messages.dump()));

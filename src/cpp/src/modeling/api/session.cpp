@@ -299,10 +299,6 @@ struct Session::Impl {
         const int64_t* prompt_data = input_ids.data<const int64_t>();
 
         // ── Prefix cache check ──
-        // Works for both text-only and VL requests.  In multi-turn chat the
-        // history (system prompt + prior turns) doesn't change, so cached KV
-        // entries — including image-pad positions from earlier VL turns — are
-        // still valid.  We only need to prefill the new suffix.
         size_t prefix_match = 0;
         if (cache_valid_) {
             const size_t cached_len = cached_token_ids_.size();
