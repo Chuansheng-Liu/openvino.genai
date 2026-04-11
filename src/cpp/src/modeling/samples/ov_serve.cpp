@@ -914,52 +914,83 @@ int main(int argc, char* argv[]) {
                 // Handler returns here; content provider runs asynchronously
             } else {
                 // ── Non-streaming ──
-                WorkerPool::Guard worker(pool);
-                auto* session = worker.get();
+                // Use chunked content provider so we get a DataSink to detect
+                // client disconnects during generation.
+                auto sp = std::move(parsed);
+                auto rid = request_id;
+                auto mn = model_name;
+                auto warmup_tok = cfg.warmup_tokens;
+                auto log = cfg.enable_logging;
 
-                GenerateResult result;
-                auto do_generate = [&]() {
-                    if (!parsed.images.empty()) {
-                        return session->generate_vl(parsed.prompt, parsed.images,
-                                                    parsed.params);
-                    } else {
-                        return session->generate(parsed.prompt, parsed.params);
-                    }
-                };
+                res.set_chunked_content_provider(
+                    "application/json",
+                    [&pool, sp = std::move(sp), rid, mn, warmup_tok, log](
+                        size_t, httplib::DataSink& sink) {
+                        WorkerPool::Guard worker(pool);
+                        auto* session = worker.get();
 
-                try {
-                    result = do_generate();
-                } catch (const std::exception& e) {
-                    if (is_gpu_oom(e)) {
-                        std::cerr << "[ov_serve] " << request_id
-                                  << " GPU OOM detected, recreating session...\n";
-                        pool.recreate_session(session, cfg.warmup_tokens);
-                        result = do_generate();  // retry once
-                    } else {
-                        throw;
-                    }
-                }
+                        // Lightweight callback: only checks connection liveness
+                        auto callback = [&](const StreamChunk& sc) -> bool {
+                            if (sc.event == StreamEvent::TOKEN) {
+                                return sink.is_writable();
+                            }
+                            return true;
+                        };
 
-                // Parse tool calls from output
-                ToolCallParser tool_parser;
-                auto pr = tool_parser.process(result.text);
-                result.text = pr.text;  // Remove tool call XML from text
+                        GenerateResult result;
+                        auto do_generate = [&]() {
+                            if (!sp.images.empty()) {
+                                return session->generate_vl(sp.prompt, sp.images,
+                                                            sp.params, callback);
+                            } else {
+                                return session->generate(sp.prompt, sp.params, callback);
+                            }
+                        };
 
-                auto resp = build_chat_response(request_id, model_name, result, pr.tool_calls);
-                res.set_content(resp.dump(), "application/json");
+                        try {
+                            try {
+                                result = do_generate();
+                            } catch (const std::exception& e) {
+                                if (is_gpu_oom(e)) {
+                                    std::cerr << "[ov_serve] " << rid
+                                              << " GPU OOM detected, recreating session...\n";
+                                    pool.recreate_session(session, warmup_tok);
+                                    result = do_generate();
+                                } else {
+                                    throw;
+                                }
+                            }
 
-                if (cfg.enable_logging) {
-                    std::cerr << "[ov_serve] " << request_id
-                              << " done: " << result.generated_tokens << " tokens"
-                              << ", ttft=" << std::round(result.ttft_ms * 10.0) / 10.0 << "ms"
-                              << ", throughput=" << std::round(result.throughput * 10.0) / 10.0 << " t/s"
-                              << ", prefill=" << std::round(result.prefill_ms * 10.0) / 10.0 << "ms"
-                              << ", decode=" << std::round(result.decode_ms * 10.0) / 10.0 << "ms"
-                              << (result.prefix_cached_tokens > 0
-                                  ? ", cache_hit=" + std::to_string(result.prefix_cached_tokens) + " tokens"
-                                  : "")
-                              << "\n";
-                }
+                            ToolCallParser tool_parser;
+                            auto pr = tool_parser.process(result.text);
+                            result.text = pr.text;
+
+                            auto resp = build_chat_response(rid, mn, result, pr.tool_calls);
+                            std::string body = resp.dump();
+                            sink.write(body.c_str(), body.size());
+
+                            if (log) {
+                                std::cerr << "[ov_serve] " << rid
+                                          << " done: " << result.generated_tokens << " tokens"
+                                          << ", ttft=" << std::round(result.ttft_ms * 10.0) / 10.0 << "ms"
+                                          << ", throughput=" << std::round(result.throughput * 10.0) / 10.0 << " t/s"
+                                          << ", prefill=" << std::round(result.prefill_ms * 10.0) / 10.0 << "ms"
+                                          << ", decode=" << std::round(result.decode_ms * 10.0) / 10.0 << "ms"
+                                          << (result.prefix_cached_tokens > 0
+                                              ? ", cache_hit=" + std::to_string(result.prefix_cached_tokens) + " tokens"
+                                              : "")
+                                          << "\n";
+                            }
+                        } catch (const std::exception& e) {
+                            json err;
+                            err["error"]["message"] = std::string("Generation error: ") + e.what();
+                            err["error"]["type"] = "server_error";
+                            std::string body = err.dump();
+                            sink.write(body.c_str(), body.size());
+                        }
+                        sink.done();
+                        return true;
+                    });
             }
         } catch (const std::exception& e) {
             res.status = 500;
@@ -1029,49 +1060,70 @@ int main(int argc, char* argv[]) {
         params.enable_thinking = false;  // No thinking in raw completions
 
         auto request_id = make_request_id();
-        WorkerPool::Guard worker(pool);
-        auto* session = worker.get();
+        auto prompt_copy = prompt;
+        auto params_copy = params;
+        auto rid = request_id;
+        auto mn = model_name;
+        auto warmup_tok = cfg.warmup_tokens;
 
-        try {
-            auto result = session->generate(prompt, params);
+        res.set_chunked_content_provider(
+            "application/json",
+            [&pool, prompt_copy = std::move(prompt_copy), params_copy, rid, mn, warmup_tok](
+                size_t, httplib::DataSink& sink) {
+                WorkerPool::Guard worker(pool);
+                auto* session = worker.get();
 
-            json resp;
-            resp["id"] = request_id;
-            resp["object"] = "text_completion";
-            resp["created"] = unix_timestamp();
-            resp["model"] = model_name;
+                auto callback = [&](const StreamChunk& sc) -> bool {
+                    if (sc.event == StreamEvent::TOKEN) {
+                        return sink.is_writable();
+                    }
+                    return true;
+                };
 
-            json choice;
-            choice["index"] = 0;
-            choice["text"] = result.text;
-            choice["finish_reason"] = (result.stop_reason == StopReason::MAX_TOKENS)
-                                          ? "length"
-                                          : "stop";
-            resp["choices"] = json::array({choice});
+                try {
+                    auto result = session->generate(prompt_copy, params_copy, callback);
 
-            json usage;
-            usage["prompt_tokens"] = result.prompt_tokens;
-            usage["completion_tokens"] = result.generated_tokens;
-            usage["total_tokens"] = result.prompt_tokens + result.generated_tokens;
+                    json resp;
+                    resp["id"] = rid;
+                    resp["object"] = "text_completion";
+                    resp["created"] = unix_timestamp();
+                    resp["model"] = mn;
 
-            json perf;
-            perf["ttft_ms"] = std::round(result.ttft_ms * 100.0) / 100.0;
-            perf["prefill_ms"] = std::round(result.prefill_ms * 100.0) / 100.0;
-            perf["decode_ms"] = std::round(result.decode_ms * 100.0) / 100.0;
-            perf["throughput_tps"] = std::round(result.throughput * 100.0) / 100.0;
-            if (result.prefix_cached_tokens > 0)
-                perf["prefix_cached_tokens"] = result.prefix_cached_tokens;
-            usage["performance"] = perf;
-            resp["usage"] = usage;
+                    json choice;
+                    choice["index"] = 0;
+                    choice["text"] = result.text;
+                    choice["finish_reason"] = (result.stop_reason == StopReason::MAX_TOKENS)
+                                                  ? "length"
+                                                  : "stop";
+                    resp["choices"] = json::array({choice});
 
-            res.set_content(resp.dump(), "application/json");
-        } catch (const std::exception& e) {
-            res.status = 500;
-            json err;
-            err["error"]["message"] = std::string("Generation error: ") + e.what();
-            err["error"]["type"] = "server_error";
-            res.set_content(err.dump(), "application/json");
-        }
+                    json usage;
+                    usage["prompt_tokens"] = result.prompt_tokens;
+                    usage["completion_tokens"] = result.generated_tokens;
+                    usage["total_tokens"] = result.prompt_tokens + result.generated_tokens;
+
+                    json perf;
+                    perf["ttft_ms"] = std::round(result.ttft_ms * 100.0) / 100.0;
+                    perf["prefill_ms"] = std::round(result.prefill_ms * 100.0) / 100.0;
+                    perf["decode_ms"] = std::round(result.decode_ms * 100.0) / 100.0;
+                    perf["throughput_tps"] = std::round(result.throughput * 100.0) / 100.0;
+                    if (result.prefix_cached_tokens > 0)
+                        perf["prefix_cached_tokens"] = result.prefix_cached_tokens;
+                    usage["performance"] = perf;
+                    resp["usage"] = usage;
+
+                    std::string body = resp.dump();
+                    sink.write(body.c_str(), body.size());
+                } catch (const std::exception& e) {
+                    json err;
+                    err["error"]["message"] = std::string("Generation error: ") + e.what();
+                    err["error"]["type"] = "server_error";
+                    std::string body = err.dump();
+                    sink.write(body.c_str(), body.size());
+                }
+                sink.done();
+                return true;
+            });
         // RAII Guard handles session release automatically
     });
 
@@ -1322,36 +1374,54 @@ int main(int argc, char* argv[]) {
                     return true;
                 });
         } else {
-            // Non-streaming: return full response
-            WorkerPool::Guard worker(pool);
-            auto* session = worker.get();
+            // Non-streaming with disconnect detection
+            auto prompt_copy = chat_text;
+            auto params_copy = params;
 
-            try {
-                auto result = session->generate(chat_text, params);
+            res.set_chunked_content_provider(
+                "application/json",
+                [&pool, prompt_copy = std::move(prompt_copy), params_copy, mn, &iso_timestamp](
+                    size_t, httplib::DataSink& sink) {
+                    WorkerPool::Guard worker(pool);
+                    auto* session = worker.get();
 
-                json resp;
-                resp["model"] = mn;
-                resp["created_at"] = iso_timestamp();
-                json msg;
-                msg["role"] = "assistant";
-                msg["content"] = result.text;
-                resp["message"] = msg;
-                resp["done"] = true;
-                resp["done_reason"] = (result.stop_reason == StopReason::MAX_TOKENS)
-                                          ? "length" : "stop";
-                resp["eval_count"] = static_cast<int>(result.generated_tokens);
-                resp["prompt_eval_count"] = static_cast<int>(result.prompt_tokens);
-                resp["eval_duration"] = static_cast<int64_t>(result.decode_ms * 1e6);
-                resp["prompt_eval_duration"] = static_cast<int64_t>(result.prefill_ms * 1e6);
-                resp["ttft_ms"] = std::round(result.ttft_ms * 100.0) / 100.0;
-                resp["throughput_tps"] = std::round(result.throughput * 100.0) / 100.0;
-                res.set_content(resp.dump(), "application/json");
-            } catch (const std::exception& e) {
-                res.status = 500;
-                json err;
-                err["error"] = std::string("Generation error: ") + e.what();
-                res.set_content(err.dump(), "application/json");
-            }
+                    auto callback = [&](const StreamChunk& sc) -> bool {
+                        if (sc.event == StreamEvent::TOKEN) {
+                            return sink.is_writable();
+                        }
+                        return true;
+                    };
+
+                    try {
+                        auto result = session->generate(prompt_copy, params_copy, callback);
+
+                        json resp;
+                        resp["model"] = mn;
+                        resp["created_at"] = iso_timestamp();
+                        json msg;
+                        msg["role"] = "assistant";
+                        msg["content"] = result.text;
+                        resp["message"] = msg;
+                        resp["done"] = true;
+                        resp["done_reason"] = (result.stop_reason == StopReason::MAX_TOKENS)
+                                                  ? "length" : "stop";
+                        resp["eval_count"] = static_cast<int>(result.generated_tokens);
+                        resp["prompt_eval_count"] = static_cast<int>(result.prompt_tokens);
+                        resp["eval_duration"] = static_cast<int64_t>(result.decode_ms * 1e6);
+                        resp["prompt_eval_duration"] = static_cast<int64_t>(result.prefill_ms * 1e6);
+                        resp["ttft_ms"] = std::round(result.ttft_ms * 100.0) / 100.0;
+                        resp["throughput_tps"] = std::round(result.throughput * 100.0) / 100.0;
+                        std::string body = resp.dump();
+                        sink.write(body.c_str(), body.size());
+                    } catch (const std::exception& e) {
+                        json err;
+                        err["error"] = std::string("Generation error: ") + e.what();
+                        std::string body = err.dump();
+                        sink.write(body.c_str(), body.size());
+                    }
+                    sink.done();
+                    return true;
+                });
         }
     });
 
@@ -1464,32 +1534,50 @@ int main(int argc, char* argv[]) {
                     return true;
                 });
         } else {
-            WorkerPool::Guard worker(pool);
-            auto* session = worker.get();
+            auto prompt_copy = prompt;
+            auto params_copy = params;
 
-            try {
-                auto result = session->generate(prompt, params);
+            res.set_chunked_content_provider(
+                "application/json",
+                [&pool, prompt_copy = std::move(prompt_copy), params_copy, mn, &iso_timestamp](
+                    size_t, httplib::DataSink& sink) {
+                    WorkerPool::Guard worker(pool);
+                    auto* session = worker.get();
 
-                json resp;
-                resp["model"] = mn;
-                resp["created_at"] = iso_timestamp();
-                resp["response"] = result.text;
-                resp["done"] = true;
-                resp["done_reason"] = (result.stop_reason == StopReason::MAX_TOKENS)
-                                          ? "length" : "stop";
-                resp["eval_count"] = static_cast<int>(result.generated_tokens);
-                resp["prompt_eval_count"] = static_cast<int>(result.prompt_tokens);
-                resp["eval_duration"] = static_cast<int64_t>(result.decode_ms * 1e6);
-                resp["prompt_eval_duration"] = static_cast<int64_t>(result.prefill_ms * 1e6);
-                resp["ttft_ms"] = std::round(result.ttft_ms * 100.0) / 100.0;
-                resp["throughput_tps"] = std::round(result.throughput * 100.0) / 100.0;
-                res.set_content(resp.dump(), "application/json");
-            } catch (const std::exception& e) {
-                res.status = 500;
-                json err;
-                err["error"] = std::string("Generation error: ") + e.what();
-                res.set_content(err.dump(), "application/json");
-            }
+                    auto callback = [&](const StreamChunk& sc) -> bool {
+                        if (sc.event == StreamEvent::TOKEN) {
+                            return sink.is_writable();
+                        }
+                        return true;
+                    };
+
+                    try {
+                        auto result = session->generate(prompt_copy, params_copy, callback);
+
+                        json resp;
+                        resp["model"] = mn;
+                        resp["created_at"] = iso_timestamp();
+                        resp["response"] = result.text;
+                        resp["done"] = true;
+                        resp["done_reason"] = (result.stop_reason == StopReason::MAX_TOKENS)
+                                                  ? "length" : "stop";
+                        resp["eval_count"] = static_cast<int>(result.generated_tokens);
+                        resp["prompt_eval_count"] = static_cast<int>(result.prompt_tokens);
+                        resp["eval_duration"] = static_cast<int64_t>(result.decode_ms * 1e6);
+                        resp["prompt_eval_duration"] = static_cast<int64_t>(result.prefill_ms * 1e6);
+                        resp["ttft_ms"] = std::round(result.ttft_ms * 100.0) / 100.0;
+                        resp["throughput_tps"] = std::round(result.throughput * 100.0) / 100.0;
+                        std::string body = resp.dump();
+                        sink.write(body.c_str(), body.size());
+                    } catch (const std::exception& e) {
+                        json err;
+                        err["error"] = std::string("Generation error: ") + e.what();
+                        std::string body = err.dump();
+                        sink.write(body.c_str(), body.size());
+                    }
+                    sink.done();
+                    return true;
+                });
         }
     });
 
