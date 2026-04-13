@@ -848,6 +848,10 @@ Tensor Qwen3_5Model::forward_impl(const Tensor* input_ids,
     auto cos_sin = build_mrope_cos_sin(position_ids);
     const Tensor& seq_source = inputs_embeds ? *inputs_embeds : *input_ids;
     auto* op_ctx = seq_source.context();
+    auto q_len_1d = Tensor(shape::dim(seq_source, 1), op_ctx);
+    auto shared_full_attn_sdpa_mask =
+        ops::llm::build_kv_causal_mask_with_attention_from_q_len(q_len_1d, full_attention_mask);
+
     std::optional<Tensor> linear_mask_view;
     const Tensor* linear_mask = nullptr;
     if (linear_attention_mask) {
