@@ -93,6 +93,12 @@ struct ModelConfig {
 
     /// Number of layers in target model (for DFlash conditioning)
     int32_t num_target_layers = 0;
+
+    /// Mask token ID for DFlash draft model (from dflash_config.mask_token_id in config.json)
+    int64_t mask_token_id = -1;
+
+    /// Explicit target layer IDs from dflash_config (if present in config.json)
+    std::vector<int32_t> target_layer_ids;
     
     // ========== Normalization ==========
     
