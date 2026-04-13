@@ -277,6 +277,38 @@ std::string build_vl_prompt(const std::string& user_prompt, int64_t image_tokens
     return prompt;
 }
 
+// ─── Quant cache suffix (matches convert_ir / model_loader convention) ───
+std::string quant_mode_token(ov::genai::modeling::weights::QuantizationConfig::Mode m) {
+    using Mode = ov::genai::modeling::weights::QuantizationConfig::Mode;
+    switch (m) {
+        case Mode::INT4_SYM:  return "4s";
+        case Mode::INT4_ASYM: return "4a";
+        case Mode::INT8_SYM:  return "8s";
+        case Mode::INT8_ASYM: return "8a";
+        default:              return "n";
+    }
+}
+
+std::string quant_cache_suffix(const ov::genai::modeling::weights::QuantizationConfig& cfg) {
+    if (!cfg.enabled()) return "";
+    return "_q" + quant_mode_token(cfg.mode) + "_b" + quant_mode_token(cfg.backup_mode) +
+           "_g" + std::to_string(cfg.group_size);
+}
+
+bool has_ir_pair(const std::filesystem::path& xml, const std::filesystem::path& bin) {
+    return std::filesystem::exists(xml) && std::filesystem::exists(bin);
+}
+
+// Try to find a DFlash IR file pair in a model directory.
+// Returns (xml, bin) paths if found, otherwise nullopt.
+std::optional<std::pair<std::filesystem::path, std::filesystem::path>>
+find_dflash_ir(const std::filesystem::path& dir, const std::string& stem) {
+    auto xml = dir / (stem + ".xml");
+    auto bin = dir / (stem + ".bin");
+    if (has_ir_pair(xml, bin)) return std::make_pair(xml, bin);
+    return std::nullopt;
+}
+
 std::string resolve_pos_embed_name(ov::genai::safetensors::SafetensorsWeightSource& source) {
     for (const auto& name : {"model.visual.pos_embed.weight", "visual.pos_embed.weight", "pos_embed.weight"}) {
         if (source.has(name)) return name;
@@ -470,6 +502,22 @@ int main(int argc, char* argv[]) try {
     PerfStats perf;
     double dflash_throughput = 0.0;
 
+    // ─── DFlash IR cache: try to load pre-converted IR files from target dir ───
+    std::string qsuffix = quant_cache_suffix(target_quant_config);
+    std::string vl_tag = vl_mode ? "_vl" : "";
+    auto cached_target = find_dflash_ir(target_dir, "qwen3_5_dflash_target" + vl_tag + qsuffix);
+    // Fallback: if non-VL run but only VL target IR exists, use it (VL IR is a superset)
+    if (!cached_target.has_value() && !vl_mode) {
+        cached_target = find_dflash_ir(target_dir, "qwen3_5_dflash_target_vl" + qsuffix);
+    }
+    auto cached_ctx_fc = find_dflash_ir(target_dir, "qwen3_5_dflash_context_fc");
+    auto cached_draft  = find_dflash_ir(target_dir, "qwen3_5_dflash_combined_draft_v2" + qsuffix);
+    bool use_cached_ir = cached_target.has_value() && cached_ctx_fc.has_value() && cached_draft.has_value();
+
+    if (use_cached_ir) {
+        std::cout << "[DFlash] Found cached IR files — loading from IR (skipping safetensors)" << std::endl;
+    }
+
     // Build models inside a scope so that weight sources are freed after model building.
     // On iGPU (shared CPU/GPU memory), this recovers ~10+ GB of safetensors data.
     std::shared_ptr<ov::Model> target_model;
@@ -478,7 +526,37 @@ int main(int argc, char* argv[]) try {
     std::shared_ptr<ov::Model> vision_model;
     ov::Tensor vl_pos_embed_weight;  // Extracted in scope for VL preprocessing later
 
-    {
+    if (use_cached_ir) {
+        // ─── Load from cached IR ───
+        ov::Core ir_core;
+        std::cout << "[Loading DFlash target IR: " << cached_target->first.filename() << "]" << std::endl;
+        target_model = ir_core.read_model(cached_target->first.string(), cached_target->second.string());
+
+        std::cout << "[Loading context_fc IR: " << cached_ctx_fc->first.filename() << "]" << std::endl;
+        context_fc_model = ir_core.read_model(cached_ctx_fc->first.string(), cached_ctx_fc->second.string());
+
+        std::cout << "[Loading combined draft V2 IR: " << cached_draft->first.filename() << "]" << std::endl;
+        combined_draft_model = ir_core.read_model(cached_draft->first.string(), cached_draft->second.string());
+
+        if (vl_mode) {
+            // Vision model uses standard IR cache from convert_ir
+            auto cached_vision = find_dflash_ir(target_dir, "qwen3_5_vision");
+            if (cached_vision.has_value()) {
+                std::cout << "[Loading vision IR: " << cached_vision->first.filename() << "]" << std::endl;
+                vision_model = ir_core.read_model(cached_vision->first.string(), cached_vision->second.string());
+            } else {
+                std::cerr << "[Warning] VL mode but no cached vision IR — building from safetensors" << std::endl;
+                auto target_data = ov::genai::safetensors::load_safetensors(target_dir);
+                ov::genai::safetensors::SafetensorsWeightSource target_source(std::move(target_data));
+                ov::genai::safetensors::SafetensorsWeightFinalizer vision_finalizer;
+                vision_model = ov::genai::modeling::models::create_qwen3_5_vision_model(
+                    target_qwen35_cfg, target_source, vision_finalizer);
+                const std::string pos_embed_name = resolve_pos_embed_name(target_source);
+                vl_pos_embed_weight = target_source.get_tensor(pos_embed_name);
+            }
+        }
+    } else {
+        // ─── Build from safetensors (original path) ───
         auto target_data = ov::genai::safetensors::load_safetensors(target_dir);
         ov::genai::safetensors::SafetensorsWeightSource target_source(std::move(target_data));
         ov::genai::safetensors::SafetensorsWeightFinalizer target_finalizer(
