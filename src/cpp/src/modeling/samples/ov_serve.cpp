@@ -961,6 +961,17 @@ int main(int argc, char* argv[]) {
                                 }
                             }
 
+                            // Skip response if client disconnected during generation
+                            if (!sink.is_writable()) {
+                                if (log) {
+                                    std::cerr << "[ov_serve] " << rid
+                                              << " client disconnected, dropping "
+                                              << result.generated_tokens << " tokens\n";
+                                }
+                                sink.done();
+                                return true;
+                            }
+
                             ToolCallParser tool_parser;
                             auto pr = tool_parser.process(result.text);
                             result.text = pr.text;
@@ -982,6 +993,7 @@ int main(int argc, char* argv[]) {
                                           << "\n";
                             }
                         } catch (const std::exception& e) {
+                            if (!sink.is_writable()) { sink.done(); return true; }
                             json err;
                             err["error"]["message"] = std::string("Generation error: ") + e.what();
                             err["error"]["type"] = "server_error";
@@ -1083,6 +1095,8 @@ int main(int argc, char* argv[]) {
                 try {
                     auto result = session->generate(prompt_copy, params_copy, callback);
 
+                    if (!sink.is_writable()) { sink.done(); return true; }
+
                     json resp;
                     resp["id"] = rid;
                     resp["object"] = "text_completion";
@@ -1115,6 +1129,7 @@ int main(int argc, char* argv[]) {
                     std::string body = resp.dump();
                     sink.write(body.c_str(), body.size());
                 } catch (const std::exception& e) {
+                    if (!sink.is_writable()) { sink.done(); return true; }
                     json err;
                     err["error"]["message"] = std::string("Generation error: ") + e.what();
                     err["error"]["type"] = "server_error";
@@ -1395,6 +1410,8 @@ int main(int argc, char* argv[]) {
                     try {
                         auto result = session->generate(prompt_copy, params_copy, callback);
 
+                        if (!sink.is_writable()) { sink.done(); return true; }
+
                         json resp;
                         resp["model"] = mn;
                         resp["created_at"] = iso_timestamp();
@@ -1414,6 +1431,7 @@ int main(int argc, char* argv[]) {
                         std::string body = resp.dump();
                         sink.write(body.c_str(), body.size());
                     } catch (const std::exception& e) {
+                        if (!sink.is_writable()) { sink.done(); return true; }
                         json err;
                         err["error"] = std::string("Generation error: ") + e.what();
                         std::string body = err.dump();
@@ -1554,6 +1572,8 @@ int main(int argc, char* argv[]) {
                     try {
                         auto result = session->generate(prompt_copy, params_copy, callback);
 
+                        if (!sink.is_writable()) { sink.done(); return true; }
+
                         json resp;
                         resp["model"] = mn;
                         resp["created_at"] = iso_timestamp();
@@ -1570,6 +1590,7 @@ int main(int argc, char* argv[]) {
                         std::string body = resp.dump();
                         sink.write(body.c_str(), body.size());
                     } catch (const std::exception& e) {
+                        if (!sink.is_writable()) { sink.done(); return true; }
                         json err;
                         err["error"] = std::string("Generation error: ") + e.what();
                         std::string body = err.dump();
