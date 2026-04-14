@@ -864,9 +864,12 @@ int main(int argc, char* argv[]) {
                         // Session already processes through ThinkingTracker internally;
                         // sc.is_thinking tells us which category each token belongs to.
                         ToolCallParser tool_parser;
+                        std::vector<ToolCall> accumulated_tool_calls;
 
                         auto callback = [&](const StreamChunk& sc) -> bool {
                             if (sc.event == StreamEvent::TOKEN && !sc.token_text.empty()) {
+                                std::cerr << "[DEBUG-STREAM] TOKEN thinking=" << sc.is_thinking
+                                          << " text='" << sc.token_text.substr(0, 30) << "'\n";
                                 if (sc.is_thinking) {
                                     // Send as reasoning_content delta
                                     json tc;
@@ -885,6 +888,10 @@ int main(int argc, char* argv[]) {
                                 } else {
                                     // Content text — run through tool parser
                                     auto pr = tool_parser.process(sc.token_text);
+                                    // Accumulate any completed tool calls
+                                    for (auto& tc_item : pr.tool_calls) {
+                                        accumulated_tool_calls.push_back(std::move(tc_item));
+                                    }
                                     if (!pr.text.empty()) {
                                         json tc;
                                         tc["id"] = rid;
@@ -903,10 +910,63 @@ int main(int argc, char* argv[]) {
                                 }
                             } else if (sc.event == StreamEvent::FINISH) {
                                 auto flush_result = tool_parser.flush();
-                                std::string finish_reason =
-                                    (sc.stop_reason == StopReason::MAX_TOKENS)
-                                        ? "length"
-                                        : "stop";
+
+                                // Emit any remaining text from flush
+                                if (!flush_result.text.empty()) {
+                                    json tc2;
+                                    tc2["id"] = rid;
+                                    tc2["object"] = "chat.completion.chunk";
+                                    tc2["created"] = unix_timestamp();
+                                    tc2["model"] = mn;
+                                    json d2;
+                                    d2["content"] = flush_result.text;
+                                    json c2;
+                                    c2["index"] = 0;
+                                    c2["delta"] = d2;
+                                    tc2["choices"] = json::array({c2});
+                                    std::string s2 = sse_chunk(tc2);
+                                    sink.write(s2.c_str(), s2.size());
+                                }
+
+                                // Merge any tool calls from flush into accumulated
+                                for (auto& tc_item : flush_result.tool_calls) {
+                                    accumulated_tool_calls.push_back(std::move(tc_item));
+                                }
+
+                                // Emit tool_call deltas in SSE
+                                for (size_t ti = 0; ti < accumulated_tool_calls.size(); ++ti) {
+                                    const auto& atc = accumulated_tool_calls[ti];
+                                    json tc_chunk;
+                                    tc_chunk["id"] = rid;
+                                    tc_chunk["object"] = "chat.completion.chunk";
+                                    tc_chunk["created"] = unix_timestamp();
+                                    tc_chunk["model"] = mn;
+                                    json d_tc;
+                                    json fn;
+                                    fn["name"] = atc.name;
+                                    fn["arguments"] = atc.arguments;
+                                    json tc_obj;
+                                    tc_obj["index"] = static_cast<int>(ti);
+                                    tc_obj["id"] = atc.id;
+                                    tc_obj["type"] = "function";
+                                    tc_obj["function"] = fn;
+                                    d_tc["tool_calls"] = json::array({tc_obj});
+                                    json c_tc;
+                                    c_tc["index"] = 0;
+                                    c_tc["delta"] = d_tc;
+                                    tc_chunk["choices"] = json::array({c_tc});
+                                    std::string s_tc = sse_chunk(tc_chunk);
+                                    sink.write(s_tc.c_str(), s_tc.size());
+                                }
+
+                                std::string finish_reason;
+                                if (!accumulated_tool_calls.empty()) {
+                                    finish_reason = "tool_calls";
+                                } else if (sc.stop_reason == StopReason::MAX_TOKENS) {
+                                    finish_reason = "length";
+                                } else {
+                                    finish_reason = "stop";
+                                }
 
                                 json fc;
                                 fc["id"] = rid;

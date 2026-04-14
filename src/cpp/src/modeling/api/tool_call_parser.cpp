@@ -25,6 +25,7 @@ std::string trim(const std::string& s) {
 
 /// Find a JSON string value for the given key in a JSON object string.
 /// Returns the value (without quotes) or empty string if not found.
+/// Handles both quoted ("name": "value") and unquoted ("name": value) forms.
 std::string find_json_string(const std::string& json, const std::string& key) {
     std::string pattern = "\"" + key + "\"";
     auto pos = json.find(pattern);
@@ -39,7 +40,7 @@ std::string find_json_string(const std::string& json, const std::string& key) {
     if (pos == std::string::npos) return {};
 
     if (json[pos] == '"') {
-        // String value — find closing quote (handle escaped quotes)
+        // Quoted string value — find closing quote (handle escaped quotes)
         size_t start = pos + 1;
         size_t end = start;
         while (end < json.size()) {
@@ -53,7 +54,11 @@ std::string find_json_string(const std::string& json, const std::string& key) {
         return json.substr(start, end - start);
     }
 
-    return {};
+    // Unquoted value (e.g. "name": get_weather) — read until delimiter
+    size_t start = pos;
+    size_t end = json.find_first_of(",}\n\r\t ", pos);
+    if (end == std::string::npos) end = json.size();
+    return json.substr(start, end - start);
 }
 
 /// Extract the "arguments" field as a raw JSON string (object or string).
