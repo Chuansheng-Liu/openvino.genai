@@ -313,9 +313,47 @@ static ParsedRequest parse_chat_request(const json& body, ov::genai::Tokenizer& 
         // thinking tag placement for prefix cache compatibility.
         // Historical image markers will be expanded by tokenize_text using
         // stored per-image pad counts.
+
+        // Build tool definition block for system message (Qwen3.5 format)
+        std::string tool_defs;
+        if (!req.tools.empty()) {
+            tool_defs = "\n\n# Tools\n\nYou may call one or more functions to assist "
+                        "with the user query.\n\nYou are provided with function signatures "
+                        "within <tools></tools> XML tags:\n<tools>";
+            for (const auto& tool : req.tools) {
+                tool_defs += "\n" + tool.dump();
+            }
+            tool_defs += "\n</tools>\n\nFor each function call, return a json object with "
+                         "function name and arguments within <tool_call></tool_call> XML tags:\n"
+                         "<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n"
+                         "</tool_call>";
+        }
+
         std::string chat_text;
-        for (const auto& msg : messages) {
+        bool system_emitted = false;
+        bool in_tool_group = false;  // track consecutive tool messages
+        for (size_t mi = 0; mi < messages.size(); ++mi) {
+            const auto& msg = messages[mi];
             std::string role = msg.at("role").get<std::string>();
+
+            // Handle tool response messages: wrap in <tool_response> inside user block
+            if (role == "tool") {
+                std::string tc = msg.contains("content") && msg["content"].is_string()
+                    ? msg["content"].get<std::string>() : "";
+                if (!in_tool_group) {
+                    chat_text += "<|im_start|>user";
+                    in_tool_group = true;
+                }
+                chat_text += "\n<tool_response>\n" + tc + "\n</tool_response>";
+                bool next_is_tool = (mi + 1 < messages.size()
+                    && messages[mi + 1].value("role", "") == "tool");
+                if (!next_is_tool) {
+                    chat_text += "<|im_end|>\n";
+                    in_tool_group = false;
+                }
+                continue;
+            }
+
             std::string content;
             if (msg.contains("content")) {
                 if (msg["content"].is_string()) {
@@ -338,8 +376,41 @@ static ParsedRequest parse_chat_request(const json& body, ov::genai::Tokenizer& 
                     content = "";
                 }
             }
-            chat_text += "<|im_start|>" + role + "\n" + content + "<|im_end|>\n";
+
+            // Inject tool definitions into the first system message
+            if (role == "system" && !system_emitted && !tool_defs.empty()) {
+                content += tool_defs;
+                system_emitted = true;
+            }
+
+            chat_text += "<|im_start|>" + role + "\n" + content;
+
+            // Append tool_calls for assistant messages (Qwen3.5 format)
+            if (role == "assistant" && msg.contains("tool_calls") && msg["tool_calls"].is_array()) {
+                for (size_t ti = 0; ti < msg["tool_calls"].size(); ++ti) {
+                    const auto& tc = msg["tool_calls"][ti];
+                    json func = tc.contains("function") ? tc["function"] : tc;
+                    std::string tc_name = func.value("name", "");
+                    std::string tc_args = func.contains("arguments")
+                        ? (func["arguments"].is_string() ? func["arguments"].get<std::string>()
+                                                         : func["arguments"].dump())
+                        : "{}";
+                    if ((ti == 0 && !content.empty()) || ti > 0) {
+                        chat_text += "\n";
+                    }
+                    chat_text += "<tool_call>\n{\"name\": \"" + tc_name
+                              + "\", \"arguments\": " + tc_args + "}\n</tool_call>";
+                }
+            }
+
+            chat_text += "<|im_end|>\n";
         }
+
+        // If tools were provided but no system message existed, emit one
+        if (!tool_defs.empty() && !system_emitted) {
+            chat_text = "<|im_start|>system\n" + tool_defs + "<|im_end|>\n" + chat_text;
+        }
+
         chat_text += "<|im_start|>assistant\n";
         if (cfg.enable_thinking) {
             chat_text += "<think>\n";
