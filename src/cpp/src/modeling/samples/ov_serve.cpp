@@ -298,10 +298,14 @@ static ParsedRequest parse_chat_request(const json& body, ov::genai::Tokenizer& 
     const std::string think_prefix = "<think>\n</think>\n\n";
     for (size_t i = 0; i < messages.size(); ++i) {
         if (messages[i].value("role", "") == "assistant"
-            && i + 1 < messages.size()  // not the last message (which is the new assistant turn)
-            && messages[i].contains("content")
-            && messages[i]["content"].is_string()) {
-            std::string c = messages[i]["content"].get<std::string>();
+            && i + 1 < messages.size()) {  // not the last message (which is the new assistant turn)
+            // Normalize null / missing content to empty string so that the
+            // think-prefix is always present (the model expects <think>
+            // tags in every assistant turn; omitting them confuses it at
+            // long context lengths, e.g. Hermes agent interrupted turns).
+            std::string c;
+            if (messages[i].contains("content") && messages[i]["content"].is_string())
+                c = messages[i]["content"].get<std::string>();
             if (c.find("<think>") == std::string::npos) {
                 messages[i]["content"] = think_prefix + c;
             }
@@ -1406,10 +1410,10 @@ int main(int argc, char* argv[]) {
             const std::string think_prefix = "<think>\n</think>\n\n";
             for (size_t i = 0; i < messages.size(); ++i) {
                 if (messages[i].value("role", "") == "assistant"
-                    && i + 1 < messages.size()
-                    && messages[i].contains("content")
-                    && messages[i]["content"].is_string()) {
-                    std::string c = messages[i]["content"].get<std::string>();
+                    && i + 1 < messages.size()) {
+                    std::string c;
+                    if (messages[i].contains("content") && messages[i]["content"].is_string())
+                        c = messages[i]["content"].get<std::string>();
                     if (c.find("<think>") == std::string::npos) {
                         messages[i]["content"] = think_prefix + c;
                     }
