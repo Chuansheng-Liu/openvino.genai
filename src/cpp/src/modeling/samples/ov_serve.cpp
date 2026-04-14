@@ -265,6 +265,7 @@ static ParsedRequest parse_chat_request(const json& body, ov::genai::Tokenizer& 
     // Extract tool definitions
     if (body.contains("tools")) {
         req.tools = body["tools"].get<std::vector<json>>();
+        std::cerr << "[ov_serve] tools: " << req.tools.size() << " tool(s) provided\n";
     }
 
     // Build prompt: use native chat template for text-only requests;
@@ -314,10 +315,12 @@ static ParsedRequest parse_chat_request(const json& body, ov::genai::Tokenizer& 
         // Historical image markers will be expanded by tokenize_text using
         // stored per-image pad counts.
 
-        // Build tool definition block for system message (Qwen3.5 format)
+         // Build tool definition block (Qwen3.5 format) — will be emitted as a
+        // separate system message near the end of the context so the model attends
+        // to it even when the primary system prompt is very long (e.g. Hermes agent).
         std::string tool_defs;
         if (!req.tools.empty()) {
-            tool_defs = "\n\n# Tools\n\nYou may call one or more functions to assist "
+            tool_defs = "# Tools\n\nYou may call one or more functions to assist "
                         "with the user query.\n\nYou are provided with function signatures "
                         "within <tools></tools> XML tags:\n<tools>";
             for (const auto& tool : req.tools) {
@@ -330,7 +333,6 @@ static ParsedRequest parse_chat_request(const json& body, ov::genai::Tokenizer& 
         }
 
         std::string chat_text;
-        bool system_emitted = false;
         bool in_tool_group = false;  // track consecutive tool messages
         for (size_t mi = 0; mi < messages.size(); ++mi) {
             const auto& msg = messages[mi];
@@ -377,12 +379,6 @@ static ParsedRequest parse_chat_request(const json& body, ov::genai::Tokenizer& 
                 }
             }
 
-            // Inject tool definitions into the first system message
-            if (role == "system" && !system_emitted && !tool_defs.empty()) {
-                content += tool_defs;
-                system_emitted = true;
-            }
-
             chat_text += "<|im_start|>" + role + "\n" + content;
 
             // Append tool_calls for assistant messages (Qwen3.5 format)
@@ -406,9 +402,12 @@ static ParsedRequest parse_chat_request(const json& body, ov::genai::Tokenizer& 
             chat_text += "<|im_end|>\n";
         }
 
-        // If tools were provided but no system message existed, emit one
-        if (!tool_defs.empty() && !system_emitted) {
-            chat_text = "<|im_start|>system\n" + tool_defs + "<|im_end|>\n" + chat_text;
+        // If tools were provided, emit them as a separate system message right
+        // before the assistant turn.  Placing tool definitions here (near the end
+        // of the context) ensures the model attends to them even when the main
+        // system prompt is very long (10K+ tokens, e.g. Hermes agent).
+        if (!tool_defs.empty()) {
+            chat_text += "<|im_start|>system\n" + tool_defs + "<|im_end|>\n";
         }
 
         chat_text += "<|im_start|>assistant\n";
@@ -483,7 +482,7 @@ static ParsedRequest parse_chat_request(const json& body, ov::genai::Tokenizer& 
                 dbg.replace(pos + 30, end - pos - 30, "...<base64_truncated>...");
             }
         }
-        if (dbg.size() > 2000) dbg = dbg.substr(0, 2000) + "...(truncated)";
+        if (dbg.size() > 8000) dbg = dbg.substr(0, 4000) + "\n...(truncated " + std::to_string(dbg.size()) + " chars)...\n" + dbg.substr(dbg.size() - 4000);
         std::cerr << "[ov_serve] PROMPT: " << dbg << "\n";
     }
 
