@@ -265,7 +265,8 @@ static ParsedRequest parse_chat_request(const json& body, ov::genai::Tokenizer& 
     // Extract tool definitions
     if (body.contains("tools")) {
         req.tools = body["tools"].get<std::vector<json>>();
-        std::cerr << "[ov_serve] tools: " << req.tools.size() << " tool(s) provided\n";
+        if (cfg.enable_logging)
+            std::cerr << "[ov_serve] tools: " << req.tools.size() << " tool(s) provided\n";
     }
 
     // Build prompt: use native chat template for text-only requests;
@@ -338,6 +339,7 @@ static ParsedRequest parse_chat_request(const json& body, ov::genai::Tokenizer& 
 
         std::string chat_text;
         bool in_tool_group = false;  // track consecutive tool messages
+        bool tool_defs_emitted = false;  // emit tool defs once, right after first system message
         for (size_t mi = 0; mi < messages.size(); ++mi) {
             const auto& msg = messages[mi];
             std::string role = msg.at("role").get<std::string>();
@@ -395,7 +397,7 @@ static ParsedRequest parse_chat_request(const json& body, ov::genai::Tokenizer& 
                         ? (func["arguments"].is_string() ? func["arguments"].get<std::string>()
                                                          : func["arguments"].dump())
                         : "{}";
-                    if ((ti == 0 && !content.empty()) || ti > 0) {
+                    if ((ti == 0 && !content.empty() && content.back() != '\n') || ti > 0) {
                         chat_text += "\n";
                     }
                     chat_text += "<tool_call>\n{\"name\": \"" + tc_name
@@ -404,13 +406,20 @@ static ParsedRequest parse_chat_request(const json& body, ov::genai::Tokenizer& 
             }
 
             chat_text += "<|im_end|>\n";
+
+            // Emit tool definitions as a separate system message right after the
+            // first system message.  This keeps them at a FIXED position in the
+            // token sequence so that the prefix cache can reuse KV entries across
+            // multi-turn conversations (the system prompt + tools block is the
+            // stable prefix shared by all requests in a session).
+            if (role == "system" && !tool_defs.empty() && !tool_defs_emitted) {
+                chat_text += "<|im_start|>system\n" + tool_defs + "<|im_end|>\n";
+                tool_defs_emitted = true;
+            }
         }
 
-        // If tools were provided, emit them as a separate system message right
-        // before the assistant turn.  Placing tool definitions here (near the end
-        // of the context) ensures the model attends to them even when the main
-        // system prompt is very long (10K+ tokens, e.g. Hermes agent).
-        if (!tool_defs.empty()) {
+        // Fallback: if no system message was seen, emit tool defs before assistant turn
+        if (!tool_defs.empty() && !tool_defs_emitted) {
             chat_text += "<|im_start|>system\n" + tool_defs + "<|im_end|>\n";
         }
 
@@ -871,8 +880,9 @@ int main(int argc, char* argv[]) {
 
                         auto callback = [&](const StreamChunk& sc) -> bool {
                             if (sc.event == StreamEvent::TOKEN && !sc.token_text.empty()) {
-                                std::cerr << "[DEBUG-STREAM] TOKEN thinking=" << sc.is_thinking
-                                          << " text='" << sc.token_text.substr(0, 30) << "'\n";
+                                if (log)
+                                    std::cerr << "[DEBUG-STREAM] TOKEN thinking=" << sc.is_thinking
+                                              << " text='" << sc.token_text.substr(0, 30) << "'\n";
                                 if (sc.is_thinking) {
                                     // Send as reasoning_content delta
                                     json tc;
