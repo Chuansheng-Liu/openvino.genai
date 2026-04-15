@@ -96,7 +96,12 @@ bool is_env_truthy(const char* env_name) {
  * Controlled by OV_GENAI_USE_MODELING_API environment variable
  */
 bool use_modeling_api() {
-    return is_env_truthy("OV_GENAI_USE_MODELING_API");
+    const char* env = std::getenv("OV_GENAI_USE_MODELING_API");
+    if (env == nullptr) {
+        return true;  // Default: enabled
+    }
+    std::string val(env);
+    return (val == "1" || val == "true" || val == "TRUE");
 }
 
 /**
