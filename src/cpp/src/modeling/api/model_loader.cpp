@@ -323,25 +323,29 @@ struct ModelLoader::Impl {
 
         // ─── Text model ───
         std::shared_ptr<ov::Model> text_model;
-        if (load_text_from_ir) {
-            std::cerr << "[ModelLoader] Reusing cached text IR: " << text_ir_pair->first << std::endl;
-            text_model = core.read_model(text_ir_pair->first.string(), text_ir_pair->second.string());
-            if (use_vl && !is_vl_text_ir_compatible(text_model)) {
-                if (!has_hf_weights) {
-                    throw std::runtime_error("Bundled text IR is not VL-compatible: " + text_ir_pair->first.string());
+        if (!params.skip_text_compile) {
+            if (load_text_from_ir) {
+                std::cerr << "[ModelLoader] Reusing cached text IR: " << text_ir_pair->first << std::endl;
+                text_model = core.read_model(text_ir_pair->first.string(), text_ir_pair->second.string());
+                if (use_vl && !is_vl_text_ir_compatible(text_model)) {
+                    if (!has_hf_weights) {
+                        throw std::runtime_error("Bundled text IR is not VL-compatible: " + text_ir_pair->first.string());
+                    }
+                    std::cerr << "[ModelLoader] Cached text IR not VL-compatible, rebuilding" << std::endl;
+                    text_model.reset();
                 }
-                std::cerr << "[ModelLoader] Cached text IR not VL-compatible, rebuilding" << std::endl;
-                text_model.reset();
             }
-        }
-        if (!text_model) {
-            auto& ws = ensure_source();
-            ov::genai::safetensors::SafetensorsWeightFinalizer finalizer(text_quant_);
-            text_model = models::create_qwen3_5_text_model(cfg_, ws, finalizer, false, use_vl);
-            if (params.cache_ir) {
-                ov::serialize(text_model, text_xml.string(), text_bin.string());
-                std::cerr << "[ModelLoader] Saved text IR: " << text_xml << std::endl;
+            if (!text_model) {
+                auto& ws = ensure_source();
+                ov::genai::safetensors::SafetensorsWeightFinalizer finalizer(text_quant_);
+                text_model = models::create_qwen3_5_text_model(cfg_, ws, finalizer, false, use_vl);
+                if (params.cache_ir) {
+                    ov::serialize(text_model, text_xml.string(), text_bin.string());
+                    std::cerr << "[ModelLoader] Saved text IR: " << text_xml << std::endl;
+                }
             }
+        } else {
+            std::cerr << "[ModelLoader] Skipping text model (DFlash mode)" << std::endl;
         }
 
         // Release weight source early
@@ -356,9 +360,11 @@ struct ModelLoader::Impl {
             std::cerr << "[ModelLoader] Compiling vision model on " << vision_device << std::endl;
             compiled_vision_ = core.compile_model(vision_model, vision_device);
         }
-        std::cerr << "[ModelLoader] Compiling text model on " << device_ << std::endl;
-        compiled_text_ = core.compile_model(text_model, device_);
-        gpu_ctx_ = try_get_gpu_context(compiled_text_);
+        if (text_model) {
+            std::cerr << "[ModelLoader] Compiling text model on " << device_ << std::endl;
+            compiled_text_ = core.compile_model(text_model, device_);
+            gpu_ctx_ = try_get_gpu_context(compiled_text_);
+        }
 
         // ─── Tokenizer ───
         try {

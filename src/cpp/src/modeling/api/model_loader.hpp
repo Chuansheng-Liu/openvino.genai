@@ -22,6 +22,7 @@ struct LoadParams {
     weights::QuantizationConfig quant_config;   // defaults from env if empty
     bool cache_ir = true;                       // cache generated IR to disk
     bool enable_vision = true;                  // load vision model
+    bool skip_text_compile = false;             // skip text model GPU compile (DFlash mode)
     std::optional<int> num_layers;              // debug: override layer count
     int max_pixels = 0;                         // VL: max pixel count
 };
