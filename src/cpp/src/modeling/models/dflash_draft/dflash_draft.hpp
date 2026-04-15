@@ -48,6 +48,7 @@ struct DFlashDraftConfig {
     std::string hidden_act = "silu";
     bool attention_bias = false;
     std::vector<int32_t> target_layer_ids;
+    int64_t mask_token_id = -1;  // from dflash_config in config.json
 
     /// Number of context layers for ctx_dim computation.
     /// Uses explicit target_layer_ids count if available, else falls back to num_hidden_layers.

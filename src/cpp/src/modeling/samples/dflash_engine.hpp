@@ -238,6 +238,7 @@ public:
         dcfg.hidden_act = draft_cfg_raw.hidden_act;
         dcfg.attention_bias = draft_cfg_raw.attention_bias;
         dcfg.target_layer_ids = draft_cfg_raw.target_layer_ids;
+        dcfg.mask_token_id = draft_cfg_raw.mask_token_id;
         if (dcfg.target_layer_ids.empty()) {
             dcfg.target_layer_ids = models::build_target_layer_ids(
                 dcfg.num_target_layers, dcfg.num_hidden_layers);
@@ -382,7 +383,11 @@ public:
 
         // Tokenizer
         tokenizer_ = std::make_unique<ov::genai::Tokenizer>(target_dir_);
-        mask_token_id_ = detail::resolve_mask_token_id(*tokenizer_);
+        // Use mask_token_id from draft config if available (must match training);
+        // fall back to tokenizer heuristic otherwise.
+        mask_token_id_ = (dflash_cfg_.mask_token_id > 0)
+                             ? dflash_cfg_.mask_token_id
+                             : detail::resolve_mask_token_id(*tokenizer_);
         eos_token_id_ = tokenizer_->get_eos_token_id();
 
         // Pre-allocate reusable tensors
