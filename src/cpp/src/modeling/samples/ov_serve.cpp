@@ -19,6 +19,7 @@
 #include "modeling/api/thinking_tracker.hpp"
 #include "modeling/api/tool_call_parser.hpp"
 #include "modeling/api/types.hpp"
+#include "modeling/models/qwen3_5/modeling_qwen3_5_vision.hpp"
 #include "dflash_engine.hpp"
 
 #include <nlohmann/json.hpp>
@@ -27,6 +28,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstring>
+#include <iomanip>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -294,11 +296,11 @@ static ParsedRequest parse_chat_request(const json& body, ov::genai::Tokenizer& 
 
     // Prepend thinking tags to historical assistant messages so that the
     // tokenized prompt matches what was originally generated (the model's
-    // output always starts with <think>\n</think>\n\n when thinking is
+    // output always starts with <think>\n\n</think>\n\n when thinking is
     // disabled, or <think>\n...thoughts...</think>\n\n when enabled).
     // Without this, prefix cache would miss because the cached KV sequence
     // contains these thinking tokens but the rebuilt prompt does not.
-    const std::string think_prefix = "<think>\n</think>\n\n";
+    const std::string think_prefix = "<think>\n\n</think>\n\n";
     for (size_t i = 0; i < messages.size(); ++i) {
         if (messages[i].value("role", "") == "assistant"
             && i + 1 < messages.size()) {  // not the last message (which is the new assistant turn)
@@ -429,7 +431,7 @@ static ParsedRequest parse_chat_request(const json& body, ov::genai::Tokenizer& 
         if (cfg.enable_thinking) {
             chat_text += "<think>\n";
         } else {
-            chat_text += "<think>\n</think>\n\n";
+            chat_text += "<think>\n\n</think>\n\n";
         }
         req.prompt = chat_text;
     } else {
@@ -466,7 +468,7 @@ static ParsedRequest parse_chat_request(const json& body, ov::genai::Tokenizer& 
         if (cfg.enable_thinking) {
             chat_text += "<think>\n";
         } else {
-            chat_text += "<think>\n</think>\n\n";
+            chat_text += "<think>\n\n</think>\n\n";
         }
         req.prompt = chat_text;
     }
@@ -720,10 +722,13 @@ int main(int argc, char* argv[]) {
     std::cerr << "[ov_serve] Loading model from " << cfg.model_path << " ...\n";
     auto t0 = std::chrono::steady_clock::now();
 
+    bool dflash_enabled = !cfg.dflash_model_path.empty();
+
     LoadParams lp;
     lp.device = cfg.device;
     lp.cache_ir = true;
     lp.enable_vision = cfg.enable_vision;
+    lp.skip_text_compile = dflash_enabled;  // DFlash has its own target model
 
     ModelLoader loader(cfg.model_path, lp);
 
@@ -731,20 +736,23 @@ int main(int argc, char* argv[]) {
     double load_sec = std::chrono::duration<double>(t1 - t0).count();
     std::cerr << "[ov_serve] Model loaded in " << load_sec << "s\n";
 
-    // ── Create worker pool ──
-    std::cerr << "[ov_serve] Creating " << cfg.workers << " worker session(s)...\n";
-    WorkerPool pool(loader, cfg.workers);
-    std::cerr << "[ov_serve] Workers ready\n";
+    // ── Create worker pool (skip when DFlash handles all text) ──
+    std::unique_ptr<WorkerPool> pool_ptr;
+    if (!dflash_enabled) {
+        std::cerr << "[ov_serve] Creating " << cfg.workers << " worker session(s)...\n";
+        pool_ptr = std::make_unique<WorkerPool>(loader, cfg.workers);
+        std::cerr << "[ov_serve] Workers ready\n";
 
-    // ── GPU warmup ──
-    if (cfg.warmup_tokens > 0) {
-        std::cerr << "[ov_serve] Warming up " << pool.size()
-                  << " session(s) with max_seq_len=" << cfg.warmup_tokens << "...\n";
-        auto tw0 = std::chrono::steady_clock::now();
-        pool.warmup(cfg.warmup_tokens);
-        auto tw1 = std::chrono::steady_clock::now();
-        double warmup_sec = std::chrono::duration<double>(tw1 - tw0).count();
-        std::cerr << "[ov_serve] Warmup complete in " << warmup_sec << "s\n";
+        // ── GPU warmup ──
+        if (cfg.warmup_tokens > 0) {
+            std::cerr << "[ov_serve] Warming up " << pool_ptr->size()
+                      << " session(s) with max_seq_len=" << cfg.warmup_tokens << "...\n";
+            auto tw0 = std::chrono::steady_clock::now();
+            pool_ptr->warmup(cfg.warmup_tokens);
+            auto tw1 = std::chrono::steady_clock::now();
+            double warmup_sec = std::chrono::duration<double>(tw1 - tw0).count();
+            std::cerr << "[ov_serve] Warmup complete in " << warmup_sec << "s\n";
+        }
     }
 
     auto* tokenizer = loader.tokenizer();
@@ -752,7 +760,6 @@ int main(int argc, char* argv[]) {
 
     // ── DFlash engine (optional speculative decoding) ──
     std::unique_ptr<dflash::DFlashEngine> dflash_engine;
-    bool dflash_enabled = !cfg.dflash_model_path.empty();
     if (dflash_enabled) {
         std::cerr << "[ov_serve] Loading DFlash engine (draft: " << cfg.dflash_model_path << ")...\n";
         auto td0 = std::chrono::steady_clock::now();
@@ -761,6 +768,7 @@ int main(int argc, char* argv[]) {
         dcfg.draft_model_dir = cfg.dflash_model_path;
         dcfg.device = cfg.device;
         dflash_engine = std::make_unique<dflash::DFlashEngine>(dcfg);
+        dflash_engine->set_stop_token_ids(loader.stop_token_ids());
         auto td1 = std::chrono::steady_clock::now();
         double dflash_sec = std::chrono::duration<double>(td1 - td0).count();
         std::cerr << "[ov_serve] DFlash engine loaded in " << dflash_sec << "s\n";
@@ -792,8 +800,8 @@ int main(int argc, char* argv[]) {
 
     // Chat completions
     svr.Post("/v1/chat/completions",
-             [&pool, &cfg, &model_name, tokenizer,
-              &dflash_engine, dflash_enabled, &dflash_mu](const httplib::Request& req,
+             [&pool_ptr, &cfg, &model_name, tokenizer,
+              &dflash_engine, dflash_enabled, &dflash_mu, &loader](const httplib::Request& req,
                                                     httplib::Response& res) {
         json body;
         try {
@@ -859,20 +867,156 @@ int main(int argc, char* argv[]) {
                       << " stream=" << parsed.stream << "\n";
         }
 
-        // ── DFlash speculative decoding path (text-only) ──
-        if (dflash_enabled && parsed.images.empty()) {
+        // ── DFlash speculative decoding path (text + VL) ──
+        if (dflash_enabled) {
+            // VL preprocessing: run vision encoder and build VL inputs
+            std::shared_ptr<dflash::DFlashVLInputs> vl_inputs;
+            if (!parsed.images.empty()) {
+                try {
+                    using namespace ov::genai::modeling;
+
+                    auto* compiled_vision = loader.compiled_vision();
+                    if (!compiled_vision) {
+                        res.status = 400;
+                        json err;
+                        err["error"]["message"] = "Vision model not available";
+                        err["error"]["type"] = "invalid_request_error";
+                        res.set_content(err.dump(), "application/json");
+                        return;
+                    }
+
+                    const auto& model_cfg = loader.config();
+                    models::Qwen3_5VisionPreprocessor preprocessor(
+                        model_cfg.vision, loader.preprocess_config());
+
+                    // Run vision encoder for each image
+                    auto vision_req = compiled_vision->create_infer_request();
+                    std::vector<ov::Tensor> per_image_embeds;
+                    std::vector<std::array<int64_t, 3>> per_image_grid;
+                    size_t total_vis_tokens = 0;
+
+                    for (const auto& image : parsed.images) {
+                        auto inputs = preprocessor.preprocess(image, loader.pos_embed_weight());
+                        vision_req.set_tensor(models::Qwen3_5VisionIO::kPixelValues, inputs.pixel_values);
+                        vision_req.set_tensor(models::Qwen3_5VisionIO::kGridThw, inputs.grid_thw);
+                        vision_req.set_tensor(models::Qwen3_5VisionIO::kPosEmbeds, inputs.pos_embeds);
+                        vision_req.set_tensor(models::Qwen3_5VisionIO::kRotaryCos, inputs.rotary_cos);
+                        vision_req.set_tensor(models::Qwen3_5VisionIO::kRotarySin, inputs.rotary_sin);
+                        vision_req.infer();
+
+                        ov::Tensor ref = vision_req.get_tensor(models::Qwen3_5VisionIO::kVisualEmbeds);
+                        ov::Tensor embeds(ref.get_element_type(), ref.get_shape());
+                        std::memcpy(embeds.data(), ref.data(), ref.get_byte_size());
+
+                        const auto* g = inputs.grid_thw.data<const int64_t>();
+                        per_image_grid.push_back({g[0], g[1], g[2]});
+                        total_vis_tokens += embeds.get_shape().at(0);
+                        per_image_embeds.push_back(std::move(embeds));
+                    }
+
+                    // Build combined grid_thw [N, 3]
+                    ov::Tensor grid_thw(ov::element::i64, {parsed.images.size(), 3});
+                    auto* gdata = grid_thw.data<int64_t>();
+                    for (size_t i = 0; i < per_image_grid.size(); ++i) {
+                        gdata[i * 3 + 0] = per_image_grid[i][0];
+                        gdata[i * 3 + 1] = per_image_grid[i][1];
+                        gdata[i * 3 + 2] = per_image_grid[i][2];
+                    }
+
+                    // Concatenate visual embeds if multiple images
+                    ov::Tensor visual_embeds;
+                    if (per_image_embeds.size() == 1) {
+                        visual_embeds = per_image_embeds[0];
+                    } else {
+                        const auto hidden = per_image_embeds[0].get_shape().at(1);
+                        const auto elem_type = per_image_embeds[0].get_element_type();
+                        visual_embeds = ov::Tensor(elem_type, {total_vis_tokens, hidden});
+                        char* dst = static_cast<char*>(visual_embeds.data());
+                        for (const auto& e : per_image_embeds) {
+                            const size_t nb = e.get_byte_size();
+                            std::memcpy(dst, e.data(), nb);
+                            dst += nb;
+                        }
+                    }
+
+                    // Tokenize VL prompt (expand vision markers with pad tokens)
+                    const int32_t merge = model_cfg.vision.spatial_merge_size;
+                    const int64_t total_tokens = models::Qwen3_5VisionPreprocessor::count_visual_tokens(
+                        grid_thw, merge);
+
+                    // Expand all <|vision_start|><|vision_end|> markers
+                    std::string vl_prompt = parsed.prompt;
+                    const std::string marker = "<|vision_start|><|vision_end|>";
+                    size_t pos = 0, img_idx = 0;
+                    while ((pos = vl_prompt.find(marker, pos)) != std::string::npos
+                           && img_idx < per_image_grid.size()) {
+                        const int64_t h = per_image_grid[img_idx][1];
+                        const int64_t w = per_image_grid[img_idx][2];
+                        const int64_t pad_count = per_image_grid[img_idx][0] * (h / merge) * (w / merge);
+                        std::string expansion = "<|vision_start|>";
+                        for (int64_t i = 0; i < pad_count; ++i)
+                            expansion += "<|image_pad|>";
+                        expansion += "<|vision_end|>";
+                        vl_prompt.replace(pos, marker.size(), expansion);
+                        pos += expansion.size();
+                        ++img_idx;
+                    }
+
+                    auto encoded = tokenizer->encode(vl_prompt, ov::genai::add_special_tokens(false));
+
+                    // Build VL plan (mRoPE position IDs + visual position mask)
+                    models::Qwen3_5InputPlanner planner(model_cfg);
+                    auto plan = planner.build_plan(encoded.input_ids, &encoded.attention_mask, &grid_thw);
+
+                    // Scatter visual embeddings into padded sequence-length tensor
+                    auto visual_padded = models::Qwen3_5InputPlanner::scatter_visual_embeds(
+                        visual_embeds, plan.visual_pos_mask);
+
+                    vl_inputs = std::make_shared<dflash::DFlashVLInputs>();
+                    vl_inputs->input_ids = encoded.input_ids;
+                    vl_inputs->attention_mask = encoded.attention_mask;
+                    vl_inputs->position_ids = plan.position_ids;
+                    vl_inputs->visual_embeds = visual_padded;
+                    vl_inputs->visual_pos_mask = plan.visual_pos_mask;
+
+                    if (cfg.enable_logging) {
+                        std::cerr << "[ov_serve] " << request_id << " [dflash-vl] "
+                                  << parsed.images.size() << " images, "
+                                  << total_tokens << " vision tokens, "
+                                  << encoded.input_ids.get_shape()[1] << " prompt tokens\n";
+                    }
+                } catch (const std::exception& e) {
+                    res.status = 500;
+                    json err;
+                    err["error"]["message"] = std::string("Vision preprocessing error: ") + e.what();
+                    err["error"]["type"] = "server_error";
+                    res.set_content(err.dump(), "application/json");
+                    return;
+                }
+            }
+
             auto sp = std::move(parsed);
             auto rid = request_id;
             auto mn = model_name;
             auto log = cfg.enable_logging;
             auto max_tok = sp.params.max_new_tokens;
+            auto enable_thinking = cfg.enable_thinking;
 
             if (sp.stream) {
                 res.set_chunked_content_provider(
                     "text/event-stream",
-                    [&dflash_engine, &dflash_mu, sp = std::move(sp), rid, mn, log, max_tok](
+                    [&dflash_engine, &dflash_mu, sp = std::move(sp), rid, mn, log, max_tok,
+                     vl_inputs, enable_thinking](
                         size_t, httplib::DataSink& sink) {
                         std::lock_guard<std::mutex> lock(dflash_mu);
+
+                        // ThinkingTracker to strip <think>...</think> from output
+                        ov::genai::modeling::ThinkingTracker think_tracker;
+                        if (!enable_thinking) {
+                            // When thinking is disabled, prompt has <think>\n\n</think>\n\n
+                            // but model may still emit these tokens — tracker will strip them.
+                            // Start in BEFORE_THINKING so it catches any <think> tags.
+                        }
 
                         // Send initial role chunk
                         {
@@ -896,7 +1040,11 @@ int main(int argc, char* argv[]) {
                                 sp.prompt, max_tok,
                                 [&](const std::string& text, bool is_eos) -> bool {
                                     if (!sink.is_writable()) return false;
-                                    auto pr = tool_parser.process(text);
+                                    // Filter through ThinkingTracker to strip <think>...</think>
+                                    auto tr = think_tracker.process(text);
+                                    const std::string& content = tr.content_text;
+                                    if (content.empty()) return true;
+                                    auto pr = tool_parser.process(content);
                                     for (auto& tc : pr.tool_calls)
                                         accumulated_tool_calls.push_back(std::move(tc));
                                     if (!pr.text.empty()) {
@@ -912,7 +1060,8 @@ int main(int argc, char* argv[]) {
                                         if (!sink.write(s.c_str(), s.size())) return false;
                                     }
                                     return true;
-                                });
+                                },
+                                vl_inputs.get());
 
                             // Flush tool parser
                             auto final_pr = tool_parser.flush();
@@ -988,12 +1137,18 @@ int main(int argc, char* argv[]) {
                             sink.write(done.c_str(), done.size());
 
                             if (log) {
-                                std::cerr << "[ov_serve] " << rid << " [dflash] "
+                                double accept_rate = result.generated_tokens > 0
+                                    ? static_cast<double>(result.accepted_tokens) / static_cast<double>(result.generated_tokens) : 0.0;
+                                double avg_accept = result.draft_steps > 0
+                                    ? static_cast<double>(result.accepted_tokens) / static_cast<double>(result.draft_steps) : 0.0;
+                                std::cerr << std::fixed << std::setprecision(1)
+                                          << "[ov_serve] " << rid << " [dflash] "
                                           << result.prompt_tokens << "p+"
                                           << result.generated_tokens << "g "
-                                          << result.throughput << " t/s "
-                                          << "accept=" << result.accepted_tokens
-                                          << "/" << result.draft_steps << " steps\n";
+                                          << result.throughput << " t/s | "
+                                          << result.draft_steps << " steps, "
+                                          << std::setprecision(1) << (accept_rate * 100) << "% accept, "
+                                          << std::setprecision(1) << avg_accept << " avg/step\n";
                             }
                         } catch (const std::exception& e) {
                             json err_chunk;
@@ -1011,7 +1166,8 @@ int main(int argc, char* argv[]) {
                 // Non-streaming DFlash
                 res.set_chunked_content_provider(
                     "application/json",
-                    [&dflash_engine, &dflash_mu, sp = std::move(sp), rid, mn, log, max_tok](
+                    [&dflash_engine, &dflash_mu, sp = std::move(sp), rid, mn, log, max_tok,
+                     vl_inputs](
                         size_t, httplib::DataSink& sink) {
                         std::lock_guard<std::mutex> lock(dflash_mu);
 
@@ -1029,7 +1185,8 @@ int main(int argc, char* argv[]) {
                                         accumulated_tool_calls.push_back(std::move(tc));
                                     full_text += pr.text;
                                     return true;
-                                });
+                                },
+                                vl_inputs.get());
 
                             auto final_pr = tool_parser.flush();
                             for (auto& tc : final_pr.tool_calls)
@@ -1077,12 +1234,18 @@ int main(int argc, char* argv[]) {
                             sink.write(body.c_str(), body.size());
 
                             if (log) {
-                                std::cerr << "[ov_serve] " << rid << " [dflash] "
+                                double accept_rate = result.generated_tokens > 0
+                                    ? static_cast<double>(result.accepted_tokens) / static_cast<double>(result.generated_tokens) : 0.0;
+                                double avg_accept = result.draft_steps > 0
+                                    ? static_cast<double>(result.accepted_tokens) / static_cast<double>(result.draft_steps) : 0.0;
+                                std::cerr << std::fixed << std::setprecision(1)
+                                          << "[ov_serve] " << rid << " [dflash] "
                                           << result.prompt_tokens << "p+"
                                           << result.generated_tokens << "g "
-                                          << result.throughput << " t/s "
-                                          << "accept=" << result.accepted_tokens
-                                          << "/" << result.draft_steps << " steps\n";
+                                          << result.throughput << " t/s | "
+                                          << result.draft_steps << " steps, "
+                                          << std::setprecision(1) << (accept_rate * 100) << "% accept, "
+                                          << std::setprecision(1) << avg_accept << " avg/step\n";
                             }
                         } catch (const std::exception& e) {
                             json err;
@@ -1110,10 +1273,10 @@ int main(int argc, char* argv[]) {
 
                 res.set_chunked_content_provider(
                     "text/event-stream",
-                    [&pool, sp = std::move(sp), rid, mn, warmup_tok, log](size_t /*offset*/,
+                    [&pool_ptr, sp = std::move(sp), rid, mn, warmup_tok, log](size_t /*offset*/,
                                                          httplib::DataSink& sink) {
                         // Acquire session inside content provider (lives until lambda ends)
-                        WorkerPool::Guard worker(pool);
+                        WorkerPool::Guard worker(*pool_ptr);
                         auto* session = worker.get();
 
                         // Send initial role chunk
@@ -1301,7 +1464,7 @@ int main(int argc, char* argv[]) {
                             if (is_gpu_oom(e)) {
                                 std::cerr << "[ov_serve] streaming GPU OOM, recreating session...\n";
                                 try {
-                                    pool.recreate_session(session, warmup_tok);
+                                    pool_ptr->recreate_session(session, warmup_tok);
                                 } catch (...) {}
                             }
                             // Send error as SSE event before closing
@@ -1328,9 +1491,9 @@ int main(int argc, char* argv[]) {
 
                 res.set_chunked_content_provider(
                     "application/json",
-                    [&pool, sp = std::move(sp), rid, mn, warmup_tok, log](
+                    [&pool_ptr, sp = std::move(sp), rid, mn, warmup_tok, log](
                         size_t, httplib::DataSink& sink) {
-                        WorkerPool::Guard worker(pool);
+                        WorkerPool::Guard worker(*pool_ptr);
                         auto* session = worker.get();
 
                         // Lightweight callback: only checks connection liveness
@@ -1358,7 +1521,7 @@ int main(int argc, char* argv[]) {
                                 if (is_gpu_oom(e)) {
                                     std::cerr << "[ov_serve] " << rid
                                               << " GPU OOM detected, recreating session...\n";
-                                    pool.recreate_session(session, warmup_tok);
+                                    pool_ptr->recreate_session(session, warmup_tok);
                                     result = do_generate();
                                 } else {
                                     throw;
@@ -1419,7 +1582,15 @@ int main(int argc, char* argv[]) {
 
     // Text completions
     svr.Post("/v1/completions",
-             [&pool, &cfg, &model_name](const httplib::Request& req, httplib::Response& res) {
+             [&pool_ptr, &cfg, &model_name](const httplib::Request& req, httplib::Response& res) {
+        if (!pool_ptr) {
+            res.status = 503;
+            json err;
+            err["error"]["message"] = "Text completions endpoint is unavailable in DFlash mode";
+            err["error"]["type"] = "service_unavailable";
+            res.set_content(err.dump(), "application/json");
+            return;
+        }
         json body;
         try {
             body = json::parse(req.body);
@@ -1484,9 +1655,9 @@ int main(int argc, char* argv[]) {
 
         res.set_chunked_content_provider(
             "application/json",
-            [&pool, prompt_copy = std::move(prompt_copy), params_copy, rid, mn, warmup_tok](
+            [&pool_ptr, prompt_copy = std::move(prompt_copy), params_copy, rid, mn, warmup_tok](
                 size_t, httplib::DataSink& sink) {
-                WorkerPool::Guard worker(pool);
+                WorkerPool::Guard worker(*pool_ptr);
                 auto* session = worker.get();
 
                 auto callback = [&](const StreamChunk& sc) -> bool {
@@ -1658,8 +1829,15 @@ int main(int argc, char* argv[]) {
 
     // POST /api/chat — Ollama chat (NDJSON streaming)
     svr.Post("/api/chat",
-             [&pool, &cfg, &model_name, &iso_timestamp, &parse_ollama_options, tokenizer](
+             [&pool_ptr, &cfg, &model_name, &iso_timestamp, &parse_ollama_options, tokenizer](
                  const httplib::Request& req, httplib::Response& res) {
+        if (!pool_ptr) {
+            res.status = 503;
+            json err;
+            err["error"] = "Ollama chat endpoint is unavailable in DFlash mode";
+            res.set_content(err.dump(), "application/json");
+            return;
+        }
         json body;
         try {
             body = json::parse(req.body);
@@ -1677,7 +1855,7 @@ int main(int argc, char* argv[]) {
 
         // Prepend thinking tags to historical assistant messages (same as OpenAI path)
         {
-            const std::string think_prefix = "<think>\n</think>\n\n";
+            const std::string think_prefix = "<think>\n\n</think>\n\n";
             for (size_t i = 0; i < messages.size(); ++i) {
                 if (messages[i].value("role", "") == "assistant"
                     && i + 1 < messages.size()) {
@@ -1708,7 +1886,7 @@ int main(int argc, char* argv[]) {
             if (cfg.enable_thinking) {
                 chat_text += "<think>\n";
             } else {
-                chat_text += "<think>\n</think>\n\n";
+                chat_text += "<think>\n\n</think>\n\n";
             }
         }
 
@@ -1734,9 +1912,9 @@ int main(int argc, char* argv[]) {
             auto prompt = std::move(chat_text);
             res.set_chunked_content_provider(
                 "application/x-ndjson",
-                [&pool, params, prompt, mn, &cfg, &iso_timestamp](
+                [&pool_ptr, params, prompt, mn, &cfg, &iso_timestamp](
                     size_t, httplib::DataSink& sink) {
-                    WorkerPool::Guard worker(pool);
+                    WorkerPool::Guard worker(*pool_ptr);
                     auto* session = worker.get();
 
                     auto callback = [&](const StreamChunk& sc) -> bool {
@@ -1799,9 +1977,9 @@ int main(int argc, char* argv[]) {
 
             res.set_chunked_content_provider(
                 "application/json",
-                [&pool, prompt_copy = std::move(prompt_copy), params_copy, mn, &iso_timestamp](
+                [&pool_ptr, prompt_copy = std::move(prompt_copy), params_copy, mn, &iso_timestamp](
                     size_t, httplib::DataSink& sink) {
-                    WorkerPool::Guard worker(pool);
+                    WorkerPool::Guard worker(*pool_ptr);
                     auto* session = worker.get();
 
                     auto callback = [&](const StreamChunk& sc) -> bool {
@@ -1849,8 +2027,15 @@ int main(int argc, char* argv[]) {
 
     // POST /api/generate — Ollama raw generate (NDJSON streaming)
     svr.Post("/api/generate",
-             [&pool, &cfg, &model_name, &iso_timestamp, &parse_ollama_options, tokenizer](
+             [&pool_ptr, &cfg, &model_name, &iso_timestamp, &parse_ollama_options, tokenizer](
                  const httplib::Request& req, httplib::Response& res) {
+        if (!pool_ptr) {
+            res.status = 503;
+            json err;
+            err["error"] = "Ollama generate endpoint is unavailable in DFlash mode";
+            res.set_content(err.dump(), "application/json");
+            return;
+        }
         json body;
         try {
             body = json::parse(req.body);
@@ -1887,7 +2072,7 @@ int main(int argc, char* argv[]) {
                 if (cfg.enable_thinking) {
                     wrapped += "<think>\n";
                 } else {
-                    wrapped += "<think>\n</think>\n\n";
+                    wrapped += "<think>\n\n</think>\n\n";
                 }
                 prompt = wrapped;
             }
@@ -1903,9 +2088,9 @@ int main(int argc, char* argv[]) {
         if (do_stream) {
             res.set_chunked_content_provider(
                 "application/x-ndjson",
-                [&pool, params, prompt, mn, &iso_timestamp](
+                [&pool_ptr, params, prompt, mn, &iso_timestamp](
                     size_t, httplib::DataSink& sink) {
-                    WorkerPool::Guard worker(pool);
+                    WorkerPool::Guard worker(*pool_ptr);
                     auto* session = worker.get();
 
                     auto callback = [&](const StreamChunk& sc) -> bool {
@@ -1961,9 +2146,9 @@ int main(int argc, char* argv[]) {
 
             res.set_chunked_content_provider(
                 "application/json",
-                [&pool, prompt_copy = std::move(prompt_copy), params_copy, mn, &iso_timestamp](
+                [&pool_ptr, prompt_copy = std::move(prompt_copy), params_copy, mn, &iso_timestamp](
                     size_t, httplib::DataSink& sink) {
-                    WorkerPool::Guard worker(pool);
+                    WorkerPool::Guard worker(*pool_ptr);
                     auto* session = worker.get();
 
                     auto callback = [&](const StreamChunk& sc) -> bool {
