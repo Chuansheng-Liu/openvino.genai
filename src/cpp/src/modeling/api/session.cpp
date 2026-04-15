@@ -395,18 +395,8 @@ struct Session::Impl {
                 if (prompt_data[i] != cached_token_ids_[i]) break;
                 ++prefix_match;
             }
-            // Diagnostic: log prefix cache analysis
-            std::cerr << "[prefix-cache] cached=" << cached_len
-                      << " prompt=" << prompt_len
-                      << " match=" << prefix_match;
-            if (prefix_match < cached_len && prefix_match < static_cast<size_t>(prompt_len)) {
-                std::cerr << " DIVERGE@" << prefix_match
-                          << " cached_tok=" << cached_token_ids_[prefix_match]
-                          << " prompt_tok=" << prompt_data[prefix_match];
-            }
-            std::cerr << "\n";
         } else {
-            std::cerr << "[prefix-cache] cache_valid=false (cold start)\n";
+            // cold start — no cache to compare
         }
         // Reuse cache only when the new prompt is an exact extension of the
         // cached sequence (i.e. all cached tokens match the prompt prefix
