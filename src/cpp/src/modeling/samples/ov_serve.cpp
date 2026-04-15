@@ -19,6 +19,7 @@
 #include "modeling/api/thinking_tracker.hpp"
 #include "modeling/api/tool_call_parser.hpp"
 #include "modeling/api/types.hpp"
+#include "dflash_engine.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -135,6 +136,7 @@ static ov::Tensor decode_image_from_data_uri(const std::string& uri) {
 
 struct ServerConfig {
     std::string model_path;
+    std::string dflash_model_path;   // DFlash draft model dir (empty = disabled)
     std::string device = "GPU";
     int port = 8080;
     std::string host = "0.0.0.0";
@@ -678,6 +680,7 @@ static void print_usage() {
                  "  --min-temp        Minimum temperature floor (default: 0, no override)\n"
                  "  --warmup-tokens   Max sequence length for GPU warmup (default: 0, disabled)\n"
                  "  --no-log          Disable request/prompt logging to stderr\n";
+                 "  --dflash-dir DIR  DFlash draft model dir (enables speculative decoding)\n";
 }
 
 int main(int argc, char* argv[]) {
@@ -703,6 +706,7 @@ int main(int argc, char* argv[]) {
         else if (arg == "--no-thinking") cfg.enable_thinking = false;
         else if (arg == "--vl") cfg.enable_vision = true;
         else if (arg == "--no-log") cfg.enable_logging = false;
+        else if (arg == "--dflash-dir" && i + 1 < argc) cfg.dflash_model_path = argv[++i];
         else if (arg == "--help" || arg == "-h") { print_usage(); return 0; }
     }
 
@@ -746,6 +750,25 @@ int main(int argc, char* argv[]) {
     auto* tokenizer = loader.tokenizer();
     std::string model_name = "qwen3.5";
 
+    // ── DFlash engine (optional speculative decoding) ──
+    std::unique_ptr<dflash::DFlashEngine> dflash_engine;
+    bool dflash_enabled = !cfg.dflash_model_path.empty();
+    if (dflash_enabled) {
+        std::cerr << "[ov_serve] Loading DFlash engine (draft: " << cfg.dflash_model_path << ")...\n";
+        auto td0 = std::chrono::steady_clock::now();
+        dflash::DFlashConfig dcfg;
+        dcfg.target_model_dir = cfg.model_path;
+        dcfg.draft_model_dir = cfg.dflash_model_path;
+        dcfg.device = cfg.device;
+        dflash_engine = std::make_unique<dflash::DFlashEngine>(dcfg);
+        auto td1 = std::chrono::steady_clock::now();
+        double dflash_sec = std::chrono::duration<double>(td1 - td0).count();
+        std::cerr << "[ov_serve] DFlash engine loaded in " << dflash_sec << "s\n";
+        model_name = "qwen3.5-dflash";
+    }
+    // Mutex for DFlash engine (single-threaded speculative decode)
+    std::mutex dflash_mu;
+
     // ── HTTP server ──
     httplib::Server svr;
 
@@ -769,7 +792,8 @@ int main(int argc, char* argv[]) {
 
     // Chat completions
     svr.Post("/v1/chat/completions",
-             [&pool, &cfg, &model_name, tokenizer](const httplib::Request& req,
+             [&pool, &cfg, &model_name, tokenizer,
+              &dflash_engine, dflash_enabled, &dflash_mu](const httplib::Request& req,
                                                     httplib::Response& res) {
         json body;
         try {
@@ -835,14 +859,250 @@ int main(int argc, char* argv[]) {
                       << " stream=" << parsed.stream << "\n";
         }
 
+        // ── DFlash speculative decoding path (text-only) ──
+        if (dflash_enabled && parsed.images.empty()) {
+            auto sp = std::move(parsed);
+            auto rid = request_id;
+            auto mn = model_name;
+            auto log = cfg.enable_logging;
+            auto max_tok = sp.params.max_new_tokens;
+
+            if (sp.stream) {
+                res.set_chunked_content_provider(
+                    "text/event-stream",
+                    [&dflash_engine, &dflash_mu, sp = std::move(sp), rid, mn, log, max_tok](
+                        size_t, httplib::DataSink& sink) {
+                        std::lock_guard<std::mutex> lock(dflash_mu);
+
+                        // Send initial role chunk
+                        {
+                            json rc;
+                            rc["id"] = rid;
+                            rc["object"] = "chat.completion.chunk";
+                            rc["created"] = unix_timestamp();
+                            rc["model"] = mn;
+                            json d; d["role"] = "assistant";
+                            json c; c["index"] = 0; c["delta"] = d;
+                            rc["choices"] = json::array({c});
+                            std::string s = sse_chunk(rc);
+                            sink.write(s.c_str(), s.size());
+                        }
+
+                        ToolCallParser tool_parser;
+                        std::vector<ToolCall> accumulated_tool_calls;
+
+                        try {
+                            auto result = dflash_engine->generate(
+                                sp.prompt, max_tok,
+                                [&](const std::string& text, bool is_eos) -> bool {
+                                    if (!sink.is_writable()) return false;
+                                    auto pr = tool_parser.process(text);
+                                    for (auto& tc : pr.tool_calls)
+                                        accumulated_tool_calls.push_back(std::move(tc));
+                                    if (!pr.text.empty()) {
+                                        json tc;
+                                        tc["id"] = rid;
+                                        tc["object"] = "chat.completion.chunk";
+                                        tc["created"] = unix_timestamp();
+                                        tc["model"] = mn;
+                                        json d; d["content"] = pr.text;
+                                        json c; c["index"] = 0; c["delta"] = d;
+                                        tc["choices"] = json::array({c});
+                                        std::string s = sse_chunk(tc);
+                                        if (!sink.write(s.c_str(), s.size())) return false;
+                                    }
+                                    return true;
+                                });
+
+                            // Flush tool parser
+                            auto final_pr = tool_parser.flush();
+                            for (auto& tc : final_pr.tool_calls)
+                                accumulated_tool_calls.push_back(std::move(tc));
+                            if (!final_pr.text.empty()) {
+                                json tc;
+                                tc["id"] = rid;
+                                tc["object"] = "chat.completion.chunk";
+                                tc["created"] = unix_timestamp();
+                                tc["model"] = mn;
+                                json d; d["content"] = final_pr.text;
+                                json c; c["index"] = 0; c["delta"] = d;
+                                tc["choices"] = json::array({c});
+                                std::string s = sse_chunk(tc);
+                                sink.write(s.c_str(), s.size());
+                            }
+
+                            // Send tool calls if any
+                            if (!accumulated_tool_calls.empty()) {
+                                json tc;
+                                tc["id"] = rid;
+                                tc["object"] = "chat.completion.chunk";
+                                tc["created"] = unix_timestamp();
+                                tc["model"] = mn;
+                                json d;
+                                json tool_calls_json = json::array();
+                                for (size_t i = 0; i < accumulated_tool_calls.size(); ++i) {
+                                    json tcj;
+                                    tcj["index"] = static_cast<int>(i);
+                                    tcj["id"] = "call_" + std::to_string(i);
+                                    tcj["type"] = "function";
+                                    json fn;
+                                    fn["name"] = accumulated_tool_calls[i].name;
+                                    fn["arguments"] = accumulated_tool_calls[i].arguments;
+                                    tcj["function"] = fn;
+                                    tool_calls_json.push_back(tcj);
+                                }
+                                d["tool_calls"] = tool_calls_json;
+                                json c;
+                                c["index"] = 0;
+                                c["delta"] = d;
+                                tc["choices"] = json::array({c});
+                                std::string s = sse_chunk(tc);
+                                sink.write(s.c_str(), s.size());
+                            }
+
+                            // Final chunk with finish_reason
+                            {
+                                std::string fr = accumulated_tool_calls.empty()
+                                    ? result.finish_reason : "tool_calls";
+                                json fc;
+                                fc["id"] = rid;
+                                fc["object"] = "chat.completion.chunk";
+                                fc["created"] = unix_timestamp();
+                                fc["model"] = mn;
+                                json c;
+                                c["index"] = 0;
+                                c["delta"] = json::object();
+                                c["finish_reason"] = fr;
+                                fc["choices"] = json::array({c});
+                                // Usage info
+                                json usage;
+                                usage["prompt_tokens"] = static_cast<int>(result.prompt_tokens);
+                                usage["completion_tokens"] = static_cast<int>(result.generated_tokens);
+                                usage["total_tokens"] = static_cast<int>(result.prompt_tokens + result.generated_tokens);
+                                fc["usage"] = usage;
+                                std::string s = sse_chunk(fc);
+                                sink.write(s.c_str(), s.size());
+                            }
+
+                            std::string done = sse_done();
+                            sink.write(done.c_str(), done.size());
+
+                            if (log) {
+                                std::cerr << "[ov_serve] " << rid << " [dflash] "
+                                          << result.prompt_tokens << "p+"
+                                          << result.generated_tokens << "g "
+                                          << result.throughput << " t/s "
+                                          << "accept=" << result.accepted_tokens
+                                          << "/" << result.draft_steps << " steps\n";
+                            }
+                        } catch (const std::exception& e) {
+                            json err_chunk;
+                            err_chunk["error"] = e.what();
+                            std::string s = sse_chunk(err_chunk);
+                            sink.write(s.c_str(), s.size());
+                            std::string done = sse_done();
+                            sink.write(done.c_str(), done.size());
+                            std::cerr << "[ov_serve] " << rid << " [dflash] error: " << e.what() << "\n";
+                        }
+                        sink.done();
+                        return true;
+                    });
+            } else {
+                // Non-streaming DFlash
+                res.set_chunked_content_provider(
+                    "application/json",
+                    [&dflash_engine, &dflash_mu, sp = std::move(sp), rid, mn, log, max_tok](
+                        size_t, httplib::DataSink& sink) {
+                        std::lock_guard<std::mutex> lock(dflash_mu);
+
+                        ToolCallParser tool_parser;
+                        std::vector<ToolCall> accumulated_tool_calls;
+                        std::string full_text;
+
+                        try {
+                            auto result = dflash_engine->generate(
+                                sp.prompt, max_tok,
+                                [&](const std::string& text, bool) -> bool {
+                                    if (!sink.is_writable()) return false;
+                                    auto pr = tool_parser.process(text);
+                                    for (auto& tc : pr.tool_calls)
+                                        accumulated_tool_calls.push_back(std::move(tc));
+                                    full_text += pr.text;
+                                    return true;
+                                });
+
+                            auto final_pr = tool_parser.flush();
+                            for (auto& tc : final_pr.tool_calls)
+                                accumulated_tool_calls.push_back(std::move(tc));
+                            full_text += final_pr.text;
+
+                            std::string fr = accumulated_tool_calls.empty()
+                                ? result.finish_reason : "tool_calls";
+
+                            json resp;
+                            resp["id"] = rid;
+                            resp["object"] = "chat.completion";
+                            resp["created"] = unix_timestamp();
+                            resp["model"] = mn;
+                            json msg;
+                            msg["role"] = "assistant";
+                            if (!accumulated_tool_calls.empty()) {
+                                json tc_arr = json::array();
+                                for (size_t i = 0; i < accumulated_tool_calls.size(); ++i) {
+                                    json tcj;
+                                    tcj["id"] = "call_" + std::to_string(i);
+                                    tcj["type"] = "function";
+                                    json fn;
+                                    fn["name"] = accumulated_tool_calls[i].name;
+                                    fn["arguments"] = accumulated_tool_calls[i].arguments;
+                                    tcj["function"] = fn;
+                                    tc_arr.push_back(tcj);
+                                }
+                                msg["tool_calls"] = tc_arr;
+                                msg["content"] = nullptr;
+                            } else {
+                                msg["content"] = full_text;
+                            }
+                            json choice;
+                            choice["index"] = 0;
+                            choice["message"] = msg;
+                            choice["finish_reason"] = fr;
+                            resp["choices"] = json::array({choice});
+                            json usage;
+                            usage["prompt_tokens"] = static_cast<int>(result.prompt_tokens);
+                            usage["completion_tokens"] = static_cast<int>(result.generated_tokens);
+                            usage["total_tokens"] = static_cast<int>(result.prompt_tokens + result.generated_tokens);
+                            resp["usage"] = usage;
+                            std::string body = resp.dump();
+                            sink.write(body.c_str(), body.size());
+
+                            if (log) {
+                                std::cerr << "[ov_serve] " << rid << " [dflash] "
+                                          << result.prompt_tokens << "p+"
+                                          << result.generated_tokens << "g "
+                                          << result.throughput << " t/s "
+                                          << "accept=" << result.accepted_tokens
+                                          << "/" << result.draft_steps << " steps\n";
+                            }
+                        } catch (const std::exception& e) {
+                            json err;
+                            err["error"]["message"] = std::string("DFlash generation error: ") + e.what();
+                            err["error"]["type"] = "server_error";
+                            std::string body = err.dump();
+                            sink.write(body.c_str(), body.size());
+                            std::cerr << "[ov_serve] " << rid << " [dflash] error: " << e.what() << "\n";
+                        }
+                        sink.done();
+                        return true;
+                    });
+            }
+            return;
+        }
+
         try {
             if (parsed.stream) {
                 // ── Streaming SSE ──
-                // IMPORTANT: For streaming, session lifecycle must live inside the
-                // content provider lambda. set_chunked_content_provider returns
-                // immediately; the lambda runs after this handler exits.
-                // Capturing local variables by reference would be use-after-free.
-                auto sp = std::move(parsed);  // move into value captures
+                auto sp = std::move(parsed);
                 auto rid = request_id;
                 auto mn = model_name;
                 auto warmup_tok = cfg.warmup_tokens;
