@@ -596,6 +596,23 @@ int main(int argc, char* argv[]) try {
             draft_source, draft_finalizer);
     } // Weight sources (target_source, draft_source) and their safetensors data freed here.
 
+    // Detect if loaded target IR has visual inputs (VL IR used in text-only mode)
+    bool target_ir_is_vl = false;
+    if (target_model) {
+        for (const auto& input : target_model->inputs()) {
+            for (const auto& name : input.get_names()) {
+                if (name == "visual_embeds") {
+                    target_ir_is_vl = true;
+                    break;
+                }
+            }
+            if (target_ir_is_vl) break;
+        }
+        if (target_ir_is_vl && !vl_mode) {
+            std::cout << "[DFlash] VL target IR loaded for text-only mode — will supply zero visual inputs" << std::endl;
+        }
+    }
+
     // Apply f16 preprocessing for draft model's context_hidden input.
     // context_hidden will be stored as f16 USM → GPU reads f16 directly, fewer reorder_data.
     bool use_f16_ctx = false;
@@ -878,6 +895,17 @@ int main(int argc, char* argv[]) try {
 
     target_request.get_tensor("attention_mask").set_shape({1, 0});
 
+    // Prepare zero visual tensors for VL IR used in text-only mode or for decode/verify steps
+    ov::Tensor zero_visual_embeds;
+    ov::Tensor zero_visual_pos_mask;
+    if (vl_mode || target_ir_is_vl) {
+        const size_t hidden_size = static_cast<size_t>(target_qwen35_cfg.text.hidden_size);
+        zero_visual_embeds = ov::Tensor(ov::element::f32, {1, 1, hidden_size});
+        std::memset(zero_visual_embeds.data(), 0, zero_visual_embeds.get_byte_size());
+        zero_visual_pos_mask = ov::Tensor(ov::element::boolean, {1, 1});
+        zero_visual_pos_mask.data<bool>()[0] = false;
+    }
+
     // Prefill: run target on prompt to get first token.
     auto prefill_start = Clock::now();
     target_request.set_tensor("input_ids", make_ids_tensor(output_ids));
@@ -888,22 +916,16 @@ int main(int argc, char* argv[]) try {
         target_request.set_tensor("visual_pos_mask", visual_pos_mask_tensor);
     } else {
         target_request.set_tensor("position_ids", make_mrope_position_ids(0, output_ids.size()));
+        if (target_ir_is_vl) {
+            // VL IR requires visual inputs even in text-only mode
+            target_request.set_tensor("visual_embeds", zero_visual_embeds);
+            target_request.set_tensor("visual_pos_mask", zero_visual_pos_mask);
+        }
     }
     target_request.set_tensor("beam_idx", beam_idx);
     set_target_state_update_mode(1);
     target_request.infer();
     auto logits = target_request.get_tensor("logits");
-
-    // For VL mode, prepare zero visual tensors for subsequent decode/verify steps
-    ov::Tensor zero_visual_embeds;
-    ov::Tensor zero_visual_pos_mask;
-    if (vl_mode) {
-        const size_t hidden_size = static_cast<size_t>(target_qwen35_cfg.text.hidden_size);
-        zero_visual_embeds = ov::Tensor(ov::element::f32, {1, 1, hidden_size});
-        std::memset(zero_visual_embeds.data(), 0, zero_visual_embeds.get_byte_size());
-        zero_visual_pos_mask = ov::Tensor(ov::element::boolean, {1, 1});
-        zero_visual_pos_mask.data<bool>()[0] = false;
-    }
 
     target_kv_state.add_inputs(make_ids_tensor(output_ids));
     ov::Tensor target_hidden_block = copy_to_host(target_request.get_tensor("target_hidden"));
@@ -1114,7 +1136,7 @@ int main(int argc, char* argv[]) try {
                     pd[dim * pre_verify_len + i] = static_cast<int64_t>(target_hidden_len + i);
             target_request.set_tensor("position_ids", reuse_verify_pos);
             target_request.set_tensor("beam_idx", beam_idx);
-            if (vl_mode) {
+            if (vl_mode || target_ir_is_vl) {
                 target_request.set_tensor("visual_embeds", zero_visual_embeds);
                 target_request.set_tensor("visual_pos_mask", zero_visual_pos_mask);
             }
@@ -1284,7 +1306,7 @@ int main(int argc, char* argv[]) try {
                 }
                 target_request.set_tensor("position_ids", reuse_verify_pos);
                 target_request.set_tensor("beam_idx", beam_idx);
-                if (vl_mode) {
+                if (vl_mode || target_ir_is_vl) {
                     target_request.set_tensor("visual_embeds", zero_visual_embeds);
                     target_request.set_tensor("visual_pos_mask", zero_visual_pos_mask);
                 }
