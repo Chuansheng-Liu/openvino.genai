@@ -773,7 +773,6 @@ int main(int argc, char* argv[]) try {
     const size_t max_length = prompt_len + static_cast<size_t>(max_new_tokens);
 
     std::cout << "[INFO] prompt_len=" << prompt_len << " max_length=" << max_length << std::endl;
-
     // Compile
     std::cout << "[Compiling models on " << device << "...]" << std::endl;
     // Set snapshot outputs to f16 to eliminate f16→f32 output reorders.

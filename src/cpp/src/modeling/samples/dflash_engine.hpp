@@ -20,6 +20,7 @@
 #include <functional>
 #include <iostream>
 #include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -205,6 +206,15 @@ struct DFlashGenerateResult {
 
 // Callback: (token_text, is_eos) → continue?
 using DFlashStreamCallback = std::function<bool(const std::string& token_text, bool is_eos)>;
+
+/// Pre-processed VL inputs for DFlash generate.
+struct DFlashVLInputs {
+    ov::Tensor input_ids;       // [1, seq_len]
+    ov::Tensor attention_mask;  // [1, seq_len]
+    ov::Tensor position_ids;    // [3, 1, seq_len] mRoPE
+    ov::Tensor visual_embeds;   // [1, seq_len, hidden_size] scattered
+    ov::Tensor visual_pos_mask; // [1, seq_len] boolean
+};
 
 class DFlashEngine {
 public:
@@ -403,7 +413,8 @@ public:
     /// Generate tokens from pre-rendered prompt text.
     /// Callback receives (decoded_text, is_eos) and returns true to continue.
     DFlashGenerateResult generate(const std::string& prompt, int max_new_tokens,
-                                  DFlashStreamCallback callback) {
+                                  DFlashStreamCallback callback,
+                                  const DFlashVLInputs* vl = nullptr) {
         using Clock = std::chrono::steady_clock;
         auto duration_ms = [](auto a, auto b) {
             return std::chrono::duration<double, std::milli>(b - a).count();
@@ -414,10 +425,29 @@ public:
         // Reset state from previous request
         reset_state();
 
-        // Tokenize
-        auto encoded = tokenizer_->encode(prompt, {ov::genai::add_special_tokens(false)});
-        auto input_ids_tensor = encoded.input_ids;
-        const size_t prompt_len = input_ids_tensor.get_shape()[1];
+        // Tokenize / prepare input tensors
+        ov::Tensor input_ids_tensor;
+        ov::Tensor position_ids_tensor;
+        size_t prompt_len;
+
+        if (vl) {
+            // VL path: use pre-processed inputs
+            input_ids_tensor = vl->input_ids;
+            position_ids_tensor = vl->position_ids;
+            prompt_len = input_ids_tensor.get_shape()[1];
+        } else {
+            // Text path: tokenize and build simple mRoPE
+            auto encoded = tokenizer_->encode(prompt, {ov::genai::add_special_tokens(false)});
+            input_ids_tensor = encoded.input_ids;
+            prompt_len = input_ids_tensor.get_shape()[1];
+
+            ov::Tensor pos(ov::element::i64, {3, 1, prompt_len});
+            auto* pd = pos.data<int64_t>();
+            for (size_t dim = 0; dim < 3; ++dim)
+                for (size_t i = 0; i < prompt_len; ++i)
+                    pd[dim * prompt_len + i] = static_cast<int64_t>(i);
+            position_ids_tensor = pos;
+        }
         result.prompt_tokens = prompt_len;
 
         const size_t max_length = prompt_len + static_cast<size_t>(max_new_tokens);
@@ -431,20 +461,18 @@ public:
             std::fill_n(mask.data<int64_t>(), prompt_len, 1LL);
             target_req_.set_tensor("attention_mask", mask);
         }
-        {
-            ov::Tensor pos(ov::element::i64, {3, 1, prompt_len});
-            auto* pd = pos.data<int64_t>();
-            for (size_t dim = 0; dim < 3; ++dim)
-                for (size_t i = 0; i < prompt_len; ++i)
-                    pd[dim * prompt_len + i] = static_cast<int64_t>(i);
-            target_req_.set_tensor("position_ids", pos);
-        }
+        target_req_.set_tensor("position_ids", position_ids_tensor);
         target_req_.set_tensor("beam_idx", beam_idx_);
         if (has_state_update_mode_)
             target_req_.set_tensor("state_update_mode", detail::make_state_update_mode_tensor(1));
 
-        // VL IR: supply zero visual inputs
-        if (target_ir_is_vl_) {
+        // VL inputs for prefill
+        if (vl) {
+            // Real visual embeddings from vision encoder
+            target_req_.set_tensor("visual_embeds", vl->visual_embeds);
+            target_req_.set_tensor("visual_pos_mask", vl->visual_pos_mask);
+        } else if (target_ir_is_vl_) {
+            // Text-only on VL IR: zero visual inputs
             ov::Tensor zve(ov::element::f32, {1, prompt_len, model_hidden_size_});
             std::memset(zve.data(), 0, zve.get_byte_size());
             target_req_.set_tensor("visual_embeds", zve);
@@ -538,7 +566,7 @@ public:
         output_ids.push_back(next_token);
 
         // Stream first token
-        if (next_token == eos_token_id_) {
+        if (is_stop_token(next_token)) {
             auto text = tokenizer_->decode({next_token}, {ov::genai::skip_special_tokens(true)});
             if (!text.empty()) callback(text, true);
             result.generated_tokens = 1;
@@ -585,7 +613,7 @@ public:
         auto gen_start = Clock::now();
 
         while (output_ids.size() < static_cast<size_t>(max_new_tokens)) {
-            if (next_token == eos_token_id_) {
+            if (is_stop_token(next_token)) {
                 stopped_by_eos = true;
                 break;
             }
@@ -763,7 +791,12 @@ public:
 
             // Collect accepted tokens and stream them
             std::vector<int64_t> new_tokens;
+            bool draft_hit_stop = false;
             for (size_t i = 0; i < accepted && output_ids.size() < static_cast<size_t>(max_new_tokens); ++i) {
+                if (is_stop_token(draft_tokens[i])) {
+                    draft_hit_stop = true;
+                    break;
+                }
                 output_ids.push_back(draft_tokens[i]);
                 new_tokens.push_back(draft_tokens[i]);
             }
@@ -794,15 +827,19 @@ public:
                 }
             }
 
+            if (draft_hit_stop) {
+                stopped_by_eos = true;
+                break;
+            }
+
             if (output_ids.size() >= static_cast<size_t>(max_new_tokens)) break;
 
             // Posterior token
             next_token = posterior_next;
             output_ids.push_back(next_token);
 
-            if (next_token == eos_token_id_) {
+            if (is_stop_token(next_token)) {
                 stopped_by_eos = true;
-                // Stream EOS token text if any
                 auto text = tokenizer_->decode({next_token}, {ov::genai::skip_special_tokens(true)});
                 if (!text.empty()) callback(text, true);
                 break;
@@ -913,9 +950,18 @@ private:
     std::unique_ptr<ov::genai::Tokenizer> tokenizer_;
     int64_t mask_token_id_ = 0;
     int64_t eos_token_id_ = 0;
+    std::set<int64_t> stop_token_ids_;
+
+    bool is_stop_token(int64_t token) const {
+        return token == eos_token_id_ || stop_token_ids_.count(token) > 0;
+    }
 
     // Reusable tensors
     ov::Tensor beam_idx_;
+
+public:
+    /// Set additional stop token IDs (e.g. <|im_end|>).
+    void set_stop_token_ids(const std::set<int64_t>& ids) { stop_token_ids_ = ids; }
 };
 
 }  // namespace dflash
