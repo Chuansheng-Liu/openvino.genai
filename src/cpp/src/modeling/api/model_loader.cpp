@@ -296,7 +296,7 @@ struct ModelLoader::Impl {
         // ─── Vision model ───
         std::shared_ptr<ov::Model> vision_model;
         if (load_vision_from_ir) {
-            std::cout << "[ModelLoader] Reusing cached vision IR: " << vision_ir_pair->first << std::endl;
+            std::cerr << "[ModelLoader] Reusing cached vision IR: " << vision_ir_pair->first << std::endl;
             vision_model = core.read_model(vision_ir_pair->first.string(), vision_ir_pair->second.string());
             pos_embed_weight_ = extract_pos_embed_from_vision_model(vision_model);
         } else if (use_vl) {
@@ -308,7 +308,7 @@ struct ModelLoader::Impl {
                 pos_embed_weight_ = ws.get_tensor(pe_name);
                 embed_pos_embed_in_vision_model(vision_model, pos_embed_weight_);
                 ov::serialize(vision_model, vision_xml.string(), vision_bin.string());
-                std::cout << "[ModelLoader] Saved vision IR: " << vision_xml << std::endl;
+                std::cerr << "[ModelLoader] Saved vision IR: " << vision_xml << std::endl;
                 for (const auto& result : vision_model->get_results()) {
                     if (result->get_friendly_name() == kPosEmbedCacheResultName) {
                         vision_model->remove_result(result);
@@ -324,13 +324,13 @@ struct ModelLoader::Impl {
         // ─── Text model ───
         std::shared_ptr<ov::Model> text_model;
         if (load_text_from_ir) {
-            std::cout << "[ModelLoader] Reusing cached text IR: " << text_ir_pair->first << std::endl;
+            std::cerr << "[ModelLoader] Reusing cached text IR: " << text_ir_pair->first << std::endl;
             text_model = core.read_model(text_ir_pair->first.string(), text_ir_pair->second.string());
             if (use_vl && !is_vl_text_ir_compatible(text_model)) {
                 if (!has_hf_weights) {
                     throw std::runtime_error("Bundled text IR is not VL-compatible: " + text_ir_pair->first.string());
                 }
-                std::cout << "[ModelLoader] Cached text IR not VL-compatible, rebuilding" << std::endl;
+                std::cerr << "[ModelLoader] Cached text IR not VL-compatible, rebuilding" << std::endl;
                 text_model.reset();
             }
         }
@@ -340,7 +340,7 @@ struct ModelLoader::Impl {
             text_model = models::create_qwen3_5_text_model(cfg_, ws, finalizer, false, use_vl);
             if (params.cache_ir) {
                 ov::serialize(text_model, text_xml.string(), text_bin.string());
-                std::cout << "[ModelLoader] Saved text IR: " << text_xml << std::endl;
+                std::cerr << "[ModelLoader] Saved text IR: " << text_xml << std::endl;
             }
         }
 
@@ -353,10 +353,10 @@ struct ModelLoader::Impl {
             if (const char* env_dev = std::getenv("OV_GENAI_VISION_DEVICE")) {
                 vision_device = env_dev;
             }
-            std::cout << "[ModelLoader] Compiling vision model on " << vision_device << std::endl;
+            std::cerr << "[ModelLoader] Compiling vision model on " << vision_device << std::endl;
             compiled_vision_ = core.compile_model(vision_model, vision_device);
         }
-        std::cout << "[ModelLoader] Compiling text model on " << device_ << std::endl;
+        std::cerr << "[ModelLoader] Compiling text model on " << device_ << std::endl;
         compiled_text_ = core.compile_model(text_model, device_);
         gpu_ctx_ = try_get_gpu_context(compiled_text_);
 

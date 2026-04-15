@@ -265,6 +265,8 @@ static ParsedRequest parse_chat_request(const json& body, ov::genai::Tokenizer& 
     // Extract tool definitions
     if (body.contains("tools")) {
         req.tools = body["tools"].get<std::vector<json>>();
+        if (cfg.enable_logging)
+            std::cerr << "[ov_serve] tools: " << req.tools.size() << " tool(s) provided\n";
     }
 
     // Build prompt: use native chat template for text-only requests;
@@ -297,10 +299,14 @@ static ParsedRequest parse_chat_request(const json& body, ov::genai::Tokenizer& 
     const std::string think_prefix = "<think>\n</think>\n\n";
     for (size_t i = 0; i < messages.size(); ++i) {
         if (messages[i].value("role", "") == "assistant"
-            && i + 1 < messages.size()  // not the last message (which is the new assistant turn)
-            && messages[i].contains("content")
-            && messages[i]["content"].is_string()) {
-            std::string c = messages[i]["content"].get<std::string>();
+            && i + 1 < messages.size()) {  // not the last message (which is the new assistant turn)
+            // Normalize null / missing content to empty string so that the
+            // think-prefix is always present (the model expects <think>
+            // tags in every assistant turn; omitting them confuses it at
+            // long context lengths, e.g. Hermes agent interrupted turns).
+            std::string c;
+            if (messages[i].contains("content") && messages[i]["content"].is_string())
+                c = messages[i]["content"].get<std::string>();
             if (c.find("<think>") == std::string::npos) {
                 messages[i]["content"] = think_prefix + c;
             }
@@ -313,9 +319,49 @@ static ParsedRequest parse_chat_request(const json& body, ov::genai::Tokenizer& 
         // thinking tag placement for prefix cache compatibility.
         // Historical image markers will be expanded by tokenize_text using
         // stored per-image pad counts.
+
+         // Build tool definition block (Qwen3.5 format) — will be emitted as a
+        // separate system message near the end of the context so the model attends
+        // to it even when the primary system prompt is very long (e.g. Hermes agent).
+        std::string tool_defs;
+        if (!req.tools.empty()) {
+            tool_defs = "# Tools\n\nYou may call one or more functions to assist "
+                        "with the user query.\n\nYou are provided with function signatures "
+                        "within <tools></tools> XML tags:\n<tools>";
+            for (const auto& tool : req.tools) {
+                tool_defs += "\n" + tool.dump();
+            }
+            tool_defs += "\n</tools>\n\nFor each function call, return a json object with "
+                         "function name and arguments within <tool_call></tool_call> XML tags:\n"
+                         "<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n"
+                         "</tool_call>";
+        }
+
         std::string chat_text;
-        for (const auto& msg : messages) {
+        bool in_tool_group = false;  // track consecutive tool messages
+        bool tool_defs_emitted = false;  // emit tool defs once, right after first system message
+        for (size_t mi = 0; mi < messages.size(); ++mi) {
+            const auto& msg = messages[mi];
             std::string role = msg.at("role").get<std::string>();
+
+            // Handle tool response messages: wrap in <tool_response> inside user block
+            if (role == "tool") {
+                std::string tc = msg.contains("content") && msg["content"].is_string()
+                    ? msg["content"].get<std::string>() : "";
+                if (!in_tool_group) {
+                    chat_text += "<|im_start|>user";
+                    in_tool_group = true;
+                }
+                chat_text += "\n<tool_response>\n" + tc + "\n</tool_response>";
+                bool next_is_tool = (mi + 1 < messages.size()
+                    && messages[mi + 1].value("role", "") == "tool");
+                if (!next_is_tool) {
+                    chat_text += "<|im_end|>\n";
+                    in_tool_group = false;
+                }
+                continue;
+            }
+
             std::string content;
             if (msg.contains("content")) {
                 if (msg["content"].is_string()) {
@@ -338,8 +384,45 @@ static ParsedRequest parse_chat_request(const json& body, ov::genai::Tokenizer& 
                     content = "";
                 }
             }
-            chat_text += "<|im_start|>" + role + "\n" + content + "<|im_end|>\n";
+
+            chat_text += "<|im_start|>" + role + "\n" + content;
+
+            // Append tool_calls for assistant messages (Qwen3.5 format)
+            if (role == "assistant" && msg.contains("tool_calls") && msg["tool_calls"].is_array()) {
+                for (size_t ti = 0; ti < msg["tool_calls"].size(); ++ti) {
+                    const auto& tc = msg["tool_calls"][ti];
+                    json func = tc.contains("function") ? tc["function"] : tc;
+                    std::string tc_name = func.value("name", "");
+                    std::string tc_args = func.contains("arguments")
+                        ? (func["arguments"].is_string() ? func["arguments"].get<std::string>()
+                                                         : func["arguments"].dump())
+                        : "{}";
+                    if ((ti == 0 && !content.empty() && content.back() != '\n') || ti > 0) {
+                        chat_text += "\n";
+                    }
+                    chat_text += "<tool_call>\n{\"name\": \"" + tc_name
+                              + "\", \"arguments\": " + tc_args + "}\n</tool_call>";
+                }
+            }
+
+            chat_text += "<|im_end|>\n";
+
+            // Emit tool definitions as a separate system message right after the
+            // first system message.  This keeps them at a FIXED position in the
+            // token sequence so that the prefix cache can reuse KV entries across
+            // multi-turn conversations (the system prompt + tools block is the
+            // stable prefix shared by all requests in a session).
+            if (role == "system" && !tool_defs.empty() && !tool_defs_emitted) {
+                chat_text += "<|im_start|>system\n" + tool_defs + "<|im_end|>\n";
+                tool_defs_emitted = true;
+            }
         }
+
+        // Fallback: if no system message was seen, emit tool defs before assistant turn
+        if (!tool_defs.empty() && !tool_defs_emitted) {
+            chat_text += "<|im_start|>system\n" + tool_defs + "<|im_end|>\n";
+        }
+
         chat_text += "<|im_start|>assistant\n";
         if (cfg.enable_thinking) {
             chat_text += "<think>\n";
@@ -412,7 +495,7 @@ static ParsedRequest parse_chat_request(const json& body, ov::genai::Tokenizer& 
                 dbg.replace(pos + 30, end - pos - 30, "...<base64_truncated>...");
             }
         }
-        if (dbg.size() > 2000) dbg = dbg.substr(0, 2000) + "...(truncated)";
+        if (dbg.size() > 8000) dbg = dbg.substr(0, 4000) + "\n...(truncated " + std::to_string(dbg.size()) + " chars)...\n" + dbg.substr(dbg.size() - 4000);
         std::cerr << "[ov_serve] PROMPT: " << dbg << "\n";
     }
 
@@ -793,9 +876,13 @@ int main(int argc, char* argv[]) {
                         // Session already processes through ThinkingTracker internally;
                         // sc.is_thinking tells us which category each token belongs to.
                         ToolCallParser tool_parser;
+                        std::vector<ToolCall> accumulated_tool_calls;
 
                         auto callback = [&](const StreamChunk& sc) -> bool {
                             if (sc.event == StreamEvent::TOKEN && !sc.token_text.empty()) {
+                                if (log)
+                                    std::cerr << "[DEBUG-STREAM] TOKEN thinking=" << sc.is_thinking
+                                              << " text='" << sc.token_text.substr(0, 30) << "'\n";
                                 if (sc.is_thinking) {
                                     // Send as reasoning_content delta
                                     json tc;
@@ -814,6 +901,10 @@ int main(int argc, char* argv[]) {
                                 } else {
                                     // Content text — run through tool parser
                                     auto pr = tool_parser.process(sc.token_text);
+                                    // Accumulate any completed tool calls
+                                    for (auto& tc_item : pr.tool_calls) {
+                                        accumulated_tool_calls.push_back(std::move(tc_item));
+                                    }
                                     if (!pr.text.empty()) {
                                         json tc;
                                         tc["id"] = rid;
@@ -832,10 +923,63 @@ int main(int argc, char* argv[]) {
                                 }
                             } else if (sc.event == StreamEvent::FINISH) {
                                 auto flush_result = tool_parser.flush();
-                                std::string finish_reason =
-                                    (sc.stop_reason == StopReason::MAX_TOKENS)
-                                        ? "length"
-                                        : "stop";
+
+                                // Emit any remaining text from flush
+                                if (!flush_result.text.empty()) {
+                                    json tc2;
+                                    tc2["id"] = rid;
+                                    tc2["object"] = "chat.completion.chunk";
+                                    tc2["created"] = unix_timestamp();
+                                    tc2["model"] = mn;
+                                    json d2;
+                                    d2["content"] = flush_result.text;
+                                    json c2;
+                                    c2["index"] = 0;
+                                    c2["delta"] = d2;
+                                    tc2["choices"] = json::array({c2});
+                                    std::string s2 = sse_chunk(tc2);
+                                    sink.write(s2.c_str(), s2.size());
+                                }
+
+                                // Merge any tool calls from flush into accumulated
+                                for (auto& tc_item : flush_result.tool_calls) {
+                                    accumulated_tool_calls.push_back(std::move(tc_item));
+                                }
+
+                                // Emit tool_call deltas in SSE
+                                for (size_t ti = 0; ti < accumulated_tool_calls.size(); ++ti) {
+                                    const auto& atc = accumulated_tool_calls[ti];
+                                    json tc_chunk;
+                                    tc_chunk["id"] = rid;
+                                    tc_chunk["object"] = "chat.completion.chunk";
+                                    tc_chunk["created"] = unix_timestamp();
+                                    tc_chunk["model"] = mn;
+                                    json d_tc;
+                                    json fn;
+                                    fn["name"] = atc.name;
+                                    fn["arguments"] = atc.arguments;
+                                    json tc_obj;
+                                    tc_obj["index"] = static_cast<int>(ti);
+                                    tc_obj["id"] = atc.id;
+                                    tc_obj["type"] = "function";
+                                    tc_obj["function"] = fn;
+                                    d_tc["tool_calls"] = json::array({tc_obj});
+                                    json c_tc;
+                                    c_tc["index"] = 0;
+                                    c_tc["delta"] = d_tc;
+                                    tc_chunk["choices"] = json::array({c_tc});
+                                    std::string s_tc = sse_chunk(tc_chunk);
+                                    sink.write(s_tc.c_str(), s_tc.size());
+                                }
+
+                                std::string finish_reason;
+                                if (!accumulated_tool_calls.empty()) {
+                                    finish_reason = "tool_calls";
+                                } else if (sc.stop_reason == StopReason::MAX_TOKENS) {
+                                    finish_reason = "length";
+                                } else {
+                                    finish_reason = "stop";
+                                }
 
                                 json fc;
                                 fc["id"] = rid;
@@ -1276,10 +1420,10 @@ int main(int argc, char* argv[]) {
             const std::string think_prefix = "<think>\n</think>\n\n";
             for (size_t i = 0; i < messages.size(); ++i) {
                 if (messages[i].value("role", "") == "assistant"
-                    && i + 1 < messages.size()
-                    && messages[i].contains("content")
-                    && messages[i]["content"].is_string()) {
-                    std::string c = messages[i]["content"].get<std::string>();
+                    && i + 1 < messages.size()) {
+                    std::string c;
+                    if (messages[i].contains("content") && messages[i]["content"].is_string())
+                        c = messages[i]["content"].get<std::string>();
                     if (c.find("<think>") == std::string::npos) {
                         messages[i]["content"] = think_prefix + c;
                     }

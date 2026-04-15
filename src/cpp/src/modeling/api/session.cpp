@@ -395,6 +395,8 @@ struct Session::Impl {
                 if (prompt_data[i] != cached_token_ids_[i]) break;
                 ++prefix_match;
             }
+        } else {
+            // cold start — no cache to compare
         }
         // Reuse cache only when the new prompt is an exact extension of the
         // cached sequence (i.e. all cached tokens match the prompt prefix
@@ -628,19 +630,16 @@ struct Session::Impl {
                 if (!callback(end_chunk)) return false;
             }
 
-            // Step 2: Tool call parser on content text
+                        // Step 2: Pass content text to callback (tool call parsing is
+            // handled by the caller so streaming gets raw text)
             if (!tr.content_text.empty()) {
-                auto tp = tool_call_parser_.process(tr.content_text);
-                if (!tp.text.empty()) {
-                    accumulated_content += tp.text;
-                    StreamChunk chunk;
-                    chunk.event = StreamEvent::TOKEN;
-                    chunk.token_id = token_id;
-                    chunk.token_text = tp.text;
-                    chunk.is_thinking = false;
-                    if (!callback(chunk)) return false;
-                }
-                // Tool calls are accumulated and reported in GenerateResult
+                accumulated_content += tr.content_text;
+                StreamChunk chunk;
+                chunk.event = StreamEvent::TOKEN;
+                chunk.token_id = token_id;
+                chunk.token_text = tr.content_text;
+                chunk.is_thinking = false;
+                if (!callback(chunk)) return false;
             }
 
             return true;

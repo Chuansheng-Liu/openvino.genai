@@ -47,7 +47,7 @@ bool use_modeling_qwen3_dense_dummy_builder() {
     if (const char* v = std::getenv("OV_GENAI_USE_MODELING_API")) {
         return is_truthy(v);
     }
-    return false;
+    return true;  // Default: enabled
 }
 
 void apply_runtime_options(const std::map<std::string, GGUFMetaData>& configs,

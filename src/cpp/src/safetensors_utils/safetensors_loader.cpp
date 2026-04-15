@@ -92,7 +92,7 @@ namespace {
 bool is_modeling_api_enabled() {
     const char* env = std::getenv("OV_GENAI_USE_MODELING_API");
     if (env == nullptr) {
-        return false;  // Default: disabled
+        return true;  // Default: enabled
     }
     std::string val(env);
     return (val == "1" || val == "true" || val == "TRUE");
