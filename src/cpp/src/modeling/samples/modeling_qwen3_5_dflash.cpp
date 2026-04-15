@@ -544,6 +544,24 @@ int main(int argc, char* argv[]) try {
             if (cached_vision.has_value()) {
                 std::cout << "[Loading vision IR: " << cached_vision->first.filename() << "]" << std::endl;
                 vision_model = ir_core.read_model(cached_vision->first.string(), cached_vision->second.string());
+                // Extract pos_embed weight embedded in the cached vision IR by convert_ir
+                static constexpr const char* kPosEmbedCacheResultName = "__pos_embed_cache__";
+                for (const auto& result : vision_model->get_results()) {
+                    if (result->get_friendly_name() == kPosEmbedCacheResultName) {
+                        auto const_node = std::dynamic_pointer_cast<ov::op::v0::Constant>(
+                            result->input_value(0).get_node_shared_ptr());
+                        if (!const_node) throw std::runtime_error("pos_embed cache result is not a Constant");
+                        vl_pos_embed_weight = ov::Tensor(const_node->get_element_type(), const_node->get_shape());
+                        std::memcpy(vl_pos_embed_weight.data(), const_node->get_data_ptr(),
+                                    vl_pos_embed_weight.get_byte_size());
+                        vision_model->remove_result(result);
+                        break;
+                    }
+                }
+                if (!vl_pos_embed_weight) {
+                    throw std::runtime_error("Cached vision IR does not contain pos_embed data. "
+                                             "Re-run convert_ir with --vl to regenerate.");
+                }
             } else {
                 std::cerr << "[Warning] VL mode but no cached vision IR — building from safetensors" << std::endl;
                 auto target_data = ov::genai::safetensors::load_safetensors(target_dir);
