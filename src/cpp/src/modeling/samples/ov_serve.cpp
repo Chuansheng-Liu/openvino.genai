@@ -1145,7 +1145,7 @@ int main(int argc, char* argv[]) {
                                           << "[ov_serve] " << rid << " [dflash] "
                                           << result.prompt_tokens << "p+"
                                           << result.generated_tokens << "g "
-                                          << result.throughput << " t/s | "
+                                          << result.throughput << " t/s, ttft=" << result.ttft_ms << "ms | "
                                           << result.draft_steps << " steps, "
                                           << std::setprecision(1) << (accept_rate * 100) << "% accept, "
                                           << std::setprecision(1) << avg_accept << " avg/step\n";
@@ -1242,7 +1242,7 @@ int main(int argc, char* argv[]) {
                                           << "[ov_serve] " << rid << " [dflash] "
                                           << result.prompt_tokens << "p+"
                                           << result.generated_tokens << "g "
-                                          << result.throughput << " t/s | "
+                                          << result.throughput << " t/s, ttft=" << result.ttft_ms << "ms | "
                                           << result.draft_steps << " steps, "
                                           << std::setprecision(1) << (accept_rate * 100) << "% accept, "
                                           << std::setprecision(1) << avg_accept << " avg/step\n";

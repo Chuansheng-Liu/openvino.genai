@@ -207,6 +207,54 @@ struct DFlashGenerateResult {
 // Callback: (token_text, is_eos) → continue?
 using DFlashStreamCallback = std::function<bool(const std::string& token_text, bool is_eos)>;
 
+/// UTF-8-safe streaming text buffer for detokenization.
+/// Accumulates token IDs, re-decodes the full sequence each time, and emits
+/// only the stable prefix that forms valid UTF-8.  This prevents emitting
+/// partial multi-byte characters (e.g. half a CJK codepoint → U+FFFD).
+struct StreamTextBuffer {
+    ov::genai::Tokenizer& tokenizer;
+    std::vector<int64_t> tokens;
+    size_t printed_len = 0;
+
+    explicit StreamTextBuffer(ov::genai::Tokenizer& tok) : tokenizer(tok) {}
+
+    static bool ends_with_replacement(const std::string& s) {
+        // U+FFFD in UTF-8: EF BF BD
+        return s.size() >= 3 &&
+               s[s.size()-3] == '\xef' &&
+               s[s.size()-2] == '\xbf' &&
+               s[s.size()-1] == '\xbd';
+    }
+
+    /// Add new token(s) and return the safe-to-emit delta text.
+    std::string push(const std::vector<int64_t>& new_ids) {
+        tokens.insert(tokens.end(), new_ids.begin(), new_ids.end());
+        auto full = tokenizer.decode(tokens, {ov::genai::skip_special_tokens(true)});
+        if (ends_with_replacement(full))
+            return {};  // trailing incomplete UTF-8 — wait
+        if (full.size() > printed_len) {
+            std::string delta = full.substr(printed_len);
+            printed_len = full.size();
+            return delta;
+        }
+        return {};
+    }
+
+    std::string push(int64_t id) { return push(std::vector<int64_t>{id}); }
+
+    /// Flush any remaining buffered text.
+    std::string flush() {
+        if (tokens.empty()) return {};
+        auto full = tokenizer.decode(tokens, {ov::genai::skip_special_tokens(true)});
+        if (full.size() > printed_len) {
+            std::string delta = full.substr(printed_len);
+            printed_len = full.size();
+            return delta;
+        }
+        return {};
+    }
+};
+
 /// Pre-processed VL inputs for DFlash generate.
 struct DFlashVLInputs {
     ov::Tensor input_ids;       // [1, seq_len]
@@ -565,9 +613,14 @@ public:
         output_ids.reserve(max_new_tokens);
         output_ids.push_back(next_token);
 
+        // UTF-8-safe streaming buffer
+        StreamTextBuffer strbuf(*tokenizer_);
+
         // Stream first token
         if (is_stop_token(next_token)) {
-            auto text = tokenizer_->decode({next_token}, {ov::genai::skip_special_tokens(true)});
+            auto text = strbuf.push(next_token);
+            auto remaining = strbuf.flush();
+            text += remaining;
             if (!text.empty()) callback(text, true);
             result.generated_tokens = 1;
             result.finish_reason = "stop";
@@ -576,7 +629,7 @@ public:
             return result;
         }
         {
-            auto text = tokenizer_->decode({next_token}, {ov::genai::skip_special_tokens(true)});
+            auto text = strbuf.push(next_token);
             if (!text.empty()) {
                 if (!callback(text, false)) {
                     result.generated_tokens = output_ids.size();
@@ -817,7 +870,7 @@ public:
 
             // Stream accepted draft tokens
             if (!new_tokens.empty()) {
-                auto text = tokenizer_->decode(new_tokens, {ov::genai::skip_special_tokens(true)});
+                auto text = strbuf.push(new_tokens);
                 if (!text.empty()) {
                     if (!callback(text, false)) {
                         result.generated_tokens = output_ids.size();
@@ -840,14 +893,16 @@ public:
 
             if (is_stop_token(next_token)) {
                 stopped_by_eos = true;
-                auto text = tokenizer_->decode({next_token}, {ov::genai::skip_special_tokens(true)});
+                auto text = strbuf.push(next_token);
+                auto remaining = strbuf.flush();
+                text += remaining;
                 if (!text.empty()) callback(text, true);
                 break;
             }
 
             // Stream posterior token
             {
-                auto text = tokenizer_->decode({next_token}, {ov::genai::skip_special_tokens(true)});
+                auto text = strbuf.push(next_token);
                 if (!text.empty()) {
                     if (!callback(text, false)) {
                         result.generated_tokens = output_ids.size();
@@ -855,6 +910,14 @@ public:
                         break;
                     }
                 }
+            }
+        }
+
+        // Flush any remaining buffered text from the streaming buffer
+        {
+            auto remaining = strbuf.flush();
+            if (!remaining.empty()) {
+                callback(remaining, false);
             }
         }
 
