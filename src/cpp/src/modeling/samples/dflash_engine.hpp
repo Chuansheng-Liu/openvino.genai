@@ -196,6 +196,7 @@ struct DFlashConfig {
 struct DFlashGenerateResult {
     size_t prompt_tokens = 0;
     size_t generated_tokens = 0;
+    size_t prefix_cached_tokens = 0;
     double ttft_ms = 0.0;
     double decode_ms = 0.0;
     double throughput = 0.0;  // tokens/s
@@ -469,9 +470,7 @@ public:
         };
 
         DFlashGenerateResult result;
-
-        // Reset state from previous request
-        reset_state();
+        const bool is_vl = (vl != nullptr);
 
         // Tokenize / prepare input tensors
         ov::Tensor input_ids_tensor;
@@ -498,111 +497,283 @@ public:
         }
         result.prompt_tokens = prompt_len;
 
+        const int64_t* prompt_data = input_ids_tensor.data<const int64_t>();
         const size_t max_length = prompt_len + static_cast<size_t>(max_new_tokens);
+
+        // ── Prefix cache check ──
+        // VL requests always invalidate (different images can share token IDs).
+        size_t prefix_match = 0;
+        if (cache_valid_ && !is_vl) {
+            const size_t check_len = std::min(prompt_len, cached_token_ids_.size());
+            for (size_t i = 0; i < check_len; ++i) {
+                if (prompt_data[i] != cached_token_ids_[i]) break;
+                ++prefix_match;
+            }
+        }
+        const bool use_prefix_cache = cache_valid_ && !is_vl
+            && prefix_match > 0
+            && prompt_len > prefix_match;
 
         // ── Prefill ──
         auto prefill_start = Clock::now();
 
-        target_req_.set_tensor("input_ids", input_ids_tensor);
-        {
-            ov::Tensor mask(ov::element::i64, {1, prompt_len});
-            std::fill_n(mask.data<int64_t>(), prompt_len, 1LL);
-            target_req_.set_tensor("attention_mask", mask);
-        }
-        target_req_.set_tensor("position_ids", position_ids_tensor);
-        target_req_.set_tensor("beam_idx", beam_idx_);
-        if (has_state_update_mode_)
-            target_req_.set_tensor("state_update_mode", detail::make_state_update_mode_tensor(1));
-
-        // VL inputs for prefill
-        if (vl) {
-            // Real visual embeddings from vision encoder
-            target_req_.set_tensor("visual_embeds", vl->visual_embeds);
-            target_req_.set_tensor("visual_pos_mask", vl->visual_pos_mask);
-        } else if (target_ir_is_vl_) {
-            // Text-only on VL IR: zero visual inputs
-            ov::Tensor zve(ov::element::f32, {1, prompt_len, model_hidden_size_});
-            std::memset(zve.data(), 0, zve.get_byte_size());
-            target_req_.set_tensor("visual_embeds", zve);
-            ov::Tensor zpm(ov::element::boolean, {1, prompt_len});
-            std::memset(zpm.data(), 0, zpm.get_byte_size());
-            target_req_.set_tensor("visual_pos_mask", zpm);
-        }
-
-        target_req_.infer();
-
-        auto logits = target_req_.get_tensor("logits");
-        auto target_hidden_block = get_target_hidden();
-        const auto hidden_elem_type = target_hidden_block.get_element_type();
-
-        // Resolve hidden_dim from actual model output (may differ from config)
-        hidden_dim_ = target_hidden_block.get_shape()[2];
-
-        // Allocate hidden storage
+        ov::Tensor logits;
+        ov::Tensor target_hidden_block;
         const size_t storage_len = max_length + block_size_;
-        if (has_gpu_ctx_) {
-            try {
-                target_hidden_storage_ = remote_ctx_.create_host_tensor(
+
+        if (use_prefix_cache) {
+            // ── Partial prefill: reuse KV cache for matched prefix ──
+            result.prefix_cached_tokens = prefix_match;
+
+            // Trim KV cache to prefix_match if cached state is longer
+            if (cached_token_ids_.size() > prefix_match) {
+                const size_t trim = cached_token_ids_.size() - prefix_match;
+                kv_state_.num_tokens_to_trim = trim;
+                ov::genai::utils::trim_kv_cache(target_req_, kv_state_, std::nullopt);
+                kv_state_.num_tokens_to_trim = 0;
+            }
+            target_hidden_len_ = prefix_match;
+            ctx_hidden_len_ = prefix_match;
+
+            const size_t suffix_len = prompt_len - prefix_match;
+
+            // Suffix input_ids
+            ov::Tensor suffix_ids(ov::element::i64, {1, suffix_len});
+            std::memcpy(suffix_ids.data<int64_t>(),
+                        prompt_data + prefix_match,
+                        suffix_len * sizeof(int64_t));
+
+            // Full attention mask [1, prompt_len] — all 1s
+            ov::Tensor full_mask(ov::element::i64, {1, prompt_len});
+            std::fill_n(full_mask.data<int64_t>(), prompt_len, 1LL);
+
+            // Suffix position_ids [3, 1, suffix_len]
+            ov::Tensor suffix_pos(ov::element::i64, {3, 1, suffix_len});
+            {
+                auto* pd = suffix_pos.data<int64_t>();
+                for (size_t dim = 0; dim < 3; ++dim)
+                    for (size_t i = 0; i < suffix_len; ++i)
+                        pd[dim * suffix_len + i] = static_cast<int64_t>(prefix_match + i);
+            }
+
+            target_req_.set_tensor("input_ids", suffix_ids);
+            target_req_.set_tensor("attention_mask", full_mask);
+            target_req_.set_tensor("position_ids", suffix_pos);
+            target_req_.set_tensor("beam_idx", beam_idx_);
+            if (has_state_update_mode_)
+                target_req_.set_tensor("state_update_mode",
+                                       detail::make_state_update_mode_tensor(1));
+
+            // Zero visual tensors for suffix (text-only prefix cache)
+            if (target_ir_is_vl_) {
+                ov::Tensor zve(ov::element::f32, {1, suffix_len, model_hidden_size_});
+                std::memset(zve.data(), 0, zve.get_byte_size());
+                target_req_.set_tensor("visual_embeds", zve);
+                ov::Tensor zpm(ov::element::boolean, {1, suffix_len});
+                std::memset(zpm.data(), 0, zpm.get_byte_size());
+                target_req_.set_tensor("visual_pos_mask", zpm);
+            }
+
+            target_req_.infer();
+
+            logits = target_req_.get_tensor("logits");
+            target_hidden_block = get_target_hidden();
+
+            // Ensure storage is large enough; reallocate and copy prefix if not
+            const auto hidden_elem_type = target_hidden_block.get_element_type();
+            if (storage_len > storage_capacity_) {
+                ov::Tensor old_th = target_hidden_storage_;
+                ov::Tensor old_ctx = ctx_hidden_storage_;
+
+                if (has_gpu_ctx_) {
+                    try {
+                        target_hidden_storage_ = remote_ctx_.create_host_tensor(
+                            hidden_elem_type, {1, storage_len, hidden_dim_});
+                        using_usm_storage_ = true;
+                    } catch (...) { using_usm_storage_ = false; }
+                }
+                if (!using_usm_storage_)
+                    target_hidden_storage_ = ov::Tensor(
+                        hidden_elem_type, {1, storage_len, hidden_dim_});
+
+                // Copy prefix hidden from old storage
+                if (prefix_match > 0 && old_th.data() != nullptr)
+                    std::memcpy(target_hidden_storage_.data(), old_th.data(),
+                                prefix_match * hidden_dim_ * hidden_elem_type.size());
+
+                const ov::element::Type ctx_elem =
+                    use_f16_ctx_ ? ov::element::f16 : ov::element::f32;
+                if (has_gpu_ctx_) {
+                    try {
+                        ctx_hidden_storage_ = remote_ctx_.create_host_tensor(
+                            ctx_elem, {1, storage_len, ctx_hidden_dim_});
+                        using_usm_ctx_ = true;
+                    } catch (...) {}
+                }
+                if (!using_usm_ctx_)
+                    ctx_hidden_storage_ = ov::Tensor(
+                        ctx_elem, {1, storage_len, ctx_hidden_dim_});
+
+                if (prefix_match > 0 && old_ctx.data() != nullptr)
+                    std::memcpy(ctx_hidden_storage_.data(), old_ctx.data(),
+                                prefix_match * ctx_hidden_dim_ * ctx_elem.size());
+
+                storage_capacity_ = storage_len;
+            }
+
+            // Copy suffix hidden to storage
+            {
+                ov::Tensor dst(target_hidden_storage_,
+                               {0, prefix_match, 0},
+                               {1, prompt_len, hidden_dim_});
+                target_hidden_block.copy_to(dst);
+            }
+            target_hidden_len_ = prompt_len;
+
+            // Rebind USM output if suffix is larger than current capacity
+            const size_t max_verify = std::max(suffix_len, block_size_ + 1);
+            if (max_verify > usm_output_capacity_ && has_gpu_ctx_ && using_usm_storage_) {
+                try {
+                    auto usm_out = remote_ctx_.create_host_tensor(
+                        hidden_elem_type, {1, max_verify, hidden_dim_});
+                    target_req_.set_tensor("target_hidden", usm_out);
+                    using_usm_output_ = true;
+                    usm_output_capacity_ = max_verify;
+                } catch (...) {}
+            }
+
+            // Compute context_hidden for suffix
+            {
+                ov::Tensor suffix_th(target_hidden_storage_,
+                                     {0, prefix_match, 0},
+                                     {1, prompt_len, hidden_dim_});
+                ctx_fc_req_.set_tensor("target_hidden", suffix_th);
+                ctx_fc_req_.infer();
+                auto suffix_ctx = ctx_fc_req_.get_tensor("context_hidden");
+                ov::Tensor ctx_dst(ctx_hidden_storage_,
+                                   {0, prefix_match, 0},
+                                   {1, prompt_len, ctx_hidden_dim_});
+                copy_ctx_to_cache(suffix_ctx, ctx_dst);
+            }
+            ctx_hidden_len_ = prompt_len;
+
+            std::cerr << "[DFlashEngine] Prefix cache hit: "
+                      << prefix_match << "/" << cached_token_ids_.size()
+                      << " tokens reused, suffix=" << suffix_len << "\n";
+
+        } else {
+            // ── Full prefill: reset and process entire prompt ──
+            reset_state();
+
+            target_req_.set_tensor("input_ids", input_ids_tensor);
+            {
+                ov::Tensor mask(ov::element::i64, {1, prompt_len});
+                std::fill_n(mask.data<int64_t>(), prompt_len, 1LL);
+                target_req_.set_tensor("attention_mask", mask);
+            }
+            target_req_.set_tensor("position_ids", position_ids_tensor);
+            target_req_.set_tensor("beam_idx", beam_idx_);
+            if (has_state_update_mode_)
+                target_req_.set_tensor("state_update_mode",
+                                       detail::make_state_update_mode_tensor(1));
+
+            // VL inputs for prefill
+            if (vl) {
+                target_req_.set_tensor("visual_embeds", vl->visual_embeds);
+                target_req_.set_tensor("visual_pos_mask", vl->visual_pos_mask);
+            } else if (target_ir_is_vl_) {
+                ov::Tensor zve(ov::element::f32, {1, prompt_len, model_hidden_size_});
+                std::memset(zve.data(), 0, zve.get_byte_size());
+                target_req_.set_tensor("visual_embeds", zve);
+                ov::Tensor zpm(ov::element::boolean, {1, prompt_len});
+                std::memset(zpm.data(), 0, zpm.get_byte_size());
+                target_req_.set_tensor("visual_pos_mask", zpm);
+            }
+
+            target_req_.infer();
+
+            logits = target_req_.get_tensor("logits");
+            target_hidden_block = get_target_hidden();
+            const auto hidden_elem_type = target_hidden_block.get_element_type();
+
+            // Resolve hidden_dim from actual model output (may differ from config)
+            hidden_dim_ = target_hidden_block.get_shape()[2];
+
+            // Allocate hidden storage
+            if (has_gpu_ctx_) {
+                try {
+                    target_hidden_storage_ = remote_ctx_.create_host_tensor(
+                        hidden_elem_type, {1, storage_len, hidden_dim_});
+                    using_usm_storage_ = true;
+                } catch (...) { using_usm_storage_ = false; }
+            }
+            if (!using_usm_storage_)
+                target_hidden_storage_ = ov::Tensor(
                     hidden_elem_type, {1, storage_len, hidden_dim_});
-                using_usm_storage_ = true;
-            } catch (...) { using_usm_storage_ = false; }
-        }
-        if (!using_usm_storage_)
-            target_hidden_storage_ = ov::Tensor(hidden_elem_type, {1, storage_len, hidden_dim_});
 
-        // Copy prefill hidden to storage
-        {
-            ov::Tensor dst(target_hidden_storage_, {0, 0, 0}, {1, prompt_len, hidden_dim_});
-            target_hidden_block.copy_to(dst);
-        }
-        target_hidden_len_ = prompt_len;
+            // Copy prefill hidden to storage
+            {
+                ov::Tensor dst(target_hidden_storage_,
+                               {0, 0, 0}, {1, prompt_len, hidden_dim_});
+                target_hidden_block.copy_to(dst);
+            }
+            target_hidden_len_ = prompt_len;
+            storage_capacity_ = storage_len;
 
-        // Bind USM output for target_hidden
-        if (using_usm_storage_) {
-            try {
-                const size_t max_verify = std::max(prompt_len, block_size_ + 1);
-                auto usm_out = remote_ctx_.create_host_tensor(
-                    hidden_elem_type, {1, max_verify, hidden_dim_});
-                target_req_.set_tensor("target_hidden", usm_out);
-                using_usm_output_ = true;
-            } catch (...) {}
-        }
+            // Bind USM output for target_hidden
+            if (using_usm_storage_) {
+                try {
+                    const size_t max_verify = std::max(prompt_len, block_size_ + 1);
+                    auto usm_out = remote_ctx_.create_host_tensor(
+                        hidden_elem_type, {1, max_verify, hidden_dim_});
+                    target_req_.set_tensor("target_hidden", usm_out);
+                    using_usm_output_ = true;
+                    usm_output_capacity_ = max_verify;
+                } catch (...) {}
+            }
 
-        // Context hidden cache (f16 for draft model)
-        const ov::element::Type ctx_elem = use_f16_ctx_ ? ov::element::f16 : ov::element::f32;
-        if (has_gpu_ctx_) {
-            try {
-                ctx_hidden_storage_ = remote_ctx_.create_host_tensor(
+            // Context hidden cache (f16 for draft model)
+            const ov::element::Type ctx_elem =
+                use_f16_ctx_ ? ov::element::f16 : ov::element::f32;
+            if (has_gpu_ctx_) {
+                try {
+                    ctx_hidden_storage_ = remote_ctx_.create_host_tensor(
+                        ctx_elem, {1, storage_len, ctx_hidden_dim_});
+                    using_usm_ctx_ = true;
+                } catch (...) {}
+            }
+            if (!using_usm_ctx_)
+                ctx_hidden_storage_ = ov::Tensor(
                     ctx_elem, {1, storage_len, ctx_hidden_dim_});
-                using_usm_ctx_ = true;
-            } catch (...) {}
-        }
-        if (!using_usm_ctx_)
-            ctx_hidden_storage_ = ov::Tensor(ctx_elem, {1, storage_len, ctx_hidden_dim_});
 
-        // Compute initial context_hidden from prefill
-        {
-            ov::Tensor init_th(target_hidden_storage_, {0, 0, 0}, {1, prompt_len, hidden_dim_});
-            ctx_fc_req_.set_tensor("target_hidden", init_th);
-            ctx_fc_req_.infer();
-            auto init_ctx = ctx_fc_req_.get_tensor("context_hidden");
-            ov::Tensor dst(ctx_hidden_storage_, {0, 0, 0}, {1, prompt_len, ctx_hidden_dim_});
-            copy_ctx_to_cache(init_ctx, dst);
-        }
-        ctx_hidden_len_ = prompt_len;
+            // Compute initial context_hidden from prefill
+            {
+                ov::Tensor init_th(target_hidden_storage_,
+                                   {0, 0, 0}, {1, prompt_len, hidden_dim_});
+                ctx_fc_req_.set_tensor("target_hidden", init_th);
+                ctx_fc_req_.infer();
+                auto init_ctx = ctx_fc_req_.get_tensor("context_hidden");
+                ov::Tensor dst(ctx_hidden_storage_,
+                               {0, 0, 0}, {1, prompt_len, ctx_hidden_dim_});
+                copy_ctx_to_cache(init_ctx, dst);
+            }
+            ctx_hidden_len_ = prompt_len;
 
-        // USM logits binding
-        const auto logits_elem = logits.get_element_type();
-        const size_t vocab_size = logits.get_shape().back();
-        if (has_gpu_ctx_) {
-            try {
-                auto dl = remote_ctx_.create_host_tensor(logits_elem, {1, block_size_, vocab_size});
-                draft_req_.set_tensor("logits", dl);
-            } catch (...) {}
-            try {
-                auto tl = remote_ctx_.create_host_tensor(logits_elem, {1, block_size_ + 1, vocab_size});
-                target_req_.set_tensor("logits", tl);
-            } catch (...) {}
+            // USM logits binding (only needed on full prefill / first call)
+            const auto logits_elem = logits.get_element_type();
+            const size_t vocab_size = logits.get_shape().back();
+            if (has_gpu_ctx_) {
+                try {
+                    auto dl = remote_ctx_.create_host_tensor(
+                        logits_elem, {1, block_size_, vocab_size});
+                    draft_req_.set_tensor("logits", dl);
+                } catch (...) {}
+                try {
+                    auto tl = remote_ctx_.create_host_tensor(
+                        logits_elem, {1, block_size_ + 1, vocab_size});
+                    target_req_.set_tensor("logits", tl);
+                } catch (...) {}
+            }
         }
 
         int64_t next_token = detail::argmax_last_token(logits);
@@ -612,6 +783,35 @@ public:
         std::vector<int64_t> output_ids;
         output_ids.reserve(max_new_tokens);
         output_ids.push_back(next_token);
+
+        // Cache commit helper — called before every return to persist KV state.
+        // VL requests invalidate cache; text-only requests store prompt + decoded
+        // token IDs that match the actual KV cache length (target_hidden_len_).
+        auto commit_cache = [&]() {
+            if (is_vl) {
+                cache_valid_ = false;
+                cached_token_ids_.clear();
+                return;
+            }
+            cached_token_ids_.clear();
+            const size_t kv_decode = target_hidden_len_ >= prompt_len
+                ? target_hidden_len_ - prompt_len : 0;
+            const size_t cache_decode = std::min(kv_decode, output_ids.size());
+            cached_token_ids_.reserve(prompt_len + cache_decode);
+            cached_token_ids_.assign(prompt_data, prompt_data + prompt_len);
+            for (size_t i = 0; i < cache_decode; ++i)
+                cached_token_ids_.push_back(output_ids[i]);
+            // Trim KV if it has more entries than we tracked
+            if (kv_decode > cache_decode) {
+                const size_t excess = kv_decode - cache_decode;
+                kv_state_.num_tokens_to_trim = excess;
+                ov::genai::utils::trim_kv_cache(target_req_, kv_state_, std::nullopt);
+                kv_state_.num_tokens_to_trim = 0;
+                target_hidden_len_ -= excess;
+                ctx_hidden_len_ = std::min(ctx_hidden_len_, target_hidden_len_);
+            }
+            cache_valid_ = true;
+        };
 
         // UTF-8-safe streaming buffer
         StreamTextBuffer strbuf(*tokenizer_);
@@ -626,6 +826,7 @@ public:
             result.finish_reason = "stop";
             result.decode_ms = 0;
             result.throughput = 0;
+            commit_cache();
             return result;
         }
         {
@@ -634,6 +835,7 @@ public:
                 if (!callback(text, false)) {
                     result.generated_tokens = output_ids.size();
                     result.finish_reason = "stop";
+                    commit_cache();
                     return result;
                 }
             }
@@ -927,6 +1129,7 @@ public:
         result.throughput = result.decode_ms > 0
             ? (static_cast<double>(result.generated_tokens) * 1000.0 / result.decode_ms) : 0;
         result.finish_reason = stopped_by_eos ? "stop" : "length";
+        commit_cache();
         return result;
     }
 
@@ -944,6 +1147,10 @@ private:
         using_usm_storage_ = false;
         using_usm_output_ = false;
         using_usm_ctx_ = false;
+        storage_capacity_ = 0;
+        usm_output_capacity_ = 0;
+        cache_valid_ = false;
+        cached_token_ids_.clear();
     }
 
     void set_state_update_mode(int32_t mode) {
@@ -1008,6 +1215,12 @@ private:
     ov::Tensor ctx_hidden_storage_;
     size_t target_hidden_len_ = 0;
     size_t ctx_hidden_len_ = 0;
+
+    // Prefix cache state
+    std::vector<int64_t> cached_token_ids_;   // token IDs currently in KV cache
+    bool cache_valid_ = false;                // whether cache can be reused
+    size_t storage_capacity_ = 0;             // capacity (seq dim) of hidden storage tensors
+    size_t usm_output_capacity_ = 0;          // capacity (seq dim) of USM target_hidden output
 
     // Tokenizer
     std::unique_ptr<ov::genai::Tokenizer> tokenizer_;

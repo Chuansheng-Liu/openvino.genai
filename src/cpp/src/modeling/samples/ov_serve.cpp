@@ -1145,7 +1145,10 @@ int main(int argc, char* argv[]) {
                                           << "[ov_serve] " << rid << " [dflash] "
                                           << result.prompt_tokens << "p+"
                                           << result.generated_tokens << "g "
-                                          << result.throughput << " t/s, ttft=" << result.ttft_ms << "ms | "
+                                          << result.throughput << " t/s, ttft=" << result.ttft_ms << "ms"
+                                          << (result.prefix_cached_tokens > 0
+                                              ? ", cache=" + std::to_string(result.prefix_cached_tokens) : "")
+                                          << " | "
                                           << result.draft_steps << " steps, "
                                           << std::setprecision(1) << (accept_rate * 100) << "% accept, "
                                           << std::setprecision(1) << avg_accept << " avg/step\n";
@@ -1242,7 +1245,10 @@ int main(int argc, char* argv[]) {
                                           << "[ov_serve] " << rid << " [dflash] "
                                           << result.prompt_tokens << "p+"
                                           << result.generated_tokens << "g "
-                                          << result.throughput << " t/s, ttft=" << result.ttft_ms << "ms | "
+                                          << result.throughput << " t/s, ttft=" << result.ttft_ms << "ms"
+                                          << (result.prefix_cached_tokens > 0
+                                              ? ", cache=" + std::to_string(result.prefix_cached_tokens) : "")
+                                          << " | "
                                           << result.draft_steps << " steps, "
                                           << std::setprecision(1) << (accept_rate * 100) << "% accept, "
                                           << std::setprecision(1) << avg_accept << " avg/step\n";
