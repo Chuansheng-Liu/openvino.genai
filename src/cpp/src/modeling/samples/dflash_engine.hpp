@@ -56,6 +56,17 @@ inline ov::Tensor make_state_update_mode_tensor(int32_t mode) {
     return t;
 }
 
+/// Lightweight fingerprint of float data for VL cache validation.
+/// Samples every 97th element (prime stride) for speed while catching
+/// any meaningful change in visual embeddings.
+inline double vl_fingerprint(const float* data, size_t count) {
+    double sum = 0.0;
+    constexpr size_t kStride = 97;
+    for (size_t i = 0; i < count; i += kStride)
+        sum += static_cast<double>(data[i]);
+    return sum;
+}
+
 inline int64_t resolve_mask_token_id(ov::genai::Tokenizer& tokenizer) {
     const auto vocab = tokenizer.get_vocab();
     auto it = vocab.find("<|MASK|>");
@@ -501,18 +512,37 @@ public:
         const size_t max_length = prompt_len + static_cast<size_t>(max_new_tokens);
 
         // ── Prefix cache check ──
-        // VL requests always invalidate (different images can share token IDs).
+        // Token ID matching + VL fingerprint verification for visual content.
         size_t prefix_match = 0;
-        if (cache_valid_ && !is_vl) {
+        if (cache_valid_) {
             const size_t check_len = std::min(prompt_len, cached_token_ids_.size());
             for (size_t i = 0; i < check_len; ++i) {
                 if (prompt_data[i] != cached_token_ids_[i]) break;
                 ++prefix_match;
             }
         }
-        const bool use_prefix_cache = cache_valid_ && !is_vl
+
+        // VL compatibility: verify visual content hasn't changed for prefix region.
+        bool vl_ok = true;
+        if (is_vl && prefix_match > 0) {
+            if (!cached_is_vl_ || prefix_match < cached_vl_prompt_len_) {
+                // Cached was text-only, or prefix doesn't cover entire VL prompt
+                // → can't guarantee visual content matches
+                vl_ok = false;
+            } else {
+                // Entire cached VL prompt is within prefix — verify fingerprint
+                const size_t hidden = vl->visual_embeds.get_shape()[2];
+                double new_fp = detail::vl_fingerprint(
+                    vl->visual_embeds.data<const float>(),
+                    cached_vl_prompt_len_ * hidden);
+                vl_ok = (new_fp == cached_vl_fingerprint_);
+            }
+        }
+
+        const bool use_prefix_cache = cache_valid_
             && prefix_match > 0
-            && prompt_len > prefix_match;
+            && prompt_len > prefix_match
+            && vl_ok;
 
         // ── Prefill ──
         auto prefill_start = Clock::now();
@@ -564,8 +594,29 @@ public:
                 target_req_.set_tensor("state_update_mode",
                                        detail::make_state_update_mode_tensor(1));
 
-            // Zero visual tensors for suffix (text-only prefix cache)
-            if (target_ir_is_vl_) {
+            // Visual tensors for suffix
+            if (is_vl) {
+                // Slice visual_embeds and visual_pos_mask to suffix region
+                const size_t hidden = vl->visual_embeds.get_shape()[2];
+                const size_t ve_elem = vl->visual_embeds.get_element_type().size();
+                ov::Tensor suffix_ve(vl->visual_embeds.get_element_type(),
+                                     {1, suffix_len, hidden});
+                std::memcpy(suffix_ve.data(),
+                            static_cast<const char*>(vl->visual_embeds.data())
+                                + prefix_match * hidden * ve_elem,
+                            suffix_len * hidden * ve_elem);
+                target_req_.set_tensor("visual_embeds", suffix_ve);
+
+                const size_t pm_elem = vl->visual_pos_mask.get_element_type().size();
+                ov::Tensor suffix_pm(vl->visual_pos_mask.get_element_type(),
+                                     {1, suffix_len});
+                std::memcpy(suffix_pm.data(),
+                            static_cast<const char*>(vl->visual_pos_mask.data())
+                                + prefix_match * pm_elem,
+                            suffix_len * pm_elem);
+                target_req_.set_tensor("visual_pos_mask", suffix_pm);
+            } else if (target_ir_is_vl_) {
+                // Text-only on VL IR: zero visual inputs for suffix
                 ov::Tensor zve(ov::element::f32, {1, suffix_len, model_hidden_size_});
                 std::memset(zve.data(), 0, zve.get_byte_size());
                 target_req_.set_tensor("visual_embeds", zve);
@@ -785,14 +836,9 @@ public:
         output_ids.push_back(next_token);
 
         // Cache commit helper — called before every return to persist KV state.
-        // VL requests invalidate cache; text-only requests store prompt + decoded
-        // token IDs that match the actual KV cache length (target_hidden_len_).
+        // Stores prompt + decoded token IDs matching the actual KV cache length.
+        // For VL requests, also stores a visual fingerprint for cache validation.
         auto commit_cache = [&]() {
-            if (is_vl) {
-                cache_valid_ = false;
-                cached_token_ids_.clear();
-                return;
-            }
             cached_token_ids_.clear();
             const size_t kv_decode = target_hidden_len_ >= prompt_len
                 ? target_hidden_len_ - prompt_len : 0;
@@ -810,6 +856,20 @@ public:
                 target_hidden_len_ -= excess;
                 ctx_hidden_len_ = std::min(ctx_hidden_len_, target_hidden_len_);
             }
+            // Update VL cache state
+            if (is_vl) {
+                cached_is_vl_ = true;
+                const size_t hidden = vl->visual_embeds.get_shape()[2];
+                cached_vl_fingerprint_ = detail::vl_fingerprint(
+                    vl->visual_embeds.data<const float>(), prompt_len * hidden);
+                cached_vl_prompt_len_ = prompt_len;
+            } else if (!use_prefix_cache) {
+                // Fresh text-only (not extending a previous cache)
+                cached_is_vl_ = false;
+                cached_vl_fingerprint_ = 0.0;
+                cached_vl_prompt_len_ = 0;
+            }
+            // else: text extending previous (possibly VL) cache → keep VL state
             cache_valid_ = true;
         };
 
@@ -1151,6 +1211,9 @@ private:
         usm_output_capacity_ = 0;
         cache_valid_ = false;
         cached_token_ids_.clear();
+        cached_is_vl_ = false;
+        cached_vl_fingerprint_ = 0.0;
+        cached_vl_prompt_len_ = 0;
     }
 
     void set_state_update_mode(int32_t mode) {
@@ -1221,6 +1284,9 @@ private:
     bool cache_valid_ = false;                // whether cache can be reused
     size_t storage_capacity_ = 0;             // capacity (seq dim) of hidden storage tensors
     size_t usm_output_capacity_ = 0;          // capacity (seq dim) of USM target_hidden output
+    bool cached_is_vl_ = false;               // whether cached state includes VL content
+    double cached_vl_fingerprint_ = 0.0;      // checksum of visual_embeds for cached prompt
+    size_t cached_vl_prompt_len_ = 0;         // prompt length when VL state was cached
 
     // Tokenizer
     std::unique_ptr<ov::genai::Tokenizer> tokenizer_;

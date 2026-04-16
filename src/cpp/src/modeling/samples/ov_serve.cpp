@@ -1128,6 +1128,13 @@ int main(int argc, char* argv[]) {
                                 usage["prompt_tokens"] = static_cast<int>(result.prompt_tokens);
                                 usage["completion_tokens"] = static_cast<int>(result.generated_tokens);
                                 usage["total_tokens"] = static_cast<int>(result.prompt_tokens + result.generated_tokens);
+                                json perf;
+                                perf["ttft_ms"] = std::round(result.ttft_ms * 100.0) / 100.0;
+                                perf["decode_ms"] = std::round(result.decode_ms * 100.0) / 100.0;
+                                perf["throughput_tps"] = std::round(result.throughput * 100.0) / 100.0;
+                                if (result.prefix_cached_tokens > 0)
+                                    perf["prefix_cached_tokens"] = result.prefix_cached_tokens;
+                                usage["performance"] = perf;
                                 fc["usage"] = usage;
                                 std::string s = sse_chunk(fc);
                                 sink.write(s.c_str(), s.size());
@@ -1232,6 +1239,13 @@ int main(int argc, char* argv[]) {
                             usage["prompt_tokens"] = static_cast<int>(result.prompt_tokens);
                             usage["completion_tokens"] = static_cast<int>(result.generated_tokens);
                             usage["total_tokens"] = static_cast<int>(result.prompt_tokens + result.generated_tokens);
+                            json perf;
+                            perf["ttft_ms"] = std::round(result.ttft_ms * 100.0) / 100.0;
+                            perf["decode_ms"] = std::round(result.decode_ms * 100.0) / 100.0;
+                            perf["throughput_tps"] = std::round(result.throughput * 100.0) / 100.0;
+                            if (result.prefix_cached_tokens > 0)
+                                perf["prefix_cached_tokens"] = result.prefix_cached_tokens;
+                            usage["performance"] = perf;
                             resp["usage"] = usage;
                             std::string body = resp.dump();
                             sink.write(body.c_str(), body.size());
