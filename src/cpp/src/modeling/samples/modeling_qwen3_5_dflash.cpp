@@ -457,10 +457,13 @@ int main(int argc, char* argv[]) try {
 
     // Parse quantization config: CLI arg takes priority, then env vars
     auto parse_quant_mode = [](const std::string& s) -> ov::genai::modeling::weights::QuantizationConfig::Mode {
-        if (s == "INT4_ASYM") return ov::genai::modeling::weights::QuantizationConfig::Mode::INT4_ASYM;
-        if (s == "INT4_SYM")  return ov::genai::modeling::weights::QuantizationConfig::Mode::INT4_SYM;
-        if (s == "INT8_ASYM") return ov::genai::modeling::weights::QuantizationConfig::Mode::INT8_ASYM;
-        if (s == "INT8_SYM")  return ov::genai::modeling::weights::QuantizationConfig::Mode::INT8_SYM;
+        std::string upper;
+        upper.reserve(s.size());
+        for (char c : s) upper += static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        if (upper == "INT4_ASYM") return ov::genai::modeling::weights::QuantizationConfig::Mode::INT4_ASYM;
+        if (upper == "INT4_SYM")  return ov::genai::modeling::weights::QuantizationConfig::Mode::INT4_SYM;
+        if (upper == "INT8_ASYM") return ov::genai::modeling::weights::QuantizationConfig::Mode::INT8_ASYM;
+        if (upper == "INT8_SYM")  return ov::genai::modeling::weights::QuantizationConfig::Mode::INT8_SYM;
         return ov::genai::modeling::weights::QuantizationConfig::Mode::NONE;
     };
     auto quant_mode_name = [](ov::genai::modeling::weights::QuantizationConfig::Mode m) -> const char* {
