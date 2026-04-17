@@ -151,6 +151,7 @@ struct ServerConfig {
     float min_temperature = 0.0f;     // 0 = no override; set via --min-temp
     int warmup_tokens = 0;            // 0 = disable warmup
     bool enable_logging = true;       // Log prompts and request params to stderr
+    std::string model_name = "qwen3.5";  // Model name reported in /v1/models
 };
 
 /// Check if an exception is a GPU out-of-memory error (CL_OUT_OF_RESOURCES).
@@ -665,7 +666,7 @@ static std::string sse_done() {
 static void print_usage() {
     std::cerr << "Usage: ov_serve --model <path> [--port 8080] [--host 0.0.0.0] "
                  "[--workers 1] [--device GPU] [--vl] [--no-thinking] [--temperature 0.7] "
-                 "[--top-p 0.95] [--top-k 0] [--rep-penalty 1.0]\n"
+                 "[--top-p 0.95] [--top-k 0] [--rep-penalty 1.0] [--model-name qwen3.5]\n"
                  "\n"
                  "  --vl              Enable vision-language (load vision encoder)\n"
                  "  --no-thinking     Disable thinking mode\n"
@@ -677,6 +678,7 @@ static void print_usage() {
                  "  --freq-penalty    Frequency penalty (default: 0.0)\n"
                  "  --min-temp        Minimum temperature floor (default: 0, no override)\n"
                  "  --warmup-tokens   Max sequence length for GPU warmup (default: 0, disabled)\n"
+                 "  --model-name      Model name reported in /v1/models (default: qwen3.5)\n"
                  "  --no-log          Disable request/prompt logging to stderr\n";
 }
 
@@ -703,6 +705,7 @@ int main(int argc, char* argv[]) {
         else if (arg == "--no-thinking") cfg.enable_thinking = false;
         else if (arg == "--vl") cfg.enable_vision = true;
         else if (arg == "--no-log") cfg.enable_logging = false;
+        else if (arg == "--model-name" && i + 1 < argc) cfg.model_name = argv[++i];
         else if (arg == "--help" || arg == "-h") { print_usage(); return 0; }
     }
 
@@ -744,7 +747,7 @@ int main(int argc, char* argv[]) {
     }
 
     auto* tokenizer = loader.tokenizer();
-    std::string model_name = "qwen3.5";
+    std::string model_name = cfg.model_name;
 
     // ── HTTP server ──
     httplib::Server svr;
