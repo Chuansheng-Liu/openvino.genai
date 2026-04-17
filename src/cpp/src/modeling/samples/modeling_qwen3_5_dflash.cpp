@@ -772,17 +772,23 @@ int main(int argc, char* argv[]) try {
         // Apply chat template if available (text-only mode)
         std::string formatted_prompt = prompt;
         bool add_special_tokens = true;
-        try {
-            if (!tokenizer.get_chat_template().empty()) {
-                ov::genai::ChatHistory history({{{"role", "user"}, {"content", prompt}}});
-                constexpr bool add_generation_prompt = true;
-                ov::genai::JsonContainer extra({{"enable_thinking", enable_thinking}});
-                formatted_prompt = tokenizer.apply_chat_template(
-                    history, add_generation_prompt, {}, std::nullopt, extra);
-                add_special_tokens = false;
+
+        // If prompt already contains ChatML markers, use it as-is (pre-formatted)
+        if (prompt.find("<|im_start|>") != std::string::npos) {
+            add_special_tokens = false;
+        } else {
+            try {
+                if (!tokenizer.get_chat_template().empty()) {
+                    ov::genai::ChatHistory history({{{"role", "user"}, {"content", prompt}}});
+                    constexpr bool add_generation_prompt = true;
+                    ov::genai::JsonContainer extra({{"enable_thinking", enable_thinking}});
+                    formatted_prompt = tokenizer.apply_chat_template(
+                        history, add_generation_prompt, {}, std::nullopt, extra);
+                    add_special_tokens = false;
+                }
+            } catch (const std::exception& e) {
+                std::cerr << "Warning: chat template apply failed: " << e.what() << ", using raw prompt" << std::endl;
             }
-        } catch (const std::exception& e) {
-            std::cerr << "Warning: chat template apply failed: " << e.what() << ", using raw prompt" << std::endl;
         }
         auto encoded = tokenizer.encode(formatted_prompt, {ov::genai::add_special_tokens(add_special_tokens)});
         prompt_input_ids = encoded.input_ids;
@@ -1065,6 +1071,18 @@ int main(int argc, char* argv[]) try {
               << (using_usm_ctx ? " USM host" : " CPU") << ")" << std::endl;
     std::cerr << "[DFlash] initial context_hidden computed for " << prompt_len << " tokens" << std::endl;
 
+    // Draft context window: limit context visible to draft model
+    size_t max_draft_context = 1500;
+    {
+        const char* env = std::getenv("OV_GENAI_DFLASH_DRAFT_CTX_WINDOW");
+        if (env) {
+            int v = std::atoi(env);
+            max_draft_context = v >= 0 ? static_cast<size_t>(v) : 0;
+        }
+    }
+    std::cerr << "[DFlash] draft_ctx_window="
+              << (max_draft_context > 0 ? std::to_string(max_draft_context) : "off") << std::endl;
+
     std::cout << "\n[Generating...]" << std::flush;
 
     const size_t block_size = static_cast<size_t>(dflash_cfg.block_size);
@@ -1175,16 +1193,24 @@ int main(int argc, char* argv[]) try {
 
         ov::Tensor draft_logits;
         {
-            ov::Tensor ctx_for_draft(ctx_hidden_storage,
-                                     {0, 0, 0},
-                                     {1, context_hidden_len, ctx_hidden_dim});
+            // Apply draft context window to maintain acceptance at long context
+            size_t draft_ctx_start = 0;
+            size_t draft_ctx_len = context_hidden_len;
+            if (max_draft_context > 0 && context_hidden_len > max_draft_context) {
+                draft_ctx_start = context_hidden_len - max_draft_context;
+                draft_ctx_len = max_draft_context;
+            }
 
-            const size_t total_pos = context_hidden_len + block_size;
+            ov::Tensor ctx_for_draft(ctx_hidden_storage,
+                                     {0, draft_ctx_start, 0},
+                                     {1, draft_ctx_start + draft_ctx_len, ctx_hidden_dim});
+
+            const size_t total_pos = draft_ctx_len + block_size;
             reuse_draft_pos.set_shape({1, total_pos});
             {
                 auto* pd = reuse_draft_pos.data<int64_t>();
                 for (size_t i = 0; i < total_pos; ++i)
-                    pd[i] = static_cast<int64_t>(i);
+                    pd[i] = static_cast<int64_t>(draft_ctx_start + i);
             }
 
             draft_request.set_tensor("context_hidden", ctx_for_draft);

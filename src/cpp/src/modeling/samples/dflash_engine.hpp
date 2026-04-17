@@ -141,6 +141,18 @@ inline bool deferred_state_commit_enabled() {
     return !(raw && std::string(raw) == "1");
 }
 
+// Draft context window: limit context tokens visible to draft model.
+// Default 1500 (below the ~2000-token acceptance cliff).
+// Set to 0 to disable (draft sees full context).
+inline size_t draft_context_window_size() {
+    const char* raw = std::getenv("OV_GENAI_DFLASH_DRAFT_CTX_WINDOW");
+    if (raw) {
+        int v = std::atoi(raw);
+        return v >= 0 ? static_cast<size_t>(v) : 0;
+    }
+    return 1500;  // default
+}
+
 inline std::string quant_mode_token(ov::genai::modeling::weights::QuantizationConfig::Mode m) {
     using Mode = ov::genai::modeling::weights::QuantizationConfig::Mode;
     switch (m) {
@@ -318,10 +330,13 @@ public:
         hidden_dim_ = 0;  // will be set from actual target_hidden output after first prefill
         model_hidden_size_ = static_cast<size_t>(target_qwen35_cfg.text.hidden_size);
         ctx_hidden_dim_ = static_cast<size_t>(dcfg.hidden_size);
+        max_draft_context_ = detail::draft_context_window_size();
 
         std::cerr << "[DFlashEngine] block_size=" << block_size_
                   << " target_layers=" << dcfg.target_layer_ids.size()
-                  << " draft_layers=" << dcfg.num_hidden_layers << "\n";
+                  << " draft_layers=" << dcfg.num_hidden_layers
+                  << " draft_ctx_window=" << (max_draft_context_ > 0 ? std::to_string(max_draft_context_) : "off")
+                  << "\n";
 
         // Find IR files
         auto quant_cfg = weights::parse_quantization_config_from_env();
@@ -974,12 +989,23 @@ public:
             // Draft inference
             ov::Tensor draft_logits;
             {
-                ov::Tensor ctx_view(ctx_hidden_storage_, {0, 0, 0},
-                                    {1, ctx_hidden_len_, ctx_hidden_dim_});
-                const size_t total_pos = ctx_hidden_len_ + block_size_;
+                // Apply draft context window: limit visible context to
+                // keep the draft model within its effective capacity range.
+                // Target model still verifies with full context.
+                size_t draft_ctx_start = 0;
+                size_t draft_ctx_len = ctx_hidden_len_;
+                if (max_draft_context_ > 0 && ctx_hidden_len_ > max_draft_context_) {
+                    draft_ctx_start = ctx_hidden_len_ - max_draft_context_;
+                    draft_ctx_len = max_draft_context_;
+                }
+
+                ov::Tensor ctx_view(ctx_hidden_storage_, {0, draft_ctx_start, 0},
+                                    {1, draft_ctx_start + draft_ctx_len, ctx_hidden_dim_});
+                const size_t total_pos = draft_ctx_len + block_size_;
                 reuse_draft_pos.set_shape({1, total_pos});
                 auto* pd = reuse_draft_pos.data<int64_t>();
-                for (size_t i = 0; i < total_pos; ++i) pd[i] = static_cast<int64_t>(i);
+                for (size_t i = 0; i < total_pos; ++i)
+                    pd[i] = static_cast<int64_t>(draft_ctx_start + i);
 
                 draft_req_.set_tensor("context_hidden", ctx_view);
                 draft_req_.set_tensor("input_ids", draft_ids);
@@ -1247,6 +1273,7 @@ private:
     size_t hidden_dim_ = 0;
     size_t model_hidden_size_ = 0;  // config hidden_size for visual_embeds
     size_t ctx_hidden_dim_ = 0;
+    size_t max_draft_context_ = 0;  // draft context window (0 = disabled)
     bool target_ir_is_vl_ = false;
     bool use_f16_ctx_ = false;
 
