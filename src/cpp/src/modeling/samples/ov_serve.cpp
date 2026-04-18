@@ -293,11 +293,11 @@ static ParsedRequest parse_chat_request(const json& body, ov::genai::Tokenizer& 
 
     // Prepend thinking tags to historical assistant messages so that the
     // tokenized prompt matches what was originally generated (the model's
-    // output always starts with <think>\n</think>\n\n when thinking is
+    // output always starts with <think>\n\n</think>\n\n when thinking is
     // disabled, or <think>\n...thoughts...</think>\n\n when enabled).
     // Without this, prefix cache would miss because the cached KV sequence
     // contains these thinking tokens but the rebuilt prompt does not.
-    const std::string think_prefix = "<think>\n</think>\n\n";
+    const std::string think_prefix = "<think>\n\n</think>\n\n";
     for (size_t i = 0; i < messages.size(); ++i) {
         if (messages[i].value("role", "") == "assistant"
             && i + 1 < messages.size()) {  // not the last message (which is the new assistant turn)
@@ -428,7 +428,7 @@ static ParsedRequest parse_chat_request(const json& body, ov::genai::Tokenizer& 
         if (cfg.enable_thinking) {
             chat_text += "<think>\n";
         } else {
-            chat_text += "<think>\n</think>\n\n";
+            chat_text += "<think>\n\n</think>\n\n";
         }
         req.prompt = chat_text;
     } else {
@@ -465,7 +465,7 @@ static ParsedRequest parse_chat_request(const json& body, ov::genai::Tokenizer& 
         if (cfg.enable_thinking) {
             chat_text += "<think>\n";
         } else {
-            chat_text += "<think>\n</think>\n\n";
+            chat_text += "<think>\n\n</think>\n\n";
         }
         req.prompt = chat_text;
     }
@@ -1420,7 +1420,7 @@ int main(int argc, char* argv[]) {
 
         // Prepend thinking tags to historical assistant messages (same as OpenAI path)
         {
-            const std::string think_prefix = "<think>\n</think>\n\n";
+            const std::string think_prefix = "<think>\n\n</think>\n\n";
             for (size_t i = 0; i < messages.size(); ++i) {
                 if (messages[i].value("role", "") == "assistant"
                     && i + 1 < messages.size()) {
@@ -1451,7 +1451,7 @@ int main(int argc, char* argv[]) {
             if (cfg.enable_thinking) {
                 chat_text += "<think>\n";
             } else {
-                chat_text += "<think>\n</think>\n\n";
+                chat_text += "<think>\n\n</think>\n\n";
             }
         }
 
@@ -1630,7 +1630,7 @@ int main(int argc, char* argv[]) {
                 if (cfg.enable_thinking) {
                     wrapped += "<think>\n";
                 } else {
-                    wrapped += "<think>\n</think>\n\n";
+                    wrapped += "<think>\n\n</think>\n\n";
                 }
                 prompt = wrapped;
             }

@@ -27,7 +27,7 @@ ThinkingResult ThinkingTracker::process(const std::string& text) {
             auto found = input.find(kThinkOpen, pos);
 
             // Also look for orphan </think> (model ignoring the prompt's
-            // <think>\n</think>\n\n prefix and emitting its own thinking
+            // <think>\n\n</think>\n\n prefix and emitting its own thinking
             // block without the opening tag).  Everything before the orphan
             // </think> is treated as thinking_text so it gets filtered.
             auto close_found = input.find(kThinkClose, pos);
