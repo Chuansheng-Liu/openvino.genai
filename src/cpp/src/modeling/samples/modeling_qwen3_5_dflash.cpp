@@ -1071,18 +1071,6 @@ int main(int argc, char* argv[]) try {
               << (using_usm_ctx ? " USM host" : " CPU") << ")" << std::endl;
     std::cerr << "[DFlash] initial context_hidden computed for " << prompt_len << " tokens" << std::endl;
 
-    // Draft context window: limit context visible to draft model
-    size_t max_draft_context = 1500;
-    {
-        const char* env = std::getenv("OV_GENAI_DFLASH_DRAFT_CTX_WINDOW");
-        if (env) {
-            int v = std::atoi(env);
-            max_draft_context = v >= 0 ? static_cast<size_t>(v) : 0;
-        }
-    }
-    std::cerr << "[DFlash] draft_ctx_window="
-              << (max_draft_context > 0 ? std::to_string(max_draft_context) : "off") << std::endl;
-
     std::cout << "\n[Generating...]" << std::flush;
 
     const size_t block_size = static_cast<size_t>(dflash_cfg.block_size);
@@ -1193,24 +1181,16 @@ int main(int argc, char* argv[]) try {
 
         ov::Tensor draft_logits;
         {
-            // Apply draft context window to maintain acceptance at long context
-            size_t draft_ctx_start = 0;
-            size_t draft_ctx_len = context_hidden_len;
-            if (max_draft_context > 0 && context_hidden_len > max_draft_context) {
-                draft_ctx_start = context_hidden_len - max_draft_context;
-                draft_ctx_len = max_draft_context;
-            }
-
             ov::Tensor ctx_for_draft(ctx_hidden_storage,
-                                     {0, draft_ctx_start, 0},
-                                     {1, draft_ctx_start + draft_ctx_len, ctx_hidden_dim});
+                                     {0, 0, 0},
+                                     {1, context_hidden_len, ctx_hidden_dim});
 
-            const size_t total_pos = draft_ctx_len + block_size;
+            const size_t total_pos = context_hidden_len + block_size;
             reuse_draft_pos.set_shape({1, total_pos});
             {
                 auto* pd = reuse_draft_pos.data<int64_t>();
                 for (size_t i = 0; i < total_pos; ++i)
-                    pd[i] = static_cast<int64_t>(draft_ctx_start + i);
+                    pd[i] = static_cast<int64_t>(i);
             }
 
             draft_request.set_tensor("context_hidden", ctx_for_draft);
