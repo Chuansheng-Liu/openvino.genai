@@ -440,35 +440,40 @@ struct Session::Impl {
                 if (prompt_data[i] != snap_ids[i]) break;
                 ++snapshot_match;
             }
-            if (snapshot_match == snap_len) {
-                if (static_cast<size_t>(prompt_len) == snap_len) {
-                    snapshot_action = SnapshotAction::RESTORE_IDENTICAL;
-                } else if (static_cast<size_t>(prompt_len) > snap_len) {
-                    snapshot_action = SnapshotAction::RESTORE_EXTEND;
-                }
+            if (snapshot_match == snap_len && static_cast<size_t>(prompt_len) == snap_len) {
+                snapshot_action = SnapshotAction::RESTORE_IDENTICAL;
             }
+            // RESTORE_EXTEND is tentative — may be overridden by longer prefix cache below
         }
 
         // ── Prefix cache check (multi-turn extension) ──
+        // Always check, even when snapshot matched, to pick the longer reuse.
         size_t prefix_match = 0;
-        if (cache_valid_ && snapshot_action == SnapshotAction::NONE) {
+        if (cache_valid_) {
             const size_t cached_len = cached_token_ids_.size();
             const size_t check_len = std::min(static_cast<size_t>(prompt_len), cached_len);
             for (size_t i = 0; i < check_len; ++i) {
                 if (prompt_data[i] != cached_token_ids_[i]) break;
                 ++prefix_match;
             }
-        } else {
-            // cold start — no cache to compare
         }
-        // Reuse cache only when the new prompt is an exact extension of the
-        // cached sequence (i.e. all cached tokens match the prompt prefix
-        // and the prompt has additional new tokens).
-        const bool use_prefix_cache = snapshot_action == SnapshotAction::NONE
-            && cache_valid_
+        const bool prefix_cache_valid = cache_valid_
             && prefix_match > 0
             && prefix_match == cached_token_ids_.size()
             && static_cast<size_t>(prompt_len) > prefix_match;
+
+        // Resolve EXTEND vs prefix cache: pick whichever reuses more tokens.
+        if (snapshot_action != SnapshotAction::RESTORE_IDENTICAL
+            && snapshot_match == prefill_snapshot_.prompt_ids.size()
+            && static_cast<size_t>(prompt_len) > snapshot_match) {
+            // Snapshot can extend — but only use it if it reuses more than prefix cache
+            if (!prefix_cache_valid || snapshot_match > prefix_match) {
+                snapshot_action = SnapshotAction::RESTORE_EXTEND;
+            }
+        }
+
+        const bool use_prefix_cache = (snapshot_action == SnapshotAction::NONE)
+            && prefix_cache_valid;
 
         // Collect prompt token IDs for LogitProcessor
         std::vector<int64_t> prompt_token_ids(
