@@ -107,6 +107,45 @@ struct Session::Impl {
     bool cache_valid_ = false;
     std::vector<int64_t> last_vl_image_token_counts_;  // per-image pad counts from last VL request
 
+    // Prefill snapshot: saves model state right after prefill (before decode)
+    // so identical or extending prompts can skip/shorten prefill.
+    struct PrefillSnapshot {
+        std::vector<ov::Tensor> states;    // deep copies of all variable states
+        std::vector<float> logit_buf;      // post-prefill logits for identical-prompt restore
+        std::vector<int64_t> prompt_ids;   // prompt-only token IDs (no decode tokens)
+        int64_t past_len = 0;
+        bool valid = false;
+        void clear() {
+            states.clear(); logit_buf.clear(); prompt_ids.clear();
+            past_len = 0; valid = false;
+        }
+    };
+    PrefillSnapshot prefill_snapshot_;
+
+    void save_prefill_snapshot(const int64_t* prompt_data, int64_t prompt_len) {
+        prefill_snapshot_.clear();
+        auto var_states = text_request_.query_state();
+        prefill_snapshot_.states.reserve(var_states.size());
+        for (auto& vs : var_states) {
+            auto src = vs.get_state();
+            ov::Tensor dst(src.get_element_type(), src.get_shape());
+            src.copy_to(dst);
+            prefill_snapshot_.states.push_back(std::move(dst));
+        }
+        prefill_snapshot_.logit_buf = logit_buf_;
+        prefill_snapshot_.prompt_ids.assign(prompt_data, prompt_data + prompt_len);
+        prefill_snapshot_.past_len = prompt_len;
+        prefill_snapshot_.valid = true;
+    }
+
+    void restore_prefill_snapshot() {
+        auto var_states = text_request_.query_state();
+        for (size_t i = 0; i < var_states.size() && i < prefill_snapshot_.states.size(); ++i) {
+            var_states[i].set_state(prefill_snapshot_.states[i]);
+        }
+        past_len_ = prefill_snapshot_.past_len;
+    }
+
     // Sampling scratch
     std::vector<float> logit_buf_;
     SamplingContext sampling_ctx_;
@@ -386,9 +425,33 @@ struct Session::Impl {
         const int64_t prompt_len = static_cast<int64_t>(input_ids.get_shape().at(1));
         const int64_t* prompt_data = input_ids.data<const int64_t>();
 
-        // ── Prefix cache check ──
+        // ── Prefill snapshot check (identical/extending prompt fast path) ──
+        // The snapshot saves model state right after prefill, enabling reuse
+        // when the same (or extended) prompt arrives again.
+        enum class SnapshotAction { NONE, RESTORE_IDENTICAL, RESTORE_EXTEND };
+        SnapshotAction snapshot_action = SnapshotAction::NONE;
+        size_t snapshot_match = 0;
+
+        if (prefill_snapshot_.valid && !use_vl) {
+            const auto& snap_ids = prefill_snapshot_.prompt_ids;
+            const size_t snap_len = snap_ids.size();
+            const size_t check_len = std::min(static_cast<size_t>(prompt_len), snap_len);
+            for (size_t i = 0; i < check_len; ++i) {
+                if (prompt_data[i] != snap_ids[i]) break;
+                ++snapshot_match;
+            }
+            if (snapshot_match == snap_len) {
+                if (static_cast<size_t>(prompt_len) == snap_len) {
+                    snapshot_action = SnapshotAction::RESTORE_IDENTICAL;
+                } else if (static_cast<size_t>(prompt_len) > snap_len) {
+                    snapshot_action = SnapshotAction::RESTORE_EXTEND;
+                }
+            }
+        }
+
+        // ── Prefix cache check (multi-turn extension) ──
         size_t prefix_match = 0;
-        if (cache_valid_) {
+        if (cache_valid_ && snapshot_action == SnapshotAction::NONE) {
             const size_t cached_len = cached_token_ids_.size();
             const size_t check_len = std::min(static_cast<size_t>(prompt_len), cached_len);
             for (size_t i = 0; i < check_len; ++i) {
@@ -401,7 +464,8 @@ struct Session::Impl {
         // Reuse cache only when the new prompt is an exact extension of the
         // cached sequence (i.e. all cached tokens match the prompt prefix
         // and the prompt has additional new tokens).
-        const bool use_prefix_cache = cache_valid_
+        const bool use_prefix_cache = snapshot_action == SnapshotAction::NONE
+            && cache_valid_
             && prefix_match > 0
             && prefix_match == cached_token_ids_.size()
             && static_cast<size_t>(prompt_len) > prefix_match;
@@ -426,7 +490,59 @@ struct Session::Impl {
         // ─── Prefill ───
         const auto prefill_start = std::chrono::steady_clock::now();
 
-        if (use_prefix_cache) {
+        if (snapshot_action == SnapshotAction::RESTORE_IDENTICAL) {
+            // Identical prompt: restore post-prefill state, skip prefill entirely.
+            restore_prefill_snapshot();
+            logit_buf_ = prefill_snapshot_.logit_buf;
+        } else if (snapshot_action == SnapshotAction::RESTORE_EXTEND) {
+            // Extending prompt: restore post-prefill state, process only suffix.
+            restore_prefill_snapshot();
+
+            const size_t suffix_len = static_cast<size_t>(prompt_len) - snapshot_match;
+
+            ov::Tensor suffix_ids(ov::element::i64, {kBatch, suffix_len});
+            std::memcpy(suffix_ids.data<int64_t>(),
+                        prompt_data + snapshot_match,
+                        suffix_len * sizeof(int64_t));
+
+            ov::Tensor full_mask(ov::element::i64, {kBatch, static_cast<size_t>(prompt_len)});
+            std::fill_n(full_mask.data<int64_t>(), prompt_len, int64_t{1});
+
+            ov::Tensor suffix_pos(ov::element::i64, {3, kBatch, suffix_len});
+            {
+                const auto* full_pos = position_ids.data<const int64_t>();
+                const size_t full_seq = position_ids.get_shape().at(2);
+                auto* dst = suffix_pos.data<int64_t>();
+                for (size_t d = 0; d < 3; ++d) {
+                    std::memcpy(dst + d * suffix_len,
+                                full_pos + d * full_seq + snapshot_match,
+                                suffix_len * sizeof(int64_t));
+                }
+            }
+
+            auto usm_ids = clone_as_usm_host(gpu_ctx_, suffix_ids);
+            auto usm_mask = clone_as_usm_host(gpu_ctx_, full_mask);
+            auto usm_pos = clone_as_usm_host(gpu_ctx_, suffix_pos);
+
+            text_request_.set_tensor(models::Qwen3_5TextIO::kInputIds, usm_ids);
+            text_request_.set_tensor(models::Qwen3_5TextIO::kAttentionMask, usm_mask);
+            text_request_.set_tensor(models::Qwen3_5TextIO::kPositionIds, usm_pos);
+            text_request_.set_tensor(models::Qwen3_5TextIO::kBeamIdx, beam_idx_);
+
+            if (model_.compiled_vision()) {
+                const auto hidden = static_cast<size_t>(model_.config().text.hidden_size);
+                auto zero_vis = make_usm_host_tensor(gpu_ctx_, ov::element::f32,
+                                                      {kBatch, suffix_len, hidden});
+                std::memset(zero_vis.data(), 0, zero_vis.get_byte_size());
+                auto zero_mask = make_usm_host_tensor(gpu_ctx_, ov::element::boolean,
+                                                       {kBatch, suffix_len});
+                std::memset(zero_mask.data(), 0, zero_mask.get_byte_size());
+                text_request_.set_tensor(models::Qwen3_5TextIO::kVisualEmbeds, zero_vis);
+                text_request_.set_tensor(models::Qwen3_5TextIO::kVisualPosMask, zero_mask);
+            }
+
+            text_request_.infer();
+        } else if (use_prefix_cache) {
             // Partial prefill: only process new suffix tokens.
             // The KV cache already contains entries for cached_token_ids_.
             const size_t suffix_len = static_cast<size_t>(prompt_len) - prefix_match;
@@ -544,8 +660,16 @@ struct Session::Impl {
 
         const auto prefill_end = std::chrono::steady_clock::now();
 
-        ov::Tensor logits = text_request_.get_tensor(models::Qwen3_5TextIO::kLogits);
-        extract_last_logits_f32(logits, logit_buf_);
+        if (snapshot_action != SnapshotAction::RESTORE_IDENTICAL) {
+            // Extract logits from inference output (snapshot-identical already has them)
+            ov::Tensor logits = text_request_.get_tensor(models::Qwen3_5TextIO::kLogits);
+            extract_last_logits_f32(logits, logit_buf_);
+
+            // Save prefill snapshot for future reuse (text-only, non-VL)
+            if (!use_vl) {
+                save_prefill_snapshot(prompt_data, prompt_len);
+            }
+        }
 
         int64_t next_id;
         {
@@ -711,8 +835,10 @@ struct Session::Impl {
             }
 
             text_request_.infer();
-            logits = text_request_.get_tensor(models::Qwen3_5TextIO::kLogits);
-            extract_last_logits_f32(logits, logit_buf_);
+            {
+                ov::Tensor logits = text_request_.get_tensor(models::Qwen3_5TextIO::kLogits);
+                extract_last_logits_f32(logits, logit_buf_);
+            }
 
             {
                 ov::genai::Logits lw(logit_buf_.data(), logit_buf_.size());
@@ -889,7 +1015,11 @@ struct Session::Impl {
         result.prompt_tokens = static_cast<int>(prompt_len);
         result.generated_tokens = static_cast<int>(result.token_ids.size());
         result.thinking_tokens = thinking_tokens;
-        result.prefix_cached_tokens = use_prefix_cache ? static_cast<int>(prefix_match) : 0;
+        result.prefix_cached_tokens = (snapshot_action == SnapshotAction::RESTORE_IDENTICAL)
+            ? static_cast<int>(prompt_len)
+            : (snapshot_action == SnapshotAction::RESTORE_EXTEND)
+                ? static_cast<int>(snapshot_match)
+                : use_prefix_cache ? static_cast<int>(prefix_match) : 0;
         result.prefill_ms = elapsed_ms(prefill_start, prefill_end);
         result.decode_ms = elapsed_ms(decode_start, decode_end);
         result.ttft_ms = result.prefill_ms;
@@ -998,6 +1128,7 @@ GenerateResult Session::generate(const std::string& prompt,
         impl_->is_generating_.store(false);
         impl_->cache_valid_ = false;
         impl_->cached_token_ids_.clear();
+        impl_->prefill_snapshot_.clear();
         impl_->text_request_.reset_state();
         impl_->past_len_ = 0;
         throw;
@@ -1039,6 +1170,7 @@ GenerateResult Session::generate_vl(const std::string& prompt,
         impl_->is_generating_.store(false);
         impl_->cache_valid_ = false;
         impl_->cached_token_ids_.clear();
+        impl_->prefill_snapshot_.clear();
         impl_->text_request_.reset_state();
         impl_->past_len_ = 0;
         throw;
@@ -1055,6 +1187,7 @@ void Session::reset() {
     impl_->generated_ids_.clear();
     impl_->cached_token_ids_.clear();
     impl_->cache_valid_ = false;
+    impl_->prefill_snapshot_.clear();
     impl_->last_vl_image_token_counts_.clear();
 }
 
@@ -1184,6 +1317,7 @@ void Session::warmup(int max_seq_len) {
 }
 
 void Session::recreate() {
+    impl_->prefill_snapshot_.clear();
     impl_->text_request_ = {};  // release old request first
     impl_->init_request_and_tensors();
 }
