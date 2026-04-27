@@ -9,6 +9,7 @@
 #include <openvino/opsets/opset13.hpp>
 #include <openvino/core/except.hpp>
 #include <ov_ops/rotary_positional_embeddings.hpp>
+#include "transformations/rt_info/disable_fp16_compression.hpp"
 
 #include "modeling/ops/ops.hpp"
 #include "modeling/ops/shape.hpp"
@@ -39,8 +40,21 @@ std::pair<Tensor, Tensor> rope_cos_sin(const Tensor& positions,
     auto inv_freq_reshaped = inv_freq_tensor.reshape(inv_freq_shape, false);
 
     auto pos_f = positions.to(ov::element::f32);
+    // Prevent the GPU convert_precision pass from downgrading this Convert to f16.
+    // Position IDs can reach 65536+ which overflows f16 (max ~65504), producing
+    // +Inf and then NaN from cos/sin, corrupting RoPE for sequences > 65k tokens.
+    ov::disable_fp16_compression(pos_f.output().get_node_shared_ptr());
+
     auto freqs = pos_f.unsqueeze(2) * inv_freq_reshaped;
-    return {freqs.cos(), freqs.sin()};
+    auto cos_result = freqs.cos();
+    auto sin_result = freqs.sin();
+    // Keep cos/sin tables in f32.  The RoPE kernel supports mixed f16 x / f32
+    // cos-sin inputs (sets vec_size=1 for type conversion), and marking these
+    // nodes causes MarkSugraphsToKeepInMixedPrecision to also protect the
+    // intermediate Unsqueeze and Multiply nodes from f32→f16 downconversion.
+    ov::disable_fp16_compression(cos_result.output().get_node_shared_ptr());
+    ov::disable_fp16_compression(sin_result.output().get_node_shared_ptr());
+    return {cos_result, sin_result};
 }
 
 Tensor apply_rope(const Tensor& x,
