@@ -122,6 +122,11 @@ struct Session::Impl {
     };
     PrefillSnapshot prefill_snapshot_;
 
+    // Prefix snapshot: saves model state after processing only the shared
+    // prefix (e.g., system prompt tokens), enabling fast suffix-only prefill
+    // when the same prefix is reused with a different suffix (user message).
+    PrefillSnapshot prefix_snapshot_;
+
     void save_prefill_snapshot(const int64_t* prompt_data, int64_t prompt_len) {
         prefill_snapshot_.clear();
         auto var_states = text_request_.query_state();
@@ -144,6 +149,30 @@ struct Session::Impl {
             var_states[i].set_state(prefill_snapshot_.states[i]);
         }
         past_len_ = prefill_snapshot_.past_len;
+    }
+
+    void save_prefix_snapshot(const int64_t* prompt_data, int64_t prefix_len) {
+        prefix_snapshot_.clear();
+        auto var_states = text_request_.query_state();
+        prefix_snapshot_.states.reserve(var_states.size());
+        for (auto& vs : var_states) {
+            auto src = vs.get_state();
+            ov::Tensor dst(src.get_element_type(), src.get_shape());
+            src.copy_to(dst);
+            prefix_snapshot_.states.push_back(std::move(dst));
+        }
+        // logit_buf not saved — prefix snapshot is state-only (never used for IDENTICAL)
+        prefix_snapshot_.prompt_ids.assign(prompt_data, prompt_data + prefix_len);
+        prefix_snapshot_.past_len = prefix_len;
+        prefix_snapshot_.valid = true;
+    }
+
+    void restore_prefix_snapshot() {
+        auto var_states = text_request_.query_state();
+        for (size_t i = 0; i < var_states.size() && i < prefix_snapshot_.states.size(); ++i) {
+            var_states[i].set_state(prefix_snapshot_.states[i]);
+        }
+        past_len_ = prefix_snapshot_.past_len;
     }
 
     // Sampling scratch
@@ -475,6 +504,52 @@ struct Session::Impl {
         const bool use_prefix_cache = (snapshot_action == SnapshotAction::NONE)
             && prefix_cache_valid;
 
+        // ── Prefix snapshot check (shared prefix fast path) ──
+        // The prefix snapshot captures model state after processing only a
+        // common prefix (e.g., system prompt).  When the same prefix appears
+        // with a different suffix (user message), we restore the snapshot and
+        // prefill only the new suffix — much faster than full prefill.
+        bool use_prefix_snapshot = false;
+        size_t prefix_snap_match = 0;
+        if (prefix_snapshot_.valid && !use_vl
+            && snapshot_action == SnapshotAction::NONE
+            && !use_prefix_cache) {
+            const auto& psnap_ids = prefix_snapshot_.prompt_ids;
+            const size_t psnap_len = psnap_ids.size();
+            const size_t pcheck = std::min(static_cast<size_t>(prompt_len), psnap_len);
+            for (size_t i = 0; i < pcheck; ++i) {
+                if (prompt_data[i] != psnap_ids[i]) break;
+                ++prefix_snap_match;
+            }
+            if (prefix_snap_match == psnap_len
+                && static_cast<size_t>(prompt_len) > psnap_len) {
+                use_prefix_snapshot = true;
+            }
+        }
+
+        // ── Split prefill: create prefix snapshot for future reuse ──
+        // When no existing mechanism matches but a substantial common prefix
+        // exists, split the prefill into two passes:
+        //   1. Prefill prefix-only → save prefix snapshot
+        //   2. Prefill suffix on top
+        // The second request pays ~same cost, but all subsequent requests with
+        // the same prefix hit the prefix snapshot and skip prefix re-computation.
+        // Also prefer split over prefix_snapshot when a much longer prefix is
+        // available (e.g. snapshot has 424 tokens but prefill_snapshot_ shares 2000).
+        constexpr size_t kMinPrefixForSplit = 64;
+        const size_t partial_prefix_len = std::max(snapshot_match, prefix_match);
+        const bool should_split_prefill = !use_vl
+            && snapshot_action == SnapshotAction::NONE
+            && !use_prefix_cache
+            && partial_prefix_len >= kMinPrefixForSplit
+            && partial_prefix_len < static_cast<size_t>(prompt_len)
+            && (!use_prefix_snapshot || partial_prefix_len > prefix_snap_match * 2);
+
+        // If split prefill supersedes prefix snapshot, disable the latter.
+        if (should_split_prefill && use_prefix_snapshot) {
+            use_prefix_snapshot = false;
+        }
+
         // Collect prompt token IDs for LogitProcessor
         std::vector<int64_t> prompt_token_ids(
             prompt_data, prompt_data + input_ids.get_size());
@@ -624,6 +699,152 @@ struct Session::Impl {
                 std::memset(zero_mask.data(), 0, zero_mask.get_byte_size());
                 text_request_.set_tensor(models::Qwen3_5TextIO::kVisualEmbeds, zero_vis);
                 text_request_.set_tensor(models::Qwen3_5TextIO::kVisualPosMask, zero_mask);
+            }
+
+            text_request_.infer();
+        } else if (use_prefix_snapshot) {
+            // Prefix snapshot hit: restore prefix-only state, prefill suffix.
+            restore_prefix_snapshot();
+
+            const size_t suffix_len = static_cast<size_t>(prompt_len) - prefix_snap_match;
+
+            ov::Tensor suffix_ids(ov::element::i64, {kBatch, suffix_len});
+            std::memcpy(suffix_ids.data<int64_t>(),
+                        prompt_data + prefix_snap_match,
+                        suffix_len * sizeof(int64_t));
+
+            ov::Tensor full_mask(ov::element::i64, {kBatch, static_cast<size_t>(prompt_len)});
+            std::fill_n(full_mask.data<int64_t>(), prompt_len, int64_t{1});
+
+            ov::Tensor suffix_pos(ov::element::i64, {3, kBatch, suffix_len});
+            {
+                const auto* full_pos = position_ids.data<const int64_t>();
+                const size_t full_seq = position_ids.get_shape().at(2);
+                auto* dst = suffix_pos.data<int64_t>();
+                for (size_t d = 0; d < 3; ++d) {
+                    std::memcpy(dst + d * suffix_len,
+                                full_pos + d * full_seq + prefix_snap_match,
+                                suffix_len * sizeof(int64_t));
+                }
+            }
+
+            auto usm_ids = clone_as_usm_host(gpu_ctx_, suffix_ids);
+            auto usm_mask = clone_as_usm_host(gpu_ctx_, full_mask);
+            auto usm_pos = clone_as_usm_host(gpu_ctx_, suffix_pos);
+
+            text_request_.set_tensor(models::Qwen3_5TextIO::kInputIds, usm_ids);
+            text_request_.set_tensor(models::Qwen3_5TextIO::kAttentionMask, usm_mask);
+            text_request_.set_tensor(models::Qwen3_5TextIO::kPositionIds, usm_pos);
+            text_request_.set_tensor(models::Qwen3_5TextIO::kBeamIdx, beam_idx_);
+
+            if (model_.compiled_vision()) {
+                const auto hidden = static_cast<size_t>(model_.config().text.hidden_size);
+                auto zero_vis = make_usm_host_tensor(gpu_ctx_, ov::element::f32,
+                                                      {kBatch, suffix_len, hidden});
+                std::memset(zero_vis.data(), 0, zero_vis.get_byte_size());
+                auto zero_mask = make_usm_host_tensor(gpu_ctx_, ov::element::boolean,
+                                                       {kBatch, suffix_len});
+                std::memset(zero_mask.data(), 0, zero_mask.get_byte_size());
+                text_request_.set_tensor(models::Qwen3_5TextIO::kVisualEmbeds, zero_vis);
+                text_request_.set_tensor(models::Qwen3_5TextIO::kVisualPosMask, zero_mask);
+            }
+
+            text_request_.infer();
+        } else if (should_split_prefill) {
+            // Split prefill: create prefix snapshot for future reuse.
+            // Pass 1: prefill prefix-only tokens and save snapshot.
+            // Pass 2: prefill suffix tokens on top.
+            cache_valid_ = false;
+            cached_token_ids_.clear();
+
+            // ── Pass 1: Prefix-only prefill ──
+            text_request_.reset_state();
+
+            ov::Tensor pfx_ids(ov::element::i64, {kBatch, partial_prefix_len});
+            std::memcpy(pfx_ids.data<int64_t>(), prompt_data,
+                        partial_prefix_len * sizeof(int64_t));
+
+            ov::Tensor pfx_mask(ov::element::i64, {kBatch, partial_prefix_len});
+            std::fill_n(pfx_mask.data<int64_t>(),
+                        static_cast<int64_t>(partial_prefix_len), int64_t{1});
+
+            ov::Tensor pfx_pos(ov::element::i64, {3, kBatch, partial_prefix_len});
+            {
+                const auto* full_pos = position_ids.data<const int64_t>();
+                const size_t full_seq = position_ids.get_shape().at(2);
+                auto* dst = pfx_pos.data<int64_t>();
+                for (size_t d = 0; d < 3; ++d) {
+                    std::memcpy(dst + d * partial_prefix_len,
+                                full_pos + d * full_seq,
+                                partial_prefix_len * sizeof(int64_t));
+                }
+            }
+
+            auto usm_pfx_ids = clone_as_usm_host(gpu_ctx_, pfx_ids);
+            auto usm_pfx_mask = clone_as_usm_host(gpu_ctx_, pfx_mask);
+            auto usm_pfx_pos = clone_as_usm_host(gpu_ctx_, pfx_pos);
+
+            text_request_.set_tensor(models::Qwen3_5TextIO::kInputIds, usm_pfx_ids);
+            text_request_.set_tensor(models::Qwen3_5TextIO::kAttentionMask, usm_pfx_mask);
+            text_request_.set_tensor(models::Qwen3_5TextIO::kPositionIds, usm_pfx_pos);
+            text_request_.set_tensor(models::Qwen3_5TextIO::kBeamIdx, beam_idx_);
+
+            if (model_.compiled_vision()) {
+                const auto hidden = static_cast<size_t>(model_.config().text.hidden_size);
+                auto zero_vis = make_usm_host_tensor(gpu_ctx_, ov::element::f32,
+                                                      {kBatch, partial_prefix_len, hidden});
+                std::memset(zero_vis.data(), 0, zero_vis.get_byte_size());
+                auto zero_mask_t = make_usm_host_tensor(gpu_ctx_, ov::element::boolean,
+                                                         {kBatch, partial_prefix_len});
+                std::memset(zero_mask_t.data(), 0, zero_mask_t.get_byte_size());
+                text_request_.set_tensor(models::Qwen3_5TextIO::kVisualEmbeds, zero_vis);
+                text_request_.set_tensor(models::Qwen3_5TextIO::kVisualPosMask, zero_mask_t);
+            }
+
+            text_request_.infer();
+            save_prefix_snapshot(prompt_data, static_cast<int64_t>(partial_prefix_len));
+
+            // ── Pass 2: Suffix prefill on top of prefix ──
+            const size_t suffix_len = static_cast<size_t>(prompt_len) - partial_prefix_len;
+
+            ov::Tensor suffix_ids(ov::element::i64, {kBatch, suffix_len});
+            std::memcpy(suffix_ids.data<int64_t>(),
+                        prompt_data + partial_prefix_len,
+                        suffix_len * sizeof(int64_t));
+
+            ov::Tensor full_mask(ov::element::i64, {kBatch, static_cast<size_t>(prompt_len)});
+            std::fill_n(full_mask.data<int64_t>(), prompt_len, int64_t{1});
+
+            ov::Tensor suffix_pos(ov::element::i64, {3, kBatch, suffix_len});
+            {
+                const auto* full_pos = position_ids.data<const int64_t>();
+                const size_t full_seq = position_ids.get_shape().at(2);
+                auto* dst = suffix_pos.data<int64_t>();
+                for (size_t d = 0; d < 3; ++d) {
+                    std::memcpy(dst + d * suffix_len,
+                                full_pos + d * full_seq + partial_prefix_len,
+                                suffix_len * sizeof(int64_t));
+                }
+            }
+
+            auto usm_sfx_ids = clone_as_usm_host(gpu_ctx_, suffix_ids);
+            auto usm_sfx_mask = clone_as_usm_host(gpu_ctx_, full_mask);
+            auto usm_sfx_pos = clone_as_usm_host(gpu_ctx_, suffix_pos);
+
+            text_request_.set_tensor(models::Qwen3_5TextIO::kInputIds, usm_sfx_ids);
+            text_request_.set_tensor(models::Qwen3_5TextIO::kAttentionMask, usm_sfx_mask);
+            text_request_.set_tensor(models::Qwen3_5TextIO::kPositionIds, usm_sfx_pos);
+
+            if (model_.compiled_vision()) {
+                const auto hidden = static_cast<size_t>(model_.config().text.hidden_size);
+                auto zero_vis = make_usm_host_tensor(gpu_ctx_, ov::element::f32,
+                                                      {kBatch, suffix_len, hidden});
+                std::memset(zero_vis.data(), 0, zero_vis.get_byte_size());
+                auto zero_mask_t = make_usm_host_tensor(gpu_ctx_, ov::element::boolean,
+                                                         {kBatch, suffix_len});
+                std::memset(zero_mask_t.data(), 0, zero_mask_t.get_byte_size());
+                text_request_.set_tensor(models::Qwen3_5TextIO::kVisualEmbeds, zero_vis);
+                text_request_.set_tensor(models::Qwen3_5TextIO::kVisualPosMask, zero_mask_t);
             }
 
             text_request_.infer();
@@ -1024,7 +1245,8 @@ struct Session::Impl {
             ? static_cast<int>(prompt_len)
             : (snapshot_action == SnapshotAction::RESTORE_EXTEND)
                 ? static_cast<int>(snapshot_match)
-                : use_prefix_cache ? static_cast<int>(prefix_match) : 0;
+                : use_prefix_cache ? static_cast<int>(prefix_match)
+                    : use_prefix_snapshot ? static_cast<int>(prefix_snap_match) : 0;
         result.prefill_ms = elapsed_ms(prefill_start, prefill_end);
         result.decode_ms = elapsed_ms(decode_start, decode_end);
         result.ttft_ms = result.prefill_ms;
@@ -1134,6 +1356,7 @@ GenerateResult Session::generate(const std::string& prompt,
         impl_->cache_valid_ = false;
         impl_->cached_token_ids_.clear();
         impl_->prefill_snapshot_.clear();
+        impl_->prefix_snapshot_.clear();
         impl_->text_request_.reset_state();
         impl_->past_len_ = 0;
         throw;
@@ -1176,6 +1399,7 @@ GenerateResult Session::generate_vl(const std::string& prompt,
         impl_->cache_valid_ = false;
         impl_->cached_token_ids_.clear();
         impl_->prefill_snapshot_.clear();
+        impl_->prefix_snapshot_.clear();
         impl_->text_request_.reset_state();
         impl_->past_len_ = 0;
         throw;
@@ -1193,6 +1417,7 @@ void Session::reset() {
     impl_->cached_token_ids_.clear();
     impl_->cache_valid_ = false;
     impl_->prefill_snapshot_.clear();
+    impl_->prefix_snapshot_.clear();
     impl_->last_vl_image_token_counts_.clear();
 }
 
@@ -1323,6 +1548,7 @@ void Session::warmup(int max_seq_len) {
 
 void Session::recreate() {
     impl_->prefill_snapshot_.clear();
+    impl_->prefix_snapshot_.clear();
     impl_->text_request_ = {};  // release old request first
     impl_->init_request_and_tensors();
 }
